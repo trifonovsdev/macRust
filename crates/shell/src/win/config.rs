@@ -52,6 +52,9 @@ pub struct Settings {
     pub auto_update: bool,
     /// Bounce a Dock icon while its app opens ("Animate opening applications").
     pub launch_bounce: bool,
+    /// Folders open in macRust's own file manager; false hands them to
+    /// Windows Explorer.
+    pub file_manager: bool,
 }
 
 impl Default for Settings {
@@ -68,6 +71,7 @@ impl Default for Settings {
             banners: true,
             auto_update: true,
             launch_bounce: false,
+            file_manager: true,
         }
     }
 }
@@ -126,6 +130,7 @@ pub fn load_settings() -> Settings {
             "banners" => s.banners = b,
             "auto_update" => s.auto_update = b,
             "animate_opening" => s.launch_bounce = b,
+            "file_manager" => s.file_manager = v != "explorer",
             _ => {}
         }
     }
@@ -138,24 +143,25 @@ pub fn load_settings() -> Settings {
     if version < 5 && s.magnified == 92.0 {
         s.magnified = 72.0;
     }
-    // Version 3 added `auto_update`, version 4 `animate_opening`; older files
-    // get them with their defaults.
+    // Version 3 added `auto_update`, version 4 `animate_opening`, version 6
+    // `file_manager`; older files get them with their defaults.
     if version < SETTINGS_VERSION {
         save_settings(&s);
     }
     s
 }
 
-const SETTINGS_VERSION: u32 = 5;
+const SETTINGS_VERSION: u32 = 6;
 
 pub fn save_settings(s: &Settings) {
     let text = format!(
         "# macRust settings. Restart macRust after editing.\nversion = {}\n\
          icon_size = {}\nmagnified_size = {}\nmagnification = {}\nhide_taskbar = {}\nreserve_dock_space = {}\n\
          # auto | light | dark\nappearance = {}\ntray_icons = {}\nbanners = {}\nauto_update = {}\n\
-         # bounce a Dock icon while its app opens\nanimate_opening = {}\n",
+         # bounce a Dock icon while its app opens\nanimate_opening = {}\n\
+         # macrust (our Finder) | explorer (Windows Explorer opens folders)\nfile_manager = {}\n",
         SETTINGS_VERSION, s.icon_size, s.magnified, s.magnify, s.hide_taskbar, s.reserve_dock, s.appearance, s.tray_icons, s.banners,
-        s.auto_update, s.launch_bounce
+        s.auto_update, s.launch_bounce, if s.file_manager { "macrust" } else { "explorer" }
     );
     let _ = std::fs::write(settings_path(), text);
 }

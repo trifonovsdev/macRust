@@ -297,6 +297,42 @@ impl Browser {
         }
     }
 
+    /// What the pointer is over (for the host's cursor shape).
+    pub fn hover(&self) -> Hit {
+        self.hover
+    }
+
+    /// After `navigate`: select `name` once the listing has it (an
+    /// "open folder and select" request).
+    pub fn select_when_listed(&mut self, name: &str) {
+        self.select_when_seen = Some((name.to_string(), false));
+    }
+
+    /// The context-menu key: the menu of the selection, at its item, or of
+    /// the folder background.
+    pub fn menu_key(&mut self) -> Vec<Action> {
+        let f = self.frame();
+        let s = self.scale;
+        let paths = self.selected_paths();
+        let pos = self.list.cursor.filter(|&c| self.list.is_selected(c)).or_else(|| self.list.selected_positions().first().copied());
+        let (x, y) = match pos {
+            Some(p) if !paths.is_empty() => {
+                self.ensure_visible(p);
+                self.scroll = self.target;
+                let sy = self.scroll_y();
+                match self.view {
+                    View::Icons => {
+                        let t = Grid::new(f.content.w, s).tile(p);
+                        (f.content.x + t.x + t.w / 2.0, f.content.y + t.bottom() - sy)
+                    }
+                    View::List => (f.content.x + 80.0 * s, f.content.y + layout::row_y(p, s) - sy + layout::ROW_H * s),
+                }
+            }
+            _ => (f.content.x + f.content.w / 2.0, f.content.y + f.content.h / 3.0),
+        };
+        vec![Action::ContextMenu { paths, x, y }]
+    }
+
     pub fn caret_on(&self) -> bool {
         ((self.time - self.caret_since) / 0.53) as i64 % 2 == 0
     }

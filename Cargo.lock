@@ -196,6 +196,7 @@ dependencies = [
  "macrust-ui",
  "rusqlite",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

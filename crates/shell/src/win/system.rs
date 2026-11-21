@@ -278,6 +278,15 @@ pub fn open(target: &str) {
 pub fn open_with(target: &str, args: &str) {
     let (target, args) = (target.to_string(), args.to_string());
     std::thread::spawn(move || {
+        // Folders (and Explorer itself) open in our file manager unless the
+        // settings send them to Explorer. Decided here, off the UI thread:
+        // checking a network path can take seconds.
+        if super::files::enabled()
+            && let Some((folder, select)) = super::files::route(&target, &args)
+        {
+            super::files::open_window(folder.as_deref(), select.as_deref());
+            return;
+        }
         let (t, a) = (wide(&target), wide(&args));
         let r = unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);

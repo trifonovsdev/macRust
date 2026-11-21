@@ -187,7 +187,7 @@ fn shot(out: &str, name: &str, dark: bool, scale: f32, view: View, ru: bool, set
     let _ = b.set_view(view);
     setup(&mut b, &ctx);
     fill_icons(&mut b, &ctx.text);
-    let mut pm = Pixmap::new(w as u32, h as u32).unwrap();
+    let mut pm = Pixmap::new(b.w as u32, b.h as u32).unwrap();
     b.draw(&mut pm, &ctx);
     pm.save_png(format!("{out}/{name}.png")).unwrap();
 }

@@ -66,8 +66,8 @@ impl App {
         let st = &self.settings;
         let _ = writeln!(
             info,
-            "settings: icon {} magnified {} magnify {} hide_taskbar {} reserve_dock {} appearance {} tray_icons {} banners {} auto_update {} animate_opening {}",
-            st.icon_size, st.magnified, st.magnify, st.hide_taskbar, st.reserve_dock, st.appearance, st.tray_icons, st.banners, st.auto_update, st.launch_bounce
+            "settings: icon {} magnified {} magnify {} hide_taskbar {} reserve_dock {} appearance {} tray_icons {} banners {} auto_update {} animate_opening {} file_manager {}",
+            st.icon_size, st.magnified, st.magnify, st.hide_taskbar, st.reserve_dock, st.appearance, st.tray_icons, st.banners, st.auto_update, st.launch_bounce, st.file_manager
         );
         let _ = writeln!(info, "taskbar hidden: {}", self.taskbar_hidden);
         let wa = super::workarea::current();
@@ -153,6 +153,10 @@ impl App {
         info.push_str(&notes);
         let _ = std::fs::write(dir.join("info.txt"), info);
         let _ = std::fs::write(dir.join("events.txt"), redact(&trace_dump()));
+        // The file manager runs in its own process and keeps its own trace.
+        if let Ok(t) = std::fs::read_to_string(super::super::files::trace_path()) {
+            let _ = std::fs::write(dir.join("files-events.txt"), redact(&t));
+        }
         trace("report: done");
         if open_folder {
             system::open(&dir.to_string_lossy());

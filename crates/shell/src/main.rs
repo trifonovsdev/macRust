@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod files_logic;
 mod icon_logic;
 mod net_logic;
 mod wifi_logic;
