@@ -19,6 +19,7 @@ use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     QueryFullProcessImageNameW,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::Shell::NIN_SELECT;
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, ChangeWindowMessageFilterEx, CopyIcon, CreateWindowExW, DI_FLAGS, DI_MASK, DI_NORMAL,
@@ -26,8 +27,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, HICON, HWND_BROADCAST, HWND_TOPMOST, ICONINFO, IsWindow, MSGFLT_ALLOW, PostMessageW,
     RegisterClassExW, RegisterWindowMessageW, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_SHOWWINDOW, SendMessageTimeoutW, SendNotifyMessageW, SetWindowLongPtrW, SetWindowPos, UnregisterClassW,
-    WINDOWPOS, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_USER, WM_WINDOWPOSCHANGED, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN,
+    WINDOWPOS, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_USER, WM_WINDOWPOSCHANGED, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN,
     WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, PWSTR, w};
@@ -74,6 +75,23 @@ const NIF_STATE: u32 = 0x8;
 const NIF_GUID: u32 = 0x20;
 const NIS_HIDDEN: u32 = 0x1;
 
+// Explorer's own icons for volume, network and power. Their flyouts are
+// anchored to the stock taskbar, which is hidden, and the Control Center and
+// the menu bar already cover them, so they are not shown.
+const SYSTEM_GUIDS: [[u8; 16]; 3] = [
+    guid(0x7820AE73, 0x23E3, 0x4229, [0x82, 0xC1, 0xE4, 0x1C, 0xB6, 0x7D, 0x5B, 0x9C]),
+    guid(0x7820AE74, 0x23E3, 0x4229, [0x82, 0xC1, 0xE4, 0x1C, 0xB6, 0x7D, 0x5B, 0x9C]),
+    guid(0x7820AE75, 0x23E3, 0x4229, [0x82, 0xC1, 0xE4, 0x1C, 0xB6, 0x7D, 0x5B, 0x9C]),
+];
+
+/// A GUID as it lies in memory (little-endian fields).
+const fn guid(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> [u8; 16] {
+    let a = d1.to_le_bytes();
+    let b = d2.to_le_bytes();
+    let c = d3.to_le_bytes();
+    [a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7]]
+}
+
 // NOTIFYICONDATAW with 32-bit handles, as shell32 marshals it after the
 // 8-byte SHELLTRAYDATA header (signature, NIM_* message).
 const NID_OFFSET: usize = 8;
@@ -119,7 +137,7 @@ struct Icon {
 
 impl Icon {
     fn hidden(&self) -> bool {
-        self.state & NIS_HIDDEN != 0
+        self.state & NIS_HIDDEN != 0 || self.guid.is_some_and(|g| SYSTEM_GUIDS.contains(&g))
     }
 }
 
@@ -129,6 +147,8 @@ struct State {
     next_id: u64,
     icons: Vec<Icon>,
     events: Vec<TrayEvent>,
+    /// Last left click (icon id, when), to turn a second one into a double click.
+    last_left: Option<(u64, Instant)>,
 }
 
 impl State {
@@ -138,7 +158,8 @@ impl State {
         }
         let wake = self.events.is_empty();
         self.events.push(ev);
-        // One wake-up per batch: the app drains the queue with take_events.
+        // One wake-up per batch: the app drains the queue with take_events
+        // (and also every second, in case this post was lost).
         if wake {
             unsafe {
                 let _ = PostMessageW(Some(HWND(self.notify as *mut _)), self.notify_msg, WPARAM(0), LPARAM(0));
@@ -267,6 +288,7 @@ impl Tray {
                         next_id: 1,
                         icons: Vec::new(),
                         events: Vec::new(),
+                        last_left: None,
                     });
                 }
             });
@@ -306,8 +328,16 @@ impl Tray {
     /// Sends the icon's owner the mouse messages Explorer would. `anchor_x/y`
     /// (screen coordinates) only reach NOTIFYICON_VERSION_4 apps.
     pub fn click(&self, id: u64, button: TrayButton, anchor_x: i32, anchor_y: i32) {
-        let Some((hwnd, pid, callback, version, uid)) = with_state(|s| {
-            s.icons.iter().find(|i| i.id == id).map(|i| (i.hwnd, i.pid, i.callback, i.version, i.uid))
+        let double_ms = unsafe { GetDoubleClickTime() } as u128;
+        let Some((hwnd, pid, callback, version, uid, double)) = with_state(|s| {
+            let double = matches!(button, TrayButton::Left)
+                && s.last_left.is_some_and(|(i, t)| i == id && t.elapsed().as_millis() <= double_ms);
+            s.last_left = match button {
+                // A double click ends the pair; the next click starts a new one.
+                TrayButton::Left if !double => Some((id, Instant::now())),
+                _ => None,
+            };
+            s.icons.iter().find(|i| i.id == id).map(|i| (i.hwnd, i.pid, i.callback, i.version, i.uid, double))
         })
         .flatten() else {
             return;
@@ -316,11 +346,15 @@ impl Tray {
         if callback == 0 || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
             return;
         }
-        let msgs: &[u32] = match (button, version >= 3) {
-            (TrayButton::Left, true) => &[WM_LBUTTONDOWN, WM_LBUTTONUP, NIN_SELECT],
-            (TrayButton::Left, false) => &[WM_LBUTTONDOWN, WM_LBUTTONUP],
-            (TrayButton::Right, true) => &[WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU],
-            (TrayButton::Right, false) => &[WM_RBUTTONDOWN, WM_RBUTTONUP],
+        // Explorer's sequences: the mouse messages always, plus NIN_SELECT /
+        // WM_CONTEXTMENU for version 3+ icons; a second click within the
+        // double-click time arrives as WM_LBUTTONDBLCLK.
+        let msgs: &[u32] = match (button, version >= 3, double) {
+            (TrayButton::Left, _, true) => &[WM_LBUTTONDBLCLK, WM_LBUTTONUP],
+            (TrayButton::Left, true, false) => &[WM_LBUTTONDOWN, WM_LBUTTONUP, NIN_SELECT],
+            (TrayButton::Left, false, false) => &[WM_LBUTTONDOWN, WM_LBUTTONUP],
+            (TrayButton::Right, true, _) => &[WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU],
+            (TrayButton::Right, false, _) => &[WM_RBUTTONDOWN, WM_RBUTTONUP],
         };
         unsafe {
             // The app opens a menu or a window in response; let it take focus.
@@ -333,6 +367,27 @@ impl Tray {
                 };
                 let _ = PostMessageW(Some(hwnd), callback, WPARAM(wp), LPARAM(lp));
             }
+        }
+    }
+
+    /// The pointer entered an icon: apps refresh their tooltip or state on
+    /// WM_MOUSEMOVE, as they get it from Explorer.
+    pub fn hover(&self, id: u64, x: i32, y: i32) {
+        let Some((hwnd, callback, version, uid)) =
+            with_state(|s| s.icons.iter().find(|i| i.id == id).map(|i| (i.hwnd, i.callback, i.version, i.uid))).flatten()
+        else {
+            return;
+        };
+        if callback == 0 {
+            return;
+        }
+        let (wp, lp) = if version >= 4 {
+            (make_long(x, y) as usize, ((uid & 0xFFFF) << 16 | WM_MOUSEMOVE) as isize)
+        } else {
+            (uid as usize, WM_MOUSEMOVE as isize)
+        };
+        unsafe {
+            let _ = PostMessageW(Some(HWND(hwnd as *mut _)), callback, WPARAM(wp), LPARAM(lp));
         }
     }
 
@@ -562,6 +617,12 @@ fn notify_icon(data: &[u8]) -> Option<bool> {
             if hwnd != 0 {
                 icon.uid = uid;
             }
+            // Explorer answers a repeated add as a fresh icon: the app sets
+            // its version again afterwards, so the old one must not linger.
+            if message == NIM_ADD && found.is_some() {
+                icon.version = 0;
+            }
+
             if flags & NIF_MESSAGE != 0 {
                 icon.callback = u32_at(&nid, NID_CALLBACK);
             }

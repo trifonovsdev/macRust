@@ -154,6 +154,8 @@ impl App {
                 self.refresh_status();
             }
         }
+        // A lost wake-up message must not freeze the tray.
+        self.on_tray();
         if self.x.tick.is_multiple_of(5)
             && let Some(t) = &self.x.tray
         {
@@ -187,6 +189,10 @@ impl App {
             if let Some(e) = &ic.owner_exe {
                 exes.insert(e.to_lowercase());
             }
+            // A picture that could not be read would leave an empty, clickable gap.
+            if ic.icon.is_none() {
+                continue;
+            }
             let stamp = ic.icon.as_ref().map(|r| hash_of(&r.data)).unwrap_or(0);
             let images = match self.x.tray_images.get(&ic.id) {
                 Some((s, imgs)) if *s == stamp => Some(imgs.clone()),
@@ -206,15 +212,22 @@ impl App {
         if self.bar.set_tray(items, &self.ctx) {
             self.bar_s.dirty = true;
         }
-        let bar_h = self.bar.height_px();
-        for ic in &icons {
-            if let Some((a, b)) = self.bar.item_rect(BarItem::Tray(ic.id)) {
-                t.set_icon_rect(ic.id, RECT { left: a as i32, top: 0, right: b as i32, bottom: bar_h });
-            }
-        }
+        self.tray_rects();
         if exes != self.x.tray_exes {
             self.x.tray_exes = exes;
             self.rebuild_dock();
+        }
+    }
+
+    /// Where each icon is on screen, for apps that anchor flyouts to it.
+    /// Items shift whenever the clock or status items change width.
+    pub(super) fn tray_rects(&self) {
+        let Some(t) = &self.x.tray else { return };
+        let wr = self.bar.window_rect();
+        for ic in t.icons() {
+            if let Some((a, b)) = self.bar.item_rect(BarItem::Tray(ic.id)) {
+                t.set_icon_rect(ic.id, RECT { left: wr.x + a as i32, top: wr.y, right: wr.x + b as i32, bottom: wr.y + self.bar.height_px() });
+            }
         }
     }
 
@@ -222,7 +235,15 @@ impl App {
         let Some(t) = &self.x.tray else { return };
         let (a, b) = self.bar.item_rect(BarItem::Tray(id)).unwrap_or((0.0, 0.0));
         let button = if right { TrayButton::Right } else { TrayButton::Left };
-        t.click(id, button, ((a + b) / 2.0) as i32, self.bar.height_px());
+        let wr = self.bar.window_rect();
+        t.click(id, button, wr.x + ((a + b) / 2.0) as i32, wr.y + self.bar.height_px());
+    }
+
+    pub(super) fn tray_hover(&mut self, id: u64) {
+        let Some(t) = &self.x.tray else { return };
+        let (a, b) = self.bar.item_rect(BarItem::Tray(id)).unwrap_or((0.0, 0.0));
+        let wr = self.bar.window_rect();
+        t.hover(id, wr.x + ((a + b) / 2.0) as i32, wr.y + self.bar.height_px() / 2);
     }
 
     // -------------------------------------------------------------------

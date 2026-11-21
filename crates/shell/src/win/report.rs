@@ -70,6 +70,7 @@ impl App {
             st.icon_size, st.magnified, st.magnify, st.hide_taskbar, st.reserve_dock, st.appearance, st.tray_icons, st.banners
         );
         let _ = writeln!(info, "taskbar hidden: {}", self.taskbar_hidden);
+        let _ = writeln!(info, "wallpaper: {}", system::wallpaper_kind());
 
         let _ = writeln!(info, "\n[dock]");
         for (key, t) in &self.targets {

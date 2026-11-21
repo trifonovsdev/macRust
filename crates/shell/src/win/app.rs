@@ -792,6 +792,7 @@ impl App {
         };
         if self.bar.set_status(st, &self.ctx) {
             self.bar_s.dirty = true;
+            self.tray_rects();
         }
     }
 
@@ -1559,7 +1560,13 @@ impl App {
                 let (x, y) = lparam_point(lp);
                 if is_bar {
                     self.bar_s.track_leave();
+                    let before = self.bar.hovered_tray();
                     self.bar.mouse_move(x, y);
+                    if let Some(id) = self.bar.hovered_tray()
+                        && before != Some(id)
+                    {
+                        self.tray_hover(id);
+                    }
                     self.bar_s.dirty = true;
                 } else if is_dock {
                     self.dock_s.track_leave();
@@ -1753,6 +1760,10 @@ impl App {
             WM_APP_TASKBAR => {
                 if self.taskbar_hidden {
                     system::keep_taskbar_hidden();
+                }
+                // Explorer's tray window came forward: icon calls would go to it.
+                if let Some(t) = &self.x.tray {
+                    t.keep_on_top();
                 }
             }
             WM_APP_ICON => self.icons_arrived(),

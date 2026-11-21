@@ -244,8 +244,8 @@ impl Worker {
             self.set_volume(v);
         }
         if let Some(v) = brightness {
-            self.set_brightness(v);
-            snap.brightness = Some(v.clamp(0.0, 1.0));
+            // A monitor that refused the value keeps its own; the slider follows it.
+            snap.brightness = if self.set_brightness(v) { Some(v.clamp(0.0, 1.0)) } else { self.read_brightness() };
             due.brightness = Instant::now() + BRIGHTNESS_EVERY;
         }
 
@@ -456,9 +456,9 @@ impl Worker {
         r
     }
 
-    fn set_brightness(&mut self, v: f32) {
+    fn set_brightness(&mut self, v: f32) -> bool {
         if self.ddc == Some(false) {
-            return;
+            return false;
         }
         let v = v.clamp(0.0, 1.0);
         let ok = self.with_monitor(|h| unsafe {
@@ -467,11 +467,20 @@ impl Worker {
                 return None;
             }
             let target = min + (v * (max - min) as f32).round() as u32;
-            (SetMonitorBrightness(h, target) != 0).then_some(())
+            // DDC/CI needs a pause between commands; a busy monitor drops the
+            // write right after the read, so it is retried a few times.
+            for _ in 0..3 {
+                std::thread::sleep(Duration::from_millis(50));
+                if SetMonitorBrightness(h, target) != 0 {
+                    return Some(());
+                }
+            }
+            None
         });
         if ok.is_none() {
             self.log_once("set-brightness", "DDC/CI set failed");
         }
+        ok.is_some()
     }
 
     // ---- now playing ----

@@ -229,6 +229,14 @@ impl MenuBar {
         }
     }
 
+    /// The tray icon under the pointer, if any.
+    pub fn hovered_tray(&self) -> Option<u64> {
+        match self.hover {
+            Some(BarItem::Tray(id)) => Some(id),
+            _ => None,
+        }
+    }
+
     pub fn mouse_leave(&mut self) {
         self.hover = None;
         self.pressed = None;

@@ -599,6 +599,25 @@ fn desktop_color() -> [u8; 3] {
     [(c & 0xff) as u8, ((c >> 8) & 0xff) as u8, ((c >> 16) & 0xff) as u8]
 }
 
+/// What the desktop shows, for the diagnostic report: the picture's file
+/// type and fit style, never its name.
+pub fn wallpaper_kind() -> String {
+    let mut buf = [0u16; 1024];
+    let ok = unsafe {
+        SystemParametersInfoW(SPI_GETDESKWALLPAPER, buf.len() as u32, Some(buf.as_mut_ptr() as *mut c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0))
+            .is_ok()
+    };
+    let path = from_wide(&buf);
+    let bg = desktop_color();
+    if !ok || path.is_empty() {
+        return format!("solid colour {:?}", bg);
+    }
+    let ext = std::path::Path::new(&path).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_else(|| "none".into());
+    let style = reg_string(HKEY_CURRENT_USER, r"Control Panel\Desktop", "WallpaperStyle").unwrap_or_default();
+    let exists = std::path::Path::new(&path).exists();
+    format!("picture .{ext}, style {style}, file exists {exists}, background {:?}", bg)
+}
+
 /// The desktop picture as it covers a `w` x `h` screen, decoded and scaled by WIC.
 pub fn wallpaper(w: u32, h: u32) -> Option<Pixmap> {
     let mut buf = [0u16; 1024];
