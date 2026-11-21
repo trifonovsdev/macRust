@@ -337,9 +337,8 @@ fn panels(sc: &Scene, out: &str, name: &str) {
     for _ in 0..120 {
         cc.update(1.0 / 120.0);
     }
-    let (cw, ch) = cc.window_size();
     let m = (macrust_ui::panel::MARGIN * s) as i32;
-    let r = WinRect { x: sc.w as i32 - cw + m - (8.0 * s) as i32, y: br.h + (4.0 * s) as i32 - m, w: cw, h: ch };
+    let r = cc.window_rect(sc.w as i32, br.h);
     let crop = |r: WinRect| {
         let mut behind = Pixmap::new(r.w as u32, r.h as u32).unwrap();
         behind.draw_pixmap(-r.x, -r.y, sc.wall.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
@@ -435,6 +434,10 @@ fn crop_dock(sc: &Scene, out: &str, name: &str, dock: &Dock) {
 fn main() {
     let out = std::env::args().nth(1).unwrap_or_else(|| "out".into());
     std::fs::create_dir_all(&out).unwrap();
+    control_scenes(&out);
+    if std::env::args().nth(2).as_deref() == Some("cc") {
+        return;
+    }
 
     icon_sheet(&out);
     let retina_light = scene(2880, 1800, 2.0, false);
@@ -542,4 +545,83 @@ fn main() {
 
 fn dpm_probe(r: &WinRect) -> Pixmap {
     Pixmap::new(r.w as u32, r.h as u32).unwrap()
+}
+
+/// Backdrops matching the measured Tahoe frames: BB's magenta stripes (rows
+/// sampled beside its stack, undimmed, keyed to the stack top), Apple's blue
+/// guide illustration, and the owner's black desktop.
+fn cc_backdrop(w: u32, h: u32, s: f32, kind: &str, stack_top: f32) -> Pixmap {
+    const BB: [(f32, [f32; 3]); 22] = [
+        (0.0, [47.0, 16.0, 34.0]), (30.0, [49.0, 15.0, 33.0]), (60.0, [51.0, 15.0, 33.0]), (90.0, [54.0, 12.0, 34.0]),
+        (120.0, [59.0, 12.0, 37.0]), (150.0, [69.0, 11.0, 39.0]), (180.0, [81.0, 11.0, 43.0]), (210.0, [98.0, 11.0, 50.0]),
+        (240.0, [120.0, 13.0, 57.0]), (270.0, [139.0, 12.0, 65.0]), (300.0, [162.0, 11.0, 75.0]), (330.0, [185.0, 13.0, 90.0]),
+        (360.0, [194.0, 12.0, 102.0]), (390.0, [192.0, 13.0, 108.0]), (420.0, [189.0, 15.0, 113.0]), (450.0, [188.0, 18.0, 121.0]),
+        (480.0, [186.0, 19.0, 130.0]), (510.0, [180.0, 21.0, 137.0]), (540.0, [178.0, 23.0, 147.0]), (570.0, [174.0, 26.0, 156.0]),
+        (600.0, [165.0, 30.0, 162.0]), (630.0, [147.0, 35.0, 164.0]),
+    ];
+    let mut pm = Pixmap::new(w, h).unwrap();
+    let data = pm.data_mut();
+    for y in 0..h {
+        for x in 0..w {
+            let (fx, fy) = (x as f32 / s, y as f32 / s);
+            let c = match kind {
+                "bb" => {
+                    let t = fy - stack_top + 65.5;
+                    let i = BB.iter().rposition(|r| r.0 <= t).unwrap_or(0).min(BB.len() - 2);
+                    let k = ((t - BB[i].0) / 30.0).clamp(0.0, 1.0);
+                    let stripe = 1.0 + 0.12 * (fx * std::f32::consts::TAU / 13.0).sin();
+                    [0, 1, 2].map(|j| (BB[i].1[j] + (BB[i + 1].1[j] - BB[i].1[j]) * k) * stripe)
+                }
+                "blue" => {
+                    let t = ((fx * 0.35 + fy) / 520.0).clamp(0.0, 1.0);
+                    let streak = (((fx * 0.8 - fy) / 60.0).sin() * 0.5 + 0.5).powi(6) * 70.0 * (1.0 - t);
+                    [20.0 + 60.0 * (1.0 - t) + streak, 80.0 + 90.0 * (1.0 - t) + streak, 205.0 - 10.0 * (1.0 - t) + streak * 0.6]
+                }
+                _ => [0.0, 0.0, 0.0],
+            };
+            let o = ((y * w + x) * 4) as usize;
+            for j in 0..3 {
+                data[o + j] = c[j].clamp(0.0, 255.0) as u8;
+            }
+            data[o + 3] = 255;
+        }
+    }
+    pm
+}
+
+fn cc_scene(out: &str, name: &str, kind: &str, s: f32, strings: &'static Strings, state: ControlState) {
+    let ctx = Ctx::new(Text::bundled(), Theme { dark: state.dark }, strings);
+    let (w, h) = ((420.0 * s) as u32, (520.0 * s) as u32);
+    let bar = (macrust_ui::menubar::HEIGHT * s).round() as i32;
+    let mut cc = ControlCenter::new(state, s);
+    let r = cc.window_rect(w as i32, bar);
+    let stack_top = cc.body_rect(r).y as f32 / s;
+    let mut screen = cc_backdrop(w, h, s, kind, stack_top);
+    let mut behind = Pixmap::new(r.w as u32, r.h as u32).unwrap();
+    behind.draw_pixmap(-r.x, -r.y, screen.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    cc.set_backdrop(&behind);
+    cc.update(1.0 / 60.0);
+    let mut cpm = pixmap_for(r);
+    cc.draw(&mut cpm, &ctx);
+    blit(&mut screen, &cpm, r);
+    screen.save_png(format!("{out}/cc-{name}.png")).unwrap();
+}
+
+fn control_scenes(out: &str) {
+    let art = Some(fake_icon(rgba(40, 140, 250, 1.0), rgba(10, 70, 200, 1.0), 0));
+    let base = ControlState { wifi: Some((true, None)), bluetooth: Some(true), volume: Some(0.25), brightness: Some(0.4), dark: true, ..Default::default() };
+    let playing = NowPlayingView { title: "macOS 26 Tahoe is".into(), artist: "zollotech".into(), playing: true, art };
+    cc_scene(out, "dark-bb", "bb", 2.0, &Strings::EN, ControlState { playing: Some(playing), ..base.clone() });
+    cc_scene(
+        out,
+        "light-blue",
+        "blue",
+        2.0,
+        &Strings::EN,
+        ControlState { wifi: Some((true, Some("Tita".into()))), volume: Some(0.55), dark: false, ..base.clone() },
+    );
+    // The owner's PC: black desktop, Wi-Fi off, no brightness control, nothing playing.
+    let owner = ControlState { wifi: Some((false, None)), bluetooth: Some(true), volume: Some(1.0), brightness: None, dark: true, ..Default::default() };
+    cc_scene(out, "black-ru", "black", 2.0, &Strings::RU, owner.clone());
+    cc_scene(out, "black-ru-1x", "black", 1.0, &Strings::RU, owner);
 }
