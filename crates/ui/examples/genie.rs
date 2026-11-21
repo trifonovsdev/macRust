@@ -33,7 +33,9 @@ fn snapshot(pm: &Pixmap, radius: f32) -> Snapshot {
     let (w, h) = (pm.width() as usize, pm.height() as usize);
     let mut px = pm.data().to_vec();
     genie::round_corners(&mut px, w, h, radius);
-    Snapshot::new(px, w, h)
+    let mut s = Snapshot::new(px, w, h);
+    s.build_levels();
+    s
 }
 
 fn render(bg: &Pixmap, snap: &Snapshot, p: &Path, dir: Dir, t: f32) -> Pixmap {
@@ -164,8 +166,15 @@ fn bench() {
     let px: Vec<u8> =
         (0..sw * sh).flat_map(|i| [(i % 251) as u8, (i / sw % 253) as u8, ((i * 7) % 256) as u8, 255]).collect();
     let t0 = Instant::now();
-    let snap = Snapshot::new(px, sw, sh);
-    println!("snapshot levels 1920x{sh}: {:.2} ms, {} MB", t0.elapsed().as_secs_f64() * 1000.0, snap.bytes() >> 20);
+    let mut snap = Snapshot::new(px, sw, sh);
+    let t1 = Instant::now();
+    snap.build_levels();
+    println!(
+        "snapshot 1920x{sh}: {:.2} ms before the first frame, levels {:.2} ms after, {} MB",
+        (t1 - t0).as_secs_f64() * 1000.0,
+        t1.elapsed().as_secs_f64() * 1000.0,
+        snap.bytes() >> 20
+    );
     let p = Path {
         win,
         icon: Rect { x: 1100.0, y: 1015.0, w: 42.0, h: 42.0 },

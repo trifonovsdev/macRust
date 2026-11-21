@@ -15,6 +15,8 @@ use std::time::Instant;
 use macrust_ui::WinRect;
 use macrust_ui::genie::{self, Bounds, Dir, Dst, Path, Snapshot};
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
+use windows::Win32::Graphics::Dwm::DwmFlush;
+use windows::Win32::Graphics::Gdi::GetUpdateRect;
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC,
     CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ, ReleaseDC, SelectObject,
@@ -23,7 +25,7 @@ use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     ANIMATIONINFO, CreateWindowExW, DestroyWindow, GetWindowRect, PW_RENDERFULLCONTENT, SPI_GETANIMATION,
-    SPI_SETANIMATION, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SPI_SETANIMATION, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowPos, ShowWindow, SystemParametersInfoW, ULW_ALPHA,
     UPDATELAYEREDWINDOWINFO, UpdateLayeredWindowIndirect, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
@@ -157,7 +159,58 @@ impl Overlay {
                 return None;
             };
             let old = SelectObject(dc, bmp.into());
-            Some(Overlay { hwnd, dc, bmp, old, bits: bits as *mut u8, w, h, top, shown: false, drawn: Bounds::default() })
+            let o = Overlay {
+                hwnd,
+                dc,
+                bmp,
+                old,
+                bits: bits as *mut u8,
+                w,
+                h,
+                top,
+                shown: false,
+                drawn: Bounds::default(),
+            };
+            // The window's surface starts transparent, so the first frame of
+            // every Genie uploads only what it draws.
+            o.upload(None);
+            Some(o)
+        }
+    }
+
+    /// Copies the bitmap (or its `dirty` part, screen coordinates) to the window.
+    fn upload(&self, dirty: Option<Bounds>) {
+        // The bitmap keeps screen coordinates; the window shows it from `top` down.
+        let pt = POINT { x: 0, y: self.top };
+        let size = SIZE { cx: self.w, cy: self.h - self.top };
+        let src = POINT { x: 0, y: self.top };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        // prcDirty is in window coordinates.
+        let rc = dirty.map(|d| RECT {
+            left: d.x0.max(0),
+            top: (d.y0 - self.top).max(0),
+            right: d.x1.min(self.w),
+            bottom: (d.y1 - self.top).clamp(0, self.h - self.top),
+        });
+        let info = UPDATELAYEREDWINDOWINFO {
+            cbSize: size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+            hdcDst: HDC::default(),
+            pptDst: &pt,
+            psize: &size,
+            hdcSrc: self.dc,
+            pptSrc: &src,
+            crKey: COLORREF(0),
+            pblend: &blend,
+            dwFlags: ULW_ALPHA,
+            prcDirty: rc.as_ref().map_or(std::ptr::null(), |r| r as *const RECT),
+        };
+        unsafe {
+            let _ = UpdateLayeredWindowIndirect(self.hwnd, &info);
         }
     }
 
@@ -170,52 +223,43 @@ impl Overlay {
     fn present(&mut self, drawn: Bounds, below: HWND) {
         let dirty = drawn.union(self.drawn);
         self.drawn = drawn;
-        // The bitmap keeps screen coordinates; the window shows it from `top` down.
-        let pt = POINT { x: 0, y: self.top };
-        let size = SIZE { cx: self.w, cy: self.h - self.top };
-        let src = POINT { x: 0, y: self.top };
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            BlendFlags: 0,
-            SourceConstantAlpha: 255,
-            AlphaFormat: AC_SRC_ALPHA as u8,
-        };
-        // prcDirty is in window coordinates.
-        let rc = RECT { left: dirty.x0, top: (dirty.y0 - self.top).max(0), right: dirty.x1, bottom: (dirty.y1 - self.top).max(0) };
-        let info = UPDATELAYEREDWINDOWINFO {
-            cbSize: size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
-            hdcDst: HDC::default(),
-            pptDst: &pt,
-            psize: &size,
-            hdcSrc: self.dc,
-            pptSrc: &src,
-            crKey: COLORREF(0),
-            pblend: &blend,
-            dwFlags: ULW_ALPHA,
-            // The first update must upload the whole bitmap.
-            prcDirty: if self.shown && !dirty.is_empty() { &rc } else { std::ptr::null() },
-        };
-        unsafe {
-            let _ = UpdateLayeredWindowIndirect(self.hwnd, &info);
-            if !self.shown {
-                // Right below the Dock, so the window slides in behind the bar.
-                let _ = SetWindowPos(self.hwnd, Some(below), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-                self.shown = true;
+        if dirty.is_empty() {
+            return;
+        }
+        self.upload(Some(dirty));
+        if !self.shown {
+            unsafe {
+                // Right below the Dock, so the window slides in behind the bar;
+                // placed and shown in one call.
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(below),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
             }
+            self.shown = true;
         }
     }
 
+    /// Hides the window as it is (never through an empty frame), then
+    /// clears the bitmap and the hidden window's surface for the next run.
     fn hide(&mut self) {
-        let (b, w, h) = (self.drawn, self.w as usize, self.h as usize);
-        genie::clear(&mut Dst { px: self.buf(), w, h, x: 0, y: 0 }, b);
-        self.drawn = Bounds::default();
         if self.shown {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
             self.shown = false;
         }
+        let (b, w, h) = (self.drawn, self.w as usize, self.h as usize);
+        if !b.is_empty() {
+            genie::clear(&mut Dst { px: self.buf(), w, h, x: 0, y: 0 }, b);
+            self.upload(Some(b));
+        }
+        self.drawn = Bounds::default();
     }
 }
 
@@ -233,26 +277,21 @@ impl Drop for Overlay {
 // ---------------------------------------------------------------------------
 // Snapshots
 
-/// The window's pixels under `r`, premultiplied BGRA with rounded corners:
-/// from the last Desktop Duplication frame (`fresh` takes a new one first,
-/// right for a window that is still on screen), else PrintWindow for a window
-/// that is still on screen.
-pub fn grab(cap: Option<&mut Capture>, h: HWND, r: WinRect, fresh: bool, radius: f32) -> Option<Snapshot> {
+/// The window's pixels under `r`, premultiplied BGRA with rounded corners,
+/// from Desktop Duplication. A window still on screen (`before` None) gets
+/// a fresh frame, or PrintWindow without capture. A window Windows has just
+/// minimized (`before` = GetTickCount of the event) is read from the newest
+/// frame taken before that tick, never from one that may already miss it.
+pub fn grab(cap: Option<&mut Capture>, h: HWND, r: WinRect, before: Option<u32>, radius: f32) -> Option<Snapshot> {
     let from_dda = cap.and_then(|c| {
-        if fresh {
+        if before.is_none() {
             c.poll();
         }
-        c.region(r)
+        c.region_bgra(r, before)
     });
     let mut px = match from_dda {
-        Some(pm) => {
-            let mut px = pm.take();
-            for p in px.chunks_exact_mut(4) {
-                p.swap(0, 2);
-            }
-            px
-        }
-        None if fresh => print_window(h, r)?,
+        Some(px) => px,
+        None if before.is_none() => print_window(h, r)?,
         None => return None,
     };
     let (w, hh) = (r.w as usize, r.h as usize);
@@ -316,6 +355,12 @@ fn print_window(h: HWND, r: WinRect) -> Option<Vec<u8>> {
     }
 }
 
+/// The window still has an invalid region to paint (it validates it when
+/// it draws); readable for other processes' windows.
+fn needs_paint(h: HWND) -> bool {
+    unsafe { GetUpdateRect(h, None, false).as_bool() }
+}
+
 // ---------------------------------------------------------------------------
 // Runs
 
@@ -336,6 +381,8 @@ struct Run {
     activate: bool,
     /// Restore: when the real window was shown under the last frame.
     shown_at: Option<Instant>,
+    /// Restore: frames in a row the real window looked painted.
+    painted: u32,
 }
 
 struct Cached {
@@ -452,8 +499,9 @@ impl Genie {
 
     /// Minimizes windows into their Dock icon. `already` is true when Windows
     /// has minimized them (a title-bar click); otherwise we minimize them once
-    /// the first frame covers them.
-    pub fn minimize(&mut self, items: Vec<Item>, already: bool, screen: (i32, i32), why: &str) {
+    /// the first frame is on screen. `since`: when the click or the event was
+    /// handled, for the timings in the trace.
+    pub fn minimize(&mut self, items: Vec<Item>, already: bool, screen: (i32, i32), why: &str, since: Instant) {
         let items: Vec<Item> = items.into_iter().take(self.room()).collect();
         if items.is_empty() {
             return;
@@ -475,14 +523,34 @@ impl Genie {
                 start: now,
                 activate: false,
                 shown_at: None,
+                painted: 0,
             });
         }
-        trace(format!("genie minimize start: {n} window(s), first {}x{}, from {why}", first.0, first.1));
+        let ms = |t: Instant| t.duration_since(since).as_secs_f32() * 1000.0;
+        trace(format!(
+            "genie minimize start: {n} window(s), first {}x{}, from {why}, snapshot {:.1} ms",
+            first.0,
+            first.1,
+            ms(now)
+        ));
         // The overlay shows the window before the real one goes away.
         self.step(screen);
+        trace(format!("genie first frame presented: {:.1} ms", ms(Instant::now())));
         if !already {
+            // Wait for DWM to compose that frame, so no composition shows the
+            // desktop where the window was.
+            unsafe {
+                let _ = DwmFlush();
+            }
             for h in hwnds {
                 winops::minimize(h);
+            }
+            trace(format!("genie window minimize sent: {:.1} ms", ms(Instant::now())));
+        }
+        // The squeezed levels are needed from the second frame on.
+        for r in &mut self.runs {
+            if !r.snap.has_levels() {
+                r.snap.build_levels();
             }
         }
     }
@@ -501,9 +569,20 @@ impl Genie {
             self.op_suppressed = suppress();
         }
         trace(format!("genie restore start: {}x{}", c.w, c.h));
-        let snap = Snapshot::new(c.px, c.w, c.h);
+        let mut snap = Snapshot::new(c.px, c.w, c.h);
+        // The restore starts squeezed: the levels are needed at once.
+        snap.build_levels();
         self.runs.retain(|r| r.hwnd != h);
-        self.runs.push(Run { hwnd: h, dir: Dir::Restore, path, snap, start: Instant::now(), activate, shown_at: None });
+        self.runs.push(Run {
+            hwnd: h,
+            dir: Dir::Restore,
+            path,
+            snap,
+            start: Instant::now(),
+            activate,
+            shown_at: None,
+            painted: 0,
+        });
         self.step(screen);
     }
 
@@ -522,6 +601,19 @@ impl Genie {
     /// The window came back by other means (Alt+Tab, the app itself).
     pub fn restored_elsewhere(&mut self, h: HWND) {
         self.runs.retain(|r| !(r.hwnd == h && r.dir == Dir::Minimize));
+    }
+
+    /// Creates the overlay ahead of the first Genie (a window and a
+    /// screen-sized bitmap), so a title-bar minimize does not wait for it.
+    pub fn prepare(&mut self, screen: (i32, i32)) {
+        if self.enabled && self.overlay.as_ref().is_none_or(|o| (o.w, o.h, o.top) != (screen.0, screen.1, self.top)) {
+            if self.overlay.as_ref().is_some_and(|o| o.shown) {
+                // Recreated on the next frame instead, not under a running Genie.
+                return;
+            }
+            self.overlay = None;
+            self.overlay = Overlay::new(screen.0, screen.1, self.top);
+        }
     }
 
     /// One frame of every running Genie; call at display refresh while
@@ -543,7 +635,7 @@ impl Genie {
             self.overlay = None;
             self.overlay = Overlay::new(screen.0, screen.1, self.top);
         }
-        let Some(ov) = &mut self.overlay else {
+        if self.overlay.is_none() {
             // No overlay: finish without the effect.
             for r in std::mem::take(&mut self.runs) {
                 if r.dir == Dir::Restore {
@@ -551,51 +643,51 @@ impl Genie {
                 }
             }
             return;
-        };
+        }
         let t0 = Instant::now();
-        let (w, h) = (ov.w as usize, ov.h as usize);
-        let prev = ov.drawn;
-        let mut dst = Dst { px: ov.buf(), w, h, x: 0, y: 0 };
-        genie::clear(&mut dst, prev);
-        let mut drawn = Bounds::default();
+        // Which runs are over: a minimized window gone behind the Dock; a
+        // restored window shown and painted under the last frame.
         let mut done = Vec::new();
         for (i, r) in self.runs.iter_mut().enumerate() {
             let t = (now - r.start).as_secs_f32();
             let end = genie::duration(r.dir);
-            let f = genie::frame(&r.path, r.dir, t.min(end));
             match r.dir {
                 Dir::Minimize => {
-                    if t >= end || !genie::visible(&r.path, &f) {
+                    if t >= end || !genie::visible(&r.path, &genie::frame(&r.path, r.dir, t)) {
                         done.push(i);
-                        continue;
                     }
                 }
-                Dir::Restore if t >= end => {
-                    // Show the real window under the last frame, then let go
-                    // of the overlay once it has had a moment to draw.
-                    match r.shown_at {
-                        None => {
-                            if r.activate {
-                                winops::activate(r.hwnd);
-                            } else {
-                                winops::restore(r.hwnd);
-                            }
-                            r.shown_at = Some(now);
+                Dir::Restore if t >= end => match r.shown_at {
+                    None => {
+                        if r.activate {
+                            winops::activate(r.hwnd);
+                        } else {
+                            winops::restore(r.hwnd);
                         }
-                        Some(s) => {
-                            let e = s.elapsed().as_secs_f32();
-                            if (e > 0.05 && !winops::is_minimized(r.hwnd)) || e > 0.3 {
-                                done.push(i);
-                                continue;
-                            }
+                        r.shown_at = Some(now);
+                        trace(format!("genie restore: window shown at {} ms", r.start.elapsed().as_millis()));
+                    }
+                    Some(s) => {
+                        // Keep the last frame over it until the app has
+                        // drawn: restored, its update region validated, for
+                        // three frames in a row.
+                        let painted = !winops::is_minimized(r.hwnd) && !needs_paint(r.hwnd);
+                        r.painted = if painted { r.painted + 1 } else { 0 };
+                        let e = s.elapsed().as_secs_f32();
+                        if r.painted >= 3 || e > 0.5 {
+                            trace(format!(
+                                "genie restore: window {} after {:.0} ms",
+                                if r.painted >= 3 { "painted" } else { "not seen painted, gave up" },
+                                e * 1000.0
+                            ));
+                            done.push(i);
                         }
                     }
-                }
+                },
                 Dir::Restore => {}
             }
-            drawn = drawn.union(genie::draw(&r.snap, &r.path, &f, &mut dst));
         }
-        ov.present(drawn, self.dock);
+        let all_done = done.len() == self.runs.len();
         for i in done.into_iter().rev() {
             let r = self.runs.remove(i);
             let ms = r.start.elapsed().as_millis();
@@ -605,16 +697,33 @@ impl Genie {
                 self.keep(r.hwnd, WinRect { x: w.x as i32, y: w.y as i32, w: w.w as i32, h: w.h as i32 }, r.snap);
             }
         }
+        if all_done {
+            // Hide with the last frame still in place: an empty frame first
+            // would uncover a restored window that may not be drawn yet.
+            self.finish_all();
+            return;
+        }
+        let Some(ov) = &mut self.overlay else { return };
+        let (w, h) = (ov.w as usize, ov.h as usize);
+        let prev = ov.drawn;
+        let mut dst = Dst { px: ov.buf(), w, h, x: 0, y: 0 };
+        genie::clear(&mut dst, prev);
+        let mut drawn = Bounds::default();
+        for r in &self.runs {
+            let t = (now - r.start).as_secs_f32().min(genie::duration(r.dir));
+            drawn = drawn.union(genie::draw(&r.snap, &r.path, &genie::frame(&r.path, r.dir, t), &mut dst));
+        }
+        ov.present(drawn, self.dock);
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         self.cost = (self.cost.0 + ms, self.cost.1.max(ms), self.cost.2 + 1);
-        if self.runs.is_empty() {
-            self.finish_all();
-        }
     }
 
     fn finish_all(&mut self) {
-        if let Some(o) = &mut self.overlay {
+        if let Some(o) = &mut self.overlay
+            && o.shown
+        {
             o.hide();
+            trace("genie overlay hidden");
         }
         if self.cost.2 > 0 {
             trace(format!(

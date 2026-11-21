@@ -17,6 +17,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::core::{BOOL, Interface, s, w};
 
 use super::util::log;
@@ -25,11 +26,17 @@ pub struct Capture {
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
     dup: Option<IDXGIOutputDuplication>,
-    /// The last desktop frame, kept on the GPU.
-    frame: Option<ID3D11Texture2D>,
+    /// The two newest desktop frames, kept on the GPU, with GetTickCount at
+    /// the poll that took each: a window that has just vanished can still be
+    /// read from a frame taken before it went (genie.rs).
+    frames: [Option<(ID3D11Texture2D, u32)>; 2],
+    /// Index of the newest frame.
+    cur: usize,
     /// Top-left of the output in virtual-screen coordinates.
     origin: (i32, i32),
-    staging: Option<(u32, u32, ID3D11Texture2D)>,
+    /// Staging textures by size: the glass surfaces and window snapshots
+    /// alternate, and creating one per read is not free.
+    staging: Vec<(u32, u32, ID3D11Texture2D)>,
     failures: u32,
 }
 
@@ -52,7 +59,7 @@ impl Capture {
         }
         .map_err(|e| log(format!("capture: no D3D11 device: {e}")))
         .ok()?;
-        let mut c = Capture { device: device?, ctx: ctx?, dup: None, frame: None, origin: (0, 0), staging: None, failures: 0 };
+        let mut c = Capture { device: device?, ctx: ctx?, dup: None, frames: [None, None], cur: 0, origin: (0, 0), staging: Vec::new(), failures: 0 };
         c.duplicate();
         c.dup.is_some().then_some(c)
     }
@@ -101,7 +108,7 @@ impl Capture {
             Err(e) => {
                 log(format!("capture: frame: {e}"));
                 self.dup = None;
-                self.frame = None;
+                self.frames = [None, None];
                 return false;
             }
         }
@@ -119,7 +126,9 @@ impl Capture {
     fn keep(&mut self, tex: &ID3D11Texture2D) {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { tex.GetDesc(&mut desc) };
-        let fits = self.frame.as_ref().is_some_and(|f| {
+        // The older slot takes the new frame; the current one becomes the older.
+        let slot = 1 - self.cur;
+        let fits = self.frames[slot].as_ref().is_some_and(|(f, _)| {
             let mut d = D3D11_TEXTURE2D_DESC::default();
             unsafe { f.GetDesc(&mut d) };
             d.Width == desc.Width && d.Height == desc.Height && d.Format == desc.Format
@@ -133,20 +142,37 @@ impl Capture {
             desc.ArraySize = 1;
             let mut t = None;
             if unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut t)) }.is_err() {
-                self.frame = None;
+                self.frames[slot] = None;
                 return;
             }
-            self.frame = t;
+            self.frames[slot] = t.map(|t| (t, 0));
         }
-        if let Some(f) = &self.frame {
-            unsafe { self.ctx.CopyResource(f, tex) };
+        if let Some((f, tick)) = &mut self.frames[slot] {
+            unsafe { self.ctx.CopyResource(&*f, tex) };
+            *tick = unsafe { GetTickCount() };
+            self.cur = slot;
         }
     }
 
     /// The last frame's pixels under `r` (virtual-screen coordinates), opaque
     /// premultiplied RGBA. Parts outside the output stay black.
     pub fn region(&mut self, r: WinRect) -> Option<Pixmap> {
-        let frame = self.frame.clone()?;
+        let frame = self.frames[self.cur].as_ref()?.0.clone();
+        let px = self.read(&frame, r, false)?;
+        Pixmap::from_vec(px, macrust_ui::tiny_skia::IntSize::from_wh(r.w as u32, r.h as u32)?)
+    }
+
+    /// Like `region`, but opaque BGRA, from the newest frame taken strictly
+    /// before GetTickCount `before` when given (a frame from the same tick
+    /// may already miss a window that vanished in it).
+    pub fn region_bgra(&mut self, r: WinRect, before: Option<u32>) -> Option<Vec<u8>> {
+        let older = |t: u32| before.is_none_or(|b| (b.wrapping_sub(t) as i32) > 0);
+        let pick = [self.cur, 1 - self.cur].into_iter().find_map(|i| self.frames[i].as_ref().filter(|f| older(f.1)));
+        let frame = pick?.0.clone();
+        self.read(&frame, r, true)
+    }
+
+    fn read(&mut self, frame: &ID3D11Texture2D, r: WinRect, bgra: bool) -> Option<Vec<u8>> {
         let mut d = D3D11_TEXTURE2D_DESC::default();
         unsafe { frame.GetDesc(&mut d) };
         let (fw, fh) = (d.Width as i32, d.Height as i32);
@@ -157,8 +183,10 @@ impl Capture {
         let (x0, y0) = (r.x - self.origin.0, r.y - self.origin.1);
         let (l, t) = (x0.clamp(0, fw), y0.clamp(0, fh));
         let (rr, b) = ((x0 + r.w).clamp(0, fw), (y0 + r.h).clamp(0, fh));
-        let mut out = Pixmap::new(w, h)?;
-        out.fill(macrust_ui::tiny_skia::Color::BLACK);
+        let mut out = vec![0u8; (w * h * 4) as usize];
+        for p in out.chunks_exact_mut(4) {
+            p[3] = 255;
+        }
         if rr <= l || b <= t {
             return Some(out);
         }
@@ -166,18 +194,22 @@ impl Capture {
         let bx = D3D11_BOX { left: l as u32, top: t as u32, front: 0, right: rr as u32, bottom: b as u32, back: 1 };
         let mut m = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe {
-            self.ctx.CopySubresourceRegion(&staging, 0, (l - x0) as u32, (t - y0) as u32, 0, &frame, 0, Some(&bx));
+            self.ctx.CopySubresourceRegion(&staging, 0, (l - x0) as u32, (t - y0) as u32, 0, frame, 0, Some(&bx));
             self.ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut m)).ok()?;
         }
         let pitch = m.RowPitch as usize;
         let src = unsafe { std::slice::from_raw_parts(m.pData as *const u8, pitch * h as usize) };
-        let dst = out.data_mut();
+        let (c0, c1) = ((l - x0) as usize, (rr - x0) as usize);
         for y in (t - y0) as usize..(b - y0) as usize {
-            let row = &src[y * pitch..];
-            for x in (l - x0) as usize..(rr - x0) as usize {
-                let s = &row[x * 4..x * 4 + 4];
-                // BGRA (alpha is undefined in desktop frames) -> opaque RGBA.
-                dst[(y * w as usize + x) * 4..][..4].copy_from_slice(&[s[2], s[1], s[0], 255]);
+            let row = &src[y * pitch + c0 * 4..y * pitch + c1 * 4];
+            let dst = &mut out[(y * w as usize + c0) * 4..(y * w as usize + c1) * 4];
+            dst.copy_from_slice(row);
+            for p in dst.chunks_exact_mut(4) {
+                // Alpha is undefined in desktop frames.
+                p[3] = 255;
+                if !bgra {
+                    p.swap(0, 2);
+                }
             }
         }
         unsafe { self.ctx.Unmap(&staging, 0) };
@@ -185,11 +217,11 @@ impl Capture {
     }
 
     fn staging_for(&mut self, w: u32, h: u32) -> Option<ID3D11Texture2D> {
-        if let Some((sw, sh, t)) = &self.staging
-            && *sw == w
-            && *sh == h
-        {
-            return Some(t.clone());
+        if let Some(i) = self.staging.iter().position(|(sw, sh, _)| (*sw, *sh) == (w, h)) {
+            let e = self.staging.remove(i);
+            let t = e.2.clone();
+            self.staging.insert(0, e);
+            return Some(t);
         }
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w,
@@ -206,7 +238,9 @@ impl Capture {
         let mut t = None;
         unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut t)) }.ok()?;
         let t = t?;
-        self.staging = Some((w, h, t.clone()));
+        self.staging.insert(0, (w, h, t.clone()));
+        // A few sizes in use at once (Dock, a panel, a window); the rest go.
+        self.staging.truncate(4);
         Some(t)
     }
 }
