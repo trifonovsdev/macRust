@@ -4,6 +4,7 @@ mod app;
 mod capture;
 mod catalog;
 mod config;
+mod files;
 mod genie;
 mod icons;
 mod macicons;
@@ -86,6 +87,12 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 pub fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |f: &str| args.iter().any(|a| a == f);
+    // The file manager is its own process; it must not touch the taskbar
+    // or anything else the shell owns.
+    if let Some(i) = args.iter().position(|a| a == "--files") {
+        files::run(&args[i + 1..]);
+        return;
+    }
 
     // Leaving the taskbar hidden after a crash would strand the user, so any
     // panic puts it back before the process aborts.

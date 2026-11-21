@@ -293,6 +293,11 @@ fn app_name_with(cache: &mut HashMap<String, String>, exe: &str, aumid: Option<&
     if let Some(n) = cache.get(&key) {
         return n.clone();
     }
+    // Our file manager is an unregistered id: name it ourselves.
+    if aumid.is_some_and(|a| a.eq_ignore_ascii_case(super::files::AUMID)) {
+        cache.insert(key, super::files::APP_NAME.to_string());
+        return super::files::APP_NAME.to_string();
+    }
     let name = aumid
         .and_then(registered_name)
         .or_else(|| fallback.map(str::to_string))

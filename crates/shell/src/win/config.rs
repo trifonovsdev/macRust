@@ -54,6 +54,9 @@ pub struct Settings {
     pub launch_bounce: bool,
     /// "scale" or "genie" ("Minimise windows using").
     pub minimize_effect: String,
+    /// Folders open in macRust's own file manager; false hands them to
+    /// Windows Explorer.
+    pub file_manager: bool,
 }
 
 impl Default for Settings {
@@ -71,6 +74,7 @@ impl Default for Settings {
             auto_update: true,
             launch_bounce: false,
             minimize_effect: "scale".into(),
+            file_manager: true,
         }
     }
 }
@@ -130,6 +134,7 @@ pub fn load_settings() -> Settings {
             "auto_update" => s.auto_update = b,
             "animate_opening" => s.launch_bounce = b,
             "minimize_effect" if matches!(v, "scale" | "genie") => s.minimize_effect = v.to_string(),
+            "file_manager" => s.file_manager = v != "explorer",
             _ => {}
         }
     }
@@ -147,15 +152,15 @@ pub fn load_settings() -> Settings {
     if version < 6 {
         s.minimize_effect = "scale".into();
     }
-    // Version 3 added `auto_update`, version 4 `animate_opening`; older files
-    // get them with their defaults.
+    // Version 3 added `auto_update`, version 4 `animate_opening`, version 7
+    // `file_manager`; older files get them with their defaults.
     if version < SETTINGS_VERSION {
         save_settings(&s);
     }
     s
 }
 
-const SETTINGS_VERSION: u32 = 6;
+const SETTINGS_VERSION: u32 = 7;
 
 pub fn save_settings(s: &Settings) {
     let text = format!(
@@ -163,9 +168,10 @@ pub fn save_settings(s: &Settings) {
          icon_size = {}\nmagnified_size = {}\nmagnification = {}\nhide_taskbar = {}\nreserve_dock_space = {}\n\
          # auto | light | dark\nappearance = {}\ntray_icons = {}\nbanners = {}\nauto_update = {}\n\
          # bounce a Dock icon while its app opens\nanimate_opening = {}\n\
-         # minimize windows using: scale | genie\nminimize_effect = {}\n",
+         # minimize windows using: scale | genie\nminimize_effect = {}\n\
+         # macrust (our Finder) | explorer (Windows Explorer opens folders)\nfile_manager = {}\n",
         SETTINGS_VERSION, s.icon_size, s.magnified, s.magnify, s.hide_taskbar, s.reserve_dock, s.appearance, s.tray_icons, s.banners,
-        s.auto_update, s.launch_bounce, s.minimize_effect
+        s.auto_update, s.launch_bounce, s.minimize_effect, if s.file_manager { "macrust" } else { "explorer" }
     );
     let _ = std::fs::write(settings_path(), text);
 }

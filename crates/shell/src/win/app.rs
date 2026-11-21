@@ -466,7 +466,17 @@ fn default_pins(names: &mut HashMap<String, String>) -> Vec<Pin> {
         .collect()
 }
 
+/// Our file manager's windows belong to the Explorer pin, which stands for
+/// Finder; they win over Explorer's own windows for that tile.
+fn files_pin(src: &Source, app: &RunningApp) -> bool {
+    let ours = app.aumid.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(super::files::AUMID));
+    ours && matches!(src, Source::Exe(p) if p.to_lowercase().ends_with("\\explorer.exe"))
+}
+
 fn pin_matches(src: &Source, app: &RunningApp) -> bool {
+    if files_pin(src, app) {
+        return true;
+    }
     match src {
         Source::Exe(p) => app.exe.eq_ignore_ascii_case(p) || app.relaunch_exe.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(p)),
         Source::Aumid(a) => app.aumid.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(a)),
@@ -770,7 +780,11 @@ impl App {
         let mut used = vec![false; self.running.len()];
         let mut used_lingering = vec![false; self.lingering.len()];
         for pin in self.pins.clone() {
-            let idx = self.running.iter().position(|a| pin_matches(&pin.source, a));
+            let idx = self
+                .running
+                .iter()
+                .position(|a| files_pin(&pin.source, a))
+                .or_else(|| self.running.iter().position(|a| pin_matches(&pin.source, a)));
             if let Some(i) = idx {
                 used[i] = true;
             }
