@@ -16,6 +16,7 @@ use windows::core::{Interface, PCWSTR};
 
 use super::util::{hwnd_from_isize, hwnd_to_isize, wide};
 
+#[derive(Clone)]
 pub struct Rgba {
     pub w: u32,
     pub h: u32,
