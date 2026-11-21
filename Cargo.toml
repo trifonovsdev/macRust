@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/ui", "crates/shell"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+tiny-skia = "0.12.0"
+ab_glyph = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# tiny-skia and the glyph rasterizer are unusably slow without optimizations.
+[profile.dev.package."*"]
+opt-level = 3

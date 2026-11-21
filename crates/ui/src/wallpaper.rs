@@ -1,0 +1,173 @@
+//! The desktop picture and the "vibrancy" material sampled from it.
+//!
+//! The menu bar and the dock always sit over the desktop (both reserve their
+//! strip of the work area), so their translucent background is the blurred,
+//! saturated wallpaper itself. That costs one texture lookup per pixel instead
+//! of a live backdrop blur, and the edges stay anti-aliased.
+
+use tiny_skia::{
+    Color, FilterQuality, GradientStop, LinearGradient, Paint, Pattern, Pixmap, Point, RadialGradient, Rect, Shader,
+    SpreadMode, Transform,
+};
+
+use crate::gfx::{box_blur, rgba};
+
+/// An abstract gradient desktop picture, so the shell looks right out of the box.
+pub fn procedural(w: u32, h: u32, dark: bool) -> Pixmap {
+    let mut pm = Pixmap::new(w.max(1), h.max(1)).expect("wallpaper size");
+    let (wf, hf) = (w as f32, h as f32);
+    let base: [Color; 2] = if dark {
+        [rgba(16, 22, 58, 1.0), rgba(58, 18, 64, 1.0)]
+    } else {
+        [rgba(70, 120, 214, 1.0), rgba(232, 128, 150, 1.0)]
+    };
+    let mut p = Paint::default();
+    if let Some(sh) = LinearGradient::new(
+        Point::from_xy(0.0, 0.0),
+        Point::from_xy(wf * 0.35, hf),
+        vec![GradientStop::new(0.0, base[0]), GradientStop::new(1.0, base[1])],
+        SpreadMode::Pad,
+        Transform::identity(),
+    ) {
+        p.shader = sh;
+    }
+    if let Some(r) = Rect::from_xywh(0.0, 0.0, wf, hf) {
+        pm.fill_rect(r, &p, Transform::identity(), None);
+    }
+    let blobs: &[(f32, f32, f32, Color)] = if dark {
+        &[
+            (0.18, 0.25, 0.55, rgba(40, 92, 200, 0.75)),
+            (0.82, 0.3, 0.5, rgba(150, 50, 160, 0.6)),
+            (0.6, 0.95, 0.6, rgba(220, 90, 70, 0.45)),
+            (0.1, 0.95, 0.45, rgba(20, 140, 160, 0.4)),
+        ]
+    } else {
+        &[
+            (0.15, 0.2, 0.6, rgba(110, 200, 250, 0.85)),
+            (0.85, 0.25, 0.5, rgba(178, 120, 240, 0.7)),
+            (0.65, 0.95, 0.65, rgba(255, 170, 110, 0.75)),
+            (0.05, 0.9, 0.45, rgba(80, 210, 200, 0.55)),
+            (0.45, 0.5, 0.35, rgba(255, 255, 255, 0.18)),
+        ]
+    };
+    let diag = (wf * wf + hf * hf).sqrt();
+    for &(bx, by, br, c) in blobs {
+        let center = Point::from_xy(bx * wf, by * hf);
+        let mut clear = c;
+        clear.set_alpha(0.0);
+        if let Some(sh) = RadialGradient::new(
+            center,
+            0.0,
+            center,
+            br * diag,
+            vec![GradientStop::new(0.0, c), GradientStop::new(1.0, clear)],
+            SpreadMode::Pad,
+            Transform::identity(),
+        ) {
+            let p = Paint { shader: sh, ..Paint::default() };
+            if let Some(r) = Rect::from_xywh(0.0, 0.0, wf, hf) {
+                pm.fill_rect(r, &p, Transform::identity(), None);
+            }
+        }
+    }
+    pm
+}
+
+pub struct Vibrancy {
+    low: Pixmap,
+    k: f32,
+    /// Changes whenever the wallpaper does; caches built from it compare this.
+    pub id: u64,
+}
+
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl Vibrancy {
+    /// `screen` is the wallpaper exactly as it covers the screen, in screen pixels.
+    pub fn new(screen: &Pixmap) -> Self {
+        let k = 8usize;
+        let (w, h) = (screen.width() as usize, screen.height() as usize);
+        let (lw, lh) = ((w / k).max(1), (h / k).max(1));
+        let src = screen.data();
+        let mut buf = vec![0u8; lw * lh * 4];
+        for ly in 0..lh {
+            for lx in 0..lw {
+                let mut acc = [0u32; 4];
+                let mut n = 0u32;
+                for y in ly * k..((ly + 1) * k).min(h) {
+                    for x in lx * k..((lx + 1) * k).min(w) {
+                        let i = (y * w + x) * 4;
+                        for c in 0..4 {
+                            acc[c] += src[i + c] as u32;
+                        }
+                        n += 1;
+                    }
+                }
+                let o = (ly * lw + lx) * 4;
+                for c in 0..4 {
+                    buf[o + c] = (acc[c] / n.max(1)) as u8;
+                }
+            }
+        }
+        box_blur(&mut buf, lw, lh, 4, 3, 3);
+        for px in buf.chunks_exact_mut(4) {
+            let a = px[3].max(1) as f32;
+            let (r, g, b) = (px[0] as f32 / a, px[1] as f32 / a, px[2] as f32 / a);
+            let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let sat = |v: f32| ((l + (v - l) * 1.6).clamp(0.0, 1.0) * a).round() as u8;
+            px[0] = sat(r);
+            px[1] = sat(g);
+            px[2] = sat(b);
+            px[3] = 255;
+        }
+        let size = tiny_skia::IntSize::from_wh(lw as u32, lh as u32).expect("low size");
+        Self {
+            low: Pixmap::from_vec(buf, size).expect("low pixmap"),
+            k: k as f32,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// Shader for a window whose top-left corner is at screen `ox, oy`.
+    pub fn shader(&self, ox: f32, oy: f32) -> Shader<'_> {
+        Pattern::new(
+            self.low.as_ref(),
+            SpreadMode::Pad,
+            FilterQuality::Bicubic,
+            1.0,
+            Transform::from_row(self.k, 0.0, 0.0, self.k, -ox, -oy),
+        )
+    }
+
+    /// The material for a fixed window: blurred wallpaper under `tint`, rendered
+    /// once so frames only copy it (sampling the blur live costs ~6 ms a frame).
+    pub fn material(&self, ox: f32, oy: f32, w: u32, h: u32, tint: Color) -> Option<Pixmap> {
+        let mut pm = Pixmap::new(w.max(1), h.max(1))?;
+        let rect = Rect::from_xywh(0.0, 0.0, w as f32, h as f32)?;
+        let p = Paint { shader: self.shader(ox, oy), ..Paint::default() };
+        pm.fill_rect(rect, &p, Transform::identity(), None);
+        let mut p = Paint::default();
+        p.set_color(tint);
+        pm.fill_rect(rect, &p, Transform::identity(), None);
+        Some(pm)
+    }
+
+    /// Mean luminance (0..1) of a screen rectangle of the blurred wallpaper.
+    pub fn luma(&self, x: f32, y: f32, w: f32, h: f32) -> f32 {
+        let (lw, lh) = (self.low.width() as i32, self.low.height() as i32);
+        let x0 = ((x / self.k) as i32).clamp(0, lw - 1);
+        let y0 = ((y / self.k) as i32).clamp(0, lh - 1);
+        let x1 = (((x + w) / self.k).ceil() as i32).clamp(x0 + 1, lw);
+        let y1 = (((y + h) / self.k).ceil() as i32).clamp(y0 + 1, lh);
+        let d = self.low.data();
+        let (mut sum, mut n) = (0.0, 0.0);
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let i = ((yy * lw + xx) * 4) as usize;
+                sum += (0.2126 * d[i] as f32 + 0.7152 * d[i + 1] as f32 + 0.0722 * d[i + 2] as f32) / 255.0;
+                n += 1.0;
+            }
+        }
+        if n > 0.0 { sum / n } else { 0.5 }
+    }
+}

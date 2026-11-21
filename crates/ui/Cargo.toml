@@ -1,0 +1,9 @@
+[package]
+name = "macrust-ui"
+description = "Platform-independent rendering, animation and state of the macRust shell components"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tiny-skia.workspace = true
+ab_glyph.workspace = true

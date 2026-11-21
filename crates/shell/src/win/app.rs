@@ -1,0 +1,1591 @@
+//! The shell: owns the four layered windows (menu bar, dock, search, menu),
+//! routes Win32 messages to the UI components and turns their events into
+//! actions on the system.
+
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
+use std::sync::mpsc::Receiver;
+use std::time::Instant;
+
+use macrust_ui::dock::{Dock, DockConfig, DockEntry, DockEvent, Fallback, Section};
+use macrust_ui::gfx::Image;
+use macrust_ui::menu::{MenuEntry, MenuEvent, PopupMenu};
+use macrust_ui::menubar::{BarEvent, BarItem, MenuBar, Status};
+use macrust_ui::search::{self, Index, Kind};
+use macrust_ui::spotlight::{Glyph, Row, SpotEvent, Spotlight};
+use macrust_ui::strings::Strings;
+use macrust_ui::text::Text;
+use macrust_ui::theme::Theme;
+use macrust_ui::wallpaper::{self, Vibrancy};
+use macrust_ui::{Ctx, Key, Mods, WinRect};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, MOD_ALT, MOD_NOREPEAT, RegisterHotKey, SetFocus, UnregisterHotKey, VIRTUAL_KEY, VK_BACK, VK_CONTROL,
+    VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
+    VK_TAB, VK_UP,
+};
+use windows::Win32::UI::Shell::{FOLDERID_Downloads, SHEmptyRecycleBinW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_UNCLOAKED,
+    EVENT_SYSTEM_FOREGROUND, GA_PARENT, GA_ROOTOWNER, GetAncestor, GetDesktopWindow, GetForegroundWindow, HHOOK,
+    KBDLLHOOKSTRUCT, KillTimer, MSLLHOOKSTRUCT, OBJID_WINDOW, PostMessageW, PostQuitMessage, SetForegroundWindow,
+    SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ENDSESSION, WM_HOTKEY, WM_INPUTLANGCHANGEREQUEST, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN,
+    WM_POWERBROADCAST, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_TIMER, WS_EX_NOACTIVATE,
+};
+use windows::core::PCWSTR;
+
+use super::catalog::{self, Batch};
+use super::config::{self, Pin, Settings, Source};
+use super::icons::{self, IconWorker, Request};
+use super::surface::Surface;
+use super::system::{self, Network, Power, Screen, WM_APPBAR};
+use super::tracker::{self, RunningApp};
+use super::util::{known_folder, log};
+use super::winops;
+
+/// Not re-exported by WindowsAndMessaging in this crate version.
+const WM_MOUSELEAVE: u32 = 0x02A3;
+pub const WM_APP_WINDOWS: u32 = WM_APP + 1;
+pub const WM_APP_FOREGROUND: u32 = WM_APP + 2;
+pub const WM_APP_ICON: u32 = WM_APP + 3;
+pub const WM_APP_CATALOG: u32 = WM_APP + 4;
+pub const WM_APP_DISMISS: u32 = WM_APP + 5;
+pub const WM_APP_MENUKEY: u32 = WM_APP + 6;
+pub const WM_APP_TRASH: u32 = WM_APP + 7;
+
+const TIMER_CLOCK: usize = 1;
+const TIMER_STATUS: usize = 2;
+const TIMER_CARET: usize = 3;
+const TIMER_WINDOWS: usize = 4;
+const HOTKEY_SEARCH: i32 = 1;
+
+const TRASH: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}";
+const KEY_DOWNLOADS: &str = "special:downloads";
+const KEY_TRASH: &str = "special:trash";
+
+// Menu item tags.
+const T_ABOUT: u32 = 1;
+const T_SETTINGS: u32 = 2;
+const T_STORE: u32 = 3;
+const T_FORCE_QUIT: u32 = 4;
+const T_SLEEP: u32 = 5;
+const T_RESTART: u32 = 6;
+const T_SHUTDOWN: u32 = 7;
+const T_LOCK: u32 = 8;
+const T_LOGOUT: u32 = 9;
+const T_QUIT_SHELL: u32 = 10;
+const T_CONFIRM: u32 = 20;
+const T_CANCEL: u32 = 21;
+const T_HIDE: u32 = 30;
+const T_HIDE_OTHERS: u32 = 31;
+const T_SHOW_ALL: u32 = 32;
+const T_QUIT_APP: u32 = 33;
+const T_MINIMIZE: u32 = 40;
+const T_ZOOM: u32 = 41;
+const T_LEFT: u32 = 42;
+const T_RIGHT: u32 = 43;
+const T_CENTER: u32 = 44;
+const T_BRING_ALL: u32 = 45;
+const T_DOCK_OPEN: u32 = 50;
+const T_DOCK_NEW: u32 = 51;
+const T_DOCK_PIN: u32 = 52;
+const T_DOCK_UNPIN: u32 = 53;
+const T_DOCK_REVEAL: u32 = 54;
+const T_DOCK_QUIT: u32 = 55;
+const T_EMPTY_TRASH: u32 = 56;
+const T_WINDOW_BASE: u32 = 1000;
+
+// Shared with the hook callbacks, which run on this thread but outside `App`.
+static WINDOWS_PENDING: AtomicBool = AtomicBool::new(false);
+static NOTIFY: AtomicIsize = AtomicIsize::new(0);
+static MENU_RECT: [AtomicI32; 4] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
+static BAR_H: AtomicI32 = AtomicI32::new(0);
+static MENU_FROM_BAR: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Confirm {
+    Restart,
+    ShutDown,
+    LogOut,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum MenuOwner {
+    Bar(BarItem),
+    Dock(String),
+    Confirm(Confirm),
+}
+
+enum Anchor {
+    /// Body top-left corner, screen px.
+    Below(f32, f32),
+    /// Body bottom-center, screen px.
+    Above(f32, f32),
+}
+
+enum RowAction {
+    Open { target: String, kind: Kind },
+    Calc(String),
+    Web(String),
+}
+
+#[derive(Clone)]
+enum Special {
+    None,
+    Downloads(String),
+    Trash,
+}
+
+#[derive(Clone)]
+struct DockTarget {
+    source: Option<Source>,
+    pinned: bool,
+    /// Key of the running app, when it has windows.
+    app: Option<String>,
+    special: Special,
+    name: String,
+}
+
+pub struct App {
+    ctx: Ctx,
+    settings: Settings,
+    pins: Vec<Pin>,
+    screen: Screen,
+    bar: MenuBar,
+    bar_s: Surface,
+    dock: Dock,
+    dock_s: Surface,
+    spot: Spotlight,
+    spot_s: Surface,
+    spot_clock: Instant,
+    menu: Option<PopupMenu>,
+    menu_s: Surface,
+    menu_owner: Option<MenuOwner>,
+    menu_windows: Vec<HWND>,
+    running: Vec<RunningApp>,
+    names: HashMap<String, String>,
+    fg: Option<HWND>,
+    fg_name: String,
+    targets: HashMap<String, DockTarget>,
+    dock_icons: HashMap<String, Rc<Image>>,
+    dock_failed: HashMap<String, Instant>,
+    last_appbar_place: Option<Instant>,
+    small_icons: HashMap<String, Option<Rc<Image>>>,
+    icon_worker: IconWorker,
+    /// Request id -> (cache key, is a dock icon).
+    icon_reqs: HashMap<u64, (String, bool)>,
+    icon_pending: HashSet<String>,
+    next_req: u64,
+    catalog: Receiver<Batch>,
+    index: Index,
+    row_actions: Vec<RowAction>,
+    row_icon_keys: Vec<Option<String>>,
+    net: Network,
+    net_tick: u32,
+    hooks: Vec<HHOOK>,
+    last_frame: Option<Instant>,
+    fullscreen: bool,
+    taskbar_hidden: bool,
+    taskbar_msg: u32,
+    own_pid: u32,
+}
+
+fn win_events_install() {
+    unsafe {
+        let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+        SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(win_event), 0, 0, flags);
+        SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, None, Some(win_event), 0, 0, flags);
+        SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, None, Some(win_event), 0, 0, flags);
+    }
+}
+
+fn notify(msg: u32, wp: usize) -> bool {
+    let h = HWND(NOTIFY.load(Ordering::Relaxed) as *mut _);
+    unsafe { PostMessageW(Some(h), msg, WPARAM(wp), LPARAM(0)).is_ok() }
+}
+
+thread_local! {
+    /// Top-level windows the dock knows about: destroy events of other windows are ignored.
+    static KNOWN: std::cell::RefCell<HashSet<isize>> = std::cell::RefCell::new(HashSet::new());
+}
+
+unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id_object: i32, id_child: i32, _: u32, _: u32) {
+    if event == EVENT_SYSTEM_FOREGROUND {
+        notify(WM_APP_FOREGROUND, 0);
+        return;
+    }
+    if id_object != OBJID_WINDOW.0 || id_child != 0 || hwnd.is_invalid() {
+        return;
+    }
+    // Only top-level windows change what the dock shows. A destroyed window has
+    // no parent any more, so destroys count only for windows we listed.
+    let relevant = if event == EVENT_OBJECT_DESTROY {
+        KNOWN.with(|k| k.borrow().contains(&(hwnd.0 as isize)))
+    } else {
+        unsafe { GetAncestor(hwnd, GA_PARENT) == GetDesktopWindow() }
+    };
+    if relevant && !WINDOWS_PENDING.swap(true, Ordering::Relaxed) && !notify(WM_APP_WINDOWS, 0) {
+        WINDOWS_PENDING.store(false, Ordering::Relaxed);
+    }
+}
+
+fn in_menu(p: POINT) -> bool {
+    let r: Vec<i32> = MENU_RECT.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+    p.x >= r[0] && p.x < r[2] && p.y >= r[1] && p.y < r[3]
+}
+
+/// While a menu is open: a click anywhere else closes it (the menu window never
+/// takes focus, so there is no deactivation to watch for).
+unsafe extern "system" fn ll_mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code >= 0 {
+        let m = wp.0 as u32;
+        if matches!(m, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_NCLBUTTONDOWN | WM_NCRBUTTONDOWN) {
+            let info = unsafe { &*(lp.0 as *const MSLLHOOKSTRUCT) };
+            let on_bar = MENU_FROM_BAR.load(Ordering::Relaxed) && info.pt.y < BAR_H.load(Ordering::Relaxed);
+            if !in_menu(info.pt) && !on_bar {
+                notify(WM_APP_DISMISS, 0);
+            }
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wp, lp) }
+}
+
+/// While a menu is open: arrows, Enter and Esc drive it.
+unsafe extern "system" fn ll_keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code >= 0 && matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+        let info = unsafe { &*(lp.0 as *const KBDLLHOOKSTRUCT) };
+        let vk = VIRTUAL_KEY(info.vkCode as u16);
+        if matches!(vk, VK_UP | VK_DOWN | VK_RETURN | VK_ESCAPE) {
+            notify(WM_APP_MENUKEY, vk.0 as usize);
+            return LRESULT(1);
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wp, lp) }
+}
+
+fn lparam_point(lp: LPARAM) -> (f32, f32) {
+    let x = (lp.0 & 0xffff) as u16 as i16 as f32;
+    let y = ((lp.0 >> 16) & 0xffff) as u16 as i16 as f32;
+    (x, y)
+}
+
+fn key_down(vk: VIRTUAL_KEY) -> bool {
+    unsafe { GetKeyState(vk.0 as i32) < 0 }
+}
+
+fn icon_size_for(scale: f32) -> i32 {
+    let want = (30.0 * scale).ceil() as i32;
+    [32, 48, 64, 96, 128].into_iter().find(|&s| s >= want).unwrap_or(128)
+}
+
+fn image_from(rgba: icons::Rgba, shadow: bool) -> Option<Rc<Image>> {
+    let pm = system::pixmap_from_rgba(rgba.w, rgba.h, rgba.data)?;
+    Some(Rc::new(if shadow { Image::with_shadow(pm) } else { Image::new(pm) }))
+}
+
+fn load_fonts(text: &mut Text) {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+    for f in ["segoeui.ttf", "seguisym.ttf"] {
+        if let Ok(bytes) = std::fs::read(format!("{windir}\\Fonts\\{f}"))
+            && let Ok(font) = ab_glyph_font(bytes)
+        {
+            text.add_fallback(font);
+        }
+    }
+}
+
+fn ab_glyph_font(bytes: Vec<u8>) -> Result<macrust_ui::text::FontArc, ()> {
+    macrust_ui::text::FontArc::try_from_vec(bytes).map_err(|_| ())
+}
+
+fn default_pins(names: &mut HashMap<String, String>) -> Vec<Pin> {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+    let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
+    let pf86 = std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| "C:\\Program Files (x86)".into());
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let exists = |p: &str| std::path::Path::new(p).exists();
+    let has_app = |id: &str| icons::shell_item(&format!("shell:AppsFolder\\{id}")).is_some();
+    let mut out: Vec<Source> = vec![Source::Exe(format!("{windir}\\explorer.exe"))];
+    let browsers = [
+        format!("{pf}\\Google\\Chrome\\Application\\chrome.exe"),
+        format!("{local}\\Google\\Chrome\\Application\\chrome.exe"),
+        format!("{pf}\\Mozilla Firefox\\firefox.exe"),
+        format!("{pf86}\\Microsoft\\Edge\\Application\\msedge.exe"),
+    ];
+    if let Some(b) = browsers.iter().find(|b| exists(b)) {
+        out.push(Source::Exe(b.clone()));
+    }
+    for (id, fallback) in [
+        ("Microsoft.WindowsTerminal_8wekyb3d8bbwe!App", None),
+        ("Microsoft.WindowsNotepad_8wekyb3d8bbwe!App", Some(format!("{windir}\\notepad.exe"))),
+        ("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", None),
+        ("windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel", None),
+        ("Microsoft.WindowsStore_8wekyb3d8bbwe!App", None),
+    ] {
+        if has_app(id) {
+            out.push(Source::Aumid(id.into()));
+        } else if let Some(f) = fallback
+            && exists(&f)
+        {
+            out.push(Source::Exe(f));
+        }
+    }
+    out.push(Source::Exe(format!("{windir}\\System32\\Taskmgr.exe")));
+    out.into_iter()
+        .map(|s| {
+            let name = match &s {
+                Source::Exe(p) => tracker::app_name(names, p, None),
+                Source::Aumid(a) => tracker::display_name(&s.parse_name()).unwrap_or_else(|| a.clone()),
+            };
+            Pin { name, source: s }
+        })
+        .collect()
+}
+
+fn pin_matches(src: &Source, app: &RunningApp) -> bool {
+    match src {
+        Source::Exe(p) => app.exe.eq_ignore_ascii_case(p),
+        Source::Aumid(a) => app.aumid.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(a)),
+    }
+}
+
+impl App {
+    pub fn new() -> Self {
+        let ru = system::russian_ui();
+        let strings: &'static Strings = if ru { &Strings::RU } else { &Strings::EN };
+        let settings = config::load_settings();
+        let dark = match settings.appearance.as_str() {
+            "dark" => true,
+            "light" => false,
+            _ => system::system_dark(),
+        };
+        let mut text = Text::bundled();
+        load_fonts(&mut text);
+        let ctx = Ctx::new(text, Theme { dark }, strings);
+
+        let bar_s = Surface::new(WS_EX_NOACTIVATE, "macRust menu bar");
+        let dock_s = Surface::new(WS_EX_NOACTIVATE, "macRust dock");
+        let spot_s = Surface::new(WINDOW_EX_STYLE(0), "macRust search");
+        let menu_s = Surface::new(WS_EX_NOACTIVATE, "macRust menu");
+        NOTIFY.store(bar_s.hwnd.0 as isize, Ordering::Relaxed);
+
+        let icon_worker = IconWorker::spawn(bar_s.hwnd, WM_APP_ICON);
+        let catalog = catalog::spawn(bar_s.hwnd, WM_APP_CATALOG, ru);
+        let mut names = HashMap::new();
+        let pins = config::load_pins().unwrap_or_else(|| {
+            let p = default_pins(&mut names);
+            config::save_pins(&p);
+            p
+        });
+        let taskbar_msg = unsafe { windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(windows::core::w!("TaskbarCreated")) };
+
+        let cfg = DockConfig { icon: settings.icon_size, magnified: settings.magnified, magnify: settings.magnify };
+        let mut app = Self {
+            ctx,
+            settings,
+            pins,
+            screen: system::primary_screen(),
+            bar: MenuBar::new(),
+            bar_s,
+            dock: Dock::new(cfg),
+            dock_s,
+            spot: Spotlight::new(),
+            spot_s,
+            spot_clock: Instant::now(),
+            menu: None,
+            menu_s,
+            menu_owner: None,
+            menu_windows: Vec::new(),
+            running: Vec::new(),
+            names,
+            fg: None,
+            fg_name: String::new(),
+            targets: HashMap::new(),
+            dock_icons: HashMap::new(),
+            dock_failed: HashMap::new(),
+            last_appbar_place: None,
+            small_icons: HashMap::new(),
+            icon_worker,
+            icon_reqs: HashMap::new(),
+            icon_pending: HashSet::new(),
+            next_req: 1,
+            catalog,
+            index: Index::default(),
+            row_actions: Vec::new(),
+            row_icon_keys: Vec::new(),
+            net: Network::new(),
+            net_tick: 0,
+            hooks: Vec::new(),
+            last_frame: None,
+            fullscreen: false,
+            taskbar_hidden: false,
+            taskbar_msg,
+            own_pid: unsafe { GetCurrentProcessId() },
+        };
+
+        if app.settings.hide_taskbar {
+            system::hide_taskbar();
+            app.taskbar_hidden = true;
+            system::spawn_watchdog();
+        }
+        system::appbar_register(app.bar_s.hwnd);
+        if app.settings.reserve_dock {
+            system::appbar_register(app.dock_s.hwnd);
+        }
+        app.configure(true);
+        app.refresh_windows();
+        app.refresh_foreground();
+        win_events_install();
+        unsafe {
+            if RegisterHotKey(Some(app.bar_s.hwnd), HOTKEY_SEARCH, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32).is_err() {
+                log("Alt+Space is taken by another program; open search from the menu bar");
+            }
+            SetTimer(Some(app.bar_s.hwnd), TIMER_STATUS, 1000, None);
+        }
+        app.schedule_clock();
+        app
+    }
+
+    /// Screen size, scale, wallpaper material and app-bar reservations.
+    fn configure(&mut self, reload_wallpaper: bool) {
+        self.screen = system::primary_screen();
+        let (w, h, s) = (self.screen.w as f32, self.screen.h as f32, self.screen.scale);
+        self.bar.set_screen(w, s, &self.ctx);
+        self.dock.set_screen(w, h, s);
+        self.spot.set_screen(w, h, s);
+        BAR_H.store(self.bar.height_px(), Ordering::Relaxed);
+        if reload_wallpaper {
+            let wall = system::wallpaper(self.screen.w as u32, self.screen.h as u32)
+                .unwrap_or_else(|| wallpaper::procedural(self.screen.w as u32, self.screen.h as u32, self.ctx.theme.dark));
+            self.ctx.vibrancy = Some(Vibrancy::new(&wall));
+        }
+        self.bar.update_contrast(&self.ctx);
+        self.place_appbars();
+        self.bar_s.dirty = true;
+        self.dock_s.dirty = true;
+        self.spot_s.dirty = true;
+    }
+
+    fn place_appbars(&mut self) {
+        self.last_appbar_place = Some(Instant::now());
+        system::appbar_place(self.bar_s.hwnd, true, &self.screen, self.bar.height_px());
+        if self.settings.reserve_dock {
+            system::appbar_place(self.dock_s.hwnd, false, &self.screen, self.dock.reserved_height());
+        }
+    }
+
+    fn schedule_clock(&self) {
+        let (_, _, _, _, _, sec) = system::local_time();
+        let ms = (60 - sec.min(59)) * 1000 + 50;
+        unsafe {
+            SetTimer(Some(self.bar_s.hwnd), TIMER_CLOCK, ms, None);
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        self.unhook_menu();
+        unsafe {
+            let _ = UnregisterHotKey(Some(self.bar_s.hwnd), HOTKEY_SEARCH);
+        }
+        system::appbar_remove(self.bar_s.hwnd);
+        if self.settings.reserve_dock {
+            system::appbar_remove(self.dock_s.hwnd);
+        }
+        if self.taskbar_hidden {
+            system::restore_taskbar();
+            self.taskbar_hidden = false;
+        }
+    }
+
+    fn quit(&mut self) {
+        self.shutdown();
+        unsafe { PostQuitMessage(0) };
+    }
+
+    // -----------------------------------------------------------------------
+    // Windows, apps and the dock
+
+    /// The cached dock icon; a missing one is requested from the icon thread and
+    /// the dock is rebuilt when it arrives. Failures are retried after a minute.
+    fn dock_icon(&mut self, parse_name: &str) -> Option<Rc<Image>> {
+        let key = parse_name.to_lowercase();
+        if let Some(i) = self.dock_icons.get(&key) {
+            return Some(i.clone());
+        }
+        if self.dock_failed.get(&key).is_some_and(|t| t.elapsed().as_secs() < 60) || self.icon_pending.contains(&key) {
+            return None;
+        }
+        let id = self.next_req;
+        self.next_req += 1;
+        self.icon_pending.insert(key.clone());
+        self.icon_reqs.insert(id, (key, true));
+        self.icon_worker.request(Request { id, parse_name: parse_name.to_string(), size: 256 });
+        None
+    }
+
+    fn refresh_windows(&mut self) {
+        self.running = tracker::snapshot(&mut self.names);
+        KNOWN.with(|k| {
+            let mut k = k.borrow_mut();
+            k.clear();
+            k.extend(self.running.iter().flat_map(|a| a.windows.iter().map(|w| w.0 as isize)));
+        });
+        self.rebuild_dock();
+    }
+
+    fn rebuild_dock(&mut self) {
+        let mut entries = Vec::new();
+        let mut targets = HashMap::new();
+        let mut used = vec![false; self.running.len()];
+        for pin in self.pins.clone() {
+            let idx = self.running.iter().position(|a| pin_matches(&pin.source, a));
+            if let Some(i) = idx {
+                used[i] = true;
+            }
+            let key = pin.source.key();
+            let icon = self.dock_icon(&pin.source.parse_name());
+            entries.push(DockEntry {
+                key: key.clone(),
+                label: pin.name.clone(),
+                icon,
+                running: idx.is_some(),
+                section: Section::Apps,
+                fallback: Fallback::App,
+            });
+            targets.insert(
+                key,
+                DockTarget {
+                    source: Some(pin.source.clone()),
+                    pinned: true,
+                    app: idx.map(|i| self.running[i].key.clone()),
+                    special: Special::None,
+                    name: pin.name.clone(),
+                },
+            );
+        }
+        for a in self.running.clone().into_iter().zip(used).filter(|(_, u)| !u).map(|(a, _)| a) {
+            let source = match &a.aumid {
+                Some(id) => Source::Aumid(id.clone()),
+                None => Source::Exe(a.exe.clone()),
+            };
+            let icon = self.dock_icon(&source.parse_name());
+            entries.push(DockEntry {
+                key: a.key.clone(),
+                label: a.name.clone(),
+                icon,
+                running: true,
+                section: Section::Apps,
+                fallback: Fallback::App,
+            });
+            targets.insert(
+                a.key.clone(),
+                DockTarget { source: Some(source), pinned: false, app: Some(a.key.clone()), special: Special::None, name: a.name },
+            );
+        }
+        if let Some(dl) = known_folder(&FOLDERID_Downloads) {
+            let path = dl.to_string_lossy().into_owned();
+            let icon = self.dock_icon(&path);
+            entries.push(DockEntry {
+                key: KEY_DOWNLOADS.into(),
+                label: self.ctx.strings.downloads.into(),
+                icon,
+                running: false,
+                section: Section::Stacks,
+                fallback: Fallback::Folder,
+            });
+            targets.insert(
+                KEY_DOWNLOADS.into(),
+                DockTarget { source: None, pinned: true, app: None, special: Special::Downloads(path), name: String::new() },
+            );
+        }
+        let icon = self.dock_icon(TRASH);
+        entries.push(DockEntry {
+            key: KEY_TRASH.into(),
+            label: self.ctx.strings.trash.into(),
+            icon,
+            running: false,
+            section: Section::Stacks,
+            fallback: Fallback::Trash,
+        });
+        targets.insert(
+            KEY_TRASH.into(),
+            DockTarget { source: None, pinned: true, app: None, special: Special::Trash, name: String::new() },
+        );
+        self.targets = targets;
+        self.dock.set_entries(entries);
+        self.dock_s.dirty = true;
+    }
+
+    fn app_by_key(&self, key: &str) -> Option<&RunningApp> {
+        self.running.iter().find(|a| a.key == key)
+    }
+
+    fn fg_app(&self) -> Option<&RunningApp> {
+        let fg = self.fg?;
+        self.running.iter().find(|a| a.windows.contains(&fg))
+    }
+
+    fn refresh_foreground(&mut self) {
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.is_invalid() || tracker::window_pid(fg) == self.own_pid {
+            return;
+        }
+        let root = unsafe { GetAncestor(fg, GA_ROOTOWNER) };
+        let root = if root.is_invalid() { fg } else { root };
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+        if tracker::is_desktop_class(&tracker::class_name(root)) {
+            self.fg = None;
+            self.fg_name = tracker::app_name(&mut self.names, &format!("{windir}\\explorer.exe"), None);
+        } else {
+            self.fg = Some(root);
+            let (exe, aumid) = tracker::identify(root);
+            self.fg_name = exe.map(|e| tracker::app_name(&mut self.names, &e, aumid.as_deref())).unwrap_or_default();
+        }
+        self.refresh_status();
+    }
+
+    fn refresh_status(&mut self) {
+        let (wd, day, mon, h, m, _) = system::local_time();
+        let lang_window = self.fg.unwrap_or_else(|| unsafe { GetForegroundWindow() });
+        self.net_tick += 1;
+        let wifi = if self.net_tick % 5 == 1 { self.net.connected() } else { self.bar.status().wifi };
+        let st = Status {
+            app: self.fg_name.clone(),
+            lang: system::input_language(lang_window),
+            battery: system::battery(),
+            wifi,
+            clock: self.ctx.strings.clock(wd, day, mon, h, m),
+        };
+        if self.bar.set_status(st, &self.ctx) {
+            self.bar_s.dirty = true;
+        }
+    }
+
+    fn launch(&mut self, key: &str, src: &Source) {
+        system::open(&src.parse_name());
+        self.dock.bounce(key);
+    }
+
+    fn dock_click(&mut self, key: &str) {
+        let Some(t) = self.targets.get(key).cloned() else { return };
+        match t.special {
+            Special::Downloads(p) => system::open(&p),
+            Special::Trash => system::open("shell:RecycleBinFolder"),
+            Special::None => {
+                let app = t.app.as_deref().and_then(|k| self.app_by_key(k)).cloned();
+                match (app, t.source) {
+                    (Some(app), _) => {
+                        // With the search panel up, the previous app only looks active.
+                        let active = !self.spot.is_visible() && self.fg.is_some_and(|f| app.windows.contains(&f));
+                        let all_min = app.windows.iter().all(|&w| winops::is_minimized(w));
+                        if active && !all_min {
+                            for &w in &app.windows {
+                                winops::minimize(w);
+                            }
+                        } else {
+                            for &w in app.windows.iter().rev() {
+                                if winops::is_minimized(w) {
+                                    winops::restore(w);
+                                }
+                                winops::raise(w);
+                            }
+                            winops::activate(app.windows[0]);
+                        }
+                    }
+                    (None, Some(src)) => self.launch(key, &src),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Menus
+
+    fn hook_menu(&mut self) {
+        if !self.hooks.is_empty() {
+            return;
+        }
+        unsafe {
+            if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse), None, 0) {
+                self.hooks.push(h);
+            }
+            if let Ok(h) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard), None, 0) {
+                self.hooks.push(h);
+            }
+        }
+    }
+
+    fn unhook_menu(&mut self) {
+        for h in self.hooks.drain(..) {
+            unsafe {
+                let _ = UnhookWindowsHookEx(h);
+            }
+        }
+    }
+
+    fn open_menu(&mut self, entries: Vec<MenuEntry>, owner: MenuOwner, anchor: Anchor) {
+        let s = self.screen.scale;
+        let m = PopupMenu::new(entries, 0, s, &self.ctx);
+        let (w, h) = m.window_size();
+        let (ox, oy) = m.body_offset();
+        let (bw, bh) = m.body_size();
+        let (bx, by) = match anchor {
+            Anchor::Below(x, y) => (x, y),
+            Anchor::Above(cx, bottom) => (cx - bw / 2.0, bottom - bh),
+        };
+        let bx = bx.clamp(4.0 * s, self.screen.w as f32 - bw - 4.0 * s).round() as i32;
+        let by = by.max(0.0).round() as i32;
+        self.menu_s.prepare(WinRect { x: bx - ox, y: by - oy, w, h });
+        for (a, v) in MENU_RECT.iter().zip([bx, by, bx + bw as i32, by + bh as i32]) {
+            a.store(v, Ordering::Relaxed);
+        }
+        MENU_FROM_BAR.store(matches!(owner, MenuOwner::Bar(_) | MenuOwner::Confirm(_)), Ordering::Relaxed);
+        self.dock.set_menu_open(matches!(owner, MenuOwner::Dock(_)));
+        self.menu = Some(m);
+        self.menu_owner = Some(owner);
+        self.menu_s.dirty = true;
+        self.render();
+        self.menu_s.raise();
+        // Windows silently drops a low-level hook that was once too slow; a
+        // fresh pair per menu keeps "click outside closes" working.
+        self.unhook_menu();
+        self.hook_menu();
+    }
+
+    /// Fades the open menu out (or drops it at once when another one replaces it).
+    fn close_menu(&mut self, animated: bool) {
+        self.unhook_menu();
+        if let Some(m) = &mut self.menu {
+            if animated {
+                m.close();
+            } else {
+                self.menu = None;
+                self.menu_s.hide();
+            }
+        }
+        if matches!(self.menu_owner, Some(MenuOwner::Bar(_)) | Some(MenuOwner::Confirm(_))) {
+            self.bar.set_open(None);
+        }
+        self.dock.set_menu_open(false);
+        self.menu_owner = None;
+        self.bar_s.dirty = true;
+        self.dock_s.dirty = true;
+        self.menu_s.dirty = true;
+    }
+
+    fn bar_menu(&self, item: BarItem) -> Vec<MenuEntry> {
+        let s = self.ctx.strings;
+        let app = self.fg_name.as_str();
+        let has_fg = self.fg.is_some();
+        match item {
+            BarItem::Logo => vec![
+                MenuEntry::item(s.about, T_ABOUT),
+                MenuEntry::sep(),
+                MenuEntry::item(s.settings, T_SETTINGS),
+                MenuEntry::item(s.store, T_STORE),
+                MenuEntry::sep(),
+                MenuEntry::item(s.force_quit, T_FORCE_QUIT).shortcut("Ctrl+Shift+Esc"),
+                MenuEntry::sep(),
+                MenuEntry::item(s.sleep, T_SLEEP),
+                MenuEntry::item(s.restart, T_RESTART),
+                MenuEntry::item(s.shut_down, T_SHUTDOWN),
+                MenuEntry::sep(),
+                MenuEntry::item(s.lock, T_LOCK).shortcut("Win+L"),
+                MenuEntry::item(s.log_out, T_LOGOUT),
+                MenuEntry::sep(),
+                MenuEntry::item(s.quit_shell, T_QUIT_SHELL),
+            ],
+            BarItem::App => vec![
+                MenuEntry::item(s.with_app(s.hide, app), T_HIDE).enabled(has_fg),
+                MenuEntry::item(s.hide_others, T_HIDE_OTHERS),
+                MenuEntry::item(s.show_all, T_SHOW_ALL),
+                MenuEntry::sep(),
+                MenuEntry::item(s.with_app(s.quit, app), T_QUIT_APP).enabled(has_fg).shortcut("Alt+F4"),
+            ],
+            _ => vec![
+                MenuEntry::item(s.minimize, T_MINIMIZE).enabled(has_fg).shortcut("Win+↓"),
+                MenuEntry::item(s.zoom, T_ZOOM).enabled(has_fg),
+                MenuEntry::sep(),
+                MenuEntry::item(s.tile_left, T_LEFT).enabled(has_fg).shortcut("Win+←"),
+                MenuEntry::item(s.tile_right, T_RIGHT).enabled(has_fg).shortcut("Win+→"),
+                MenuEntry::item(s.center, T_CENTER).enabled(has_fg),
+                MenuEntry::sep(),
+                MenuEntry::item(s.bring_all, T_BRING_ALL).enabled(has_fg),
+            ],
+        }
+    }
+
+    fn dock_menu(&mut self, key: &str) -> Vec<MenuEntry> {
+        let s = self.ctx.strings;
+        let Some(t) = self.targets.get(key).cloned() else { return Vec::new() };
+        self.menu_windows.clear();
+        match t.special {
+            Special::Downloads(_) => {
+                vec![MenuEntry::item(s.open, T_DOCK_OPEN), MenuEntry::item(s.show_in_folder, T_DOCK_REVEAL)]
+            }
+            Special::Trash => vec![MenuEntry::item(s.open, T_DOCK_OPEN), MenuEntry::sep(), MenuEntry::item(s.empty_trash, T_EMPTY_TRASH)],
+            Special::None => {
+                let mut e = Vec::new();
+                let app = t.app.as_deref().and_then(|k| self.app_by_key(k)).cloned();
+                if let Some(app) = &app {
+                    for (i, &w) in app.windows.iter().take(12).enumerate() {
+                        let title = tracker::title(w);
+                        e.push(MenuEntry::item(title, T_WINDOW_BASE + i as u32).checked(self.fg == Some(w)));
+                        self.menu_windows.push(w);
+                    }
+                    e.push(MenuEntry::sep());
+                }
+                e.push(if t.pinned {
+                    MenuEntry::item(s.remove_from_dock, T_DOCK_UNPIN)
+                } else {
+                    MenuEntry::item(s.keep_in_dock, T_DOCK_PIN)
+                });
+                if matches!(t.source, Some(Source::Exe(_))) {
+                    e.push(MenuEntry::item(s.show_in_folder, T_DOCK_REVEAL));
+                }
+                e.push(MenuEntry::sep());
+                if app.is_some() {
+                    e.push(MenuEntry::item(s.new_window, T_DOCK_NEW));
+                    e.push(MenuEntry::item(s.with_app(s.quit, &t.name), T_DOCK_QUIT));
+                } else {
+                    e.push(MenuEntry::item(s.open, T_DOCK_OPEN));
+                }
+                e
+            }
+        }
+    }
+
+    fn confirm(&mut self, c: Confirm) {
+        let s = self.ctx.strings;
+        let label = match c {
+            Confirm::Restart => s.restart_now,
+            Confirm::ShutDown => s.shut_down_now,
+            Confirm::LogOut => s.log_out_now,
+        };
+        let x = 6.0 * self.screen.scale;
+        let y = self.bar.height_px() as f32;
+        self.bar.set_open(Some(BarItem::Logo));
+        self.open_menu(
+            vec![MenuEntry::item(label, T_CONFIRM), MenuEntry::sep(), MenuEntry::item(s.cancel, T_CANCEL)],
+            MenuOwner::Confirm(c),
+            Anchor::Below(x, y),
+        );
+    }
+
+    fn handle_pick(&mut self, tag: u32, owner: Option<MenuOwner>) {
+        let fg_windows: Vec<HWND> = self.fg_app().map(|a| a.windows.clone()).unwrap_or_default();
+        match tag {
+            T_ABOUT => system::open("ms-settings:about"),
+            T_SETTINGS => system::open("ms-settings:"),
+            T_STORE => system::open("ms-windows-store:"),
+            T_FORCE_QUIT => system::open("taskmgr.exe"),
+            T_SLEEP => system::power(Power::Sleep),
+            T_LOCK => system::power(Power::Lock),
+            T_RESTART => self.confirm(Confirm::Restart),
+            T_SHUTDOWN => self.confirm(Confirm::ShutDown),
+            T_LOGOUT => self.confirm(Confirm::LogOut),
+            T_CONFIRM => match owner {
+                // WM_ENDSESSION tears the shell down if the session really ends;
+                // an app or the user can still cancel it.
+                Some(MenuOwner::Confirm(Confirm::Restart)) => system::power(Power::Restart),
+                // WM_ENDSESSION tears the shell down if the session really ends;
+                // an app or the user can still cancel it.
+                Some(MenuOwner::Confirm(Confirm::ShutDown)) => system::power(Power::ShutDown),
+                // WM_ENDSESSION tears the shell down if the session really ends;
+                // an app or the user can still cancel it.
+                Some(MenuOwner::Confirm(Confirm::LogOut)) => system::power(Power::LogOut),
+                _ => {}
+            },
+            T_CANCEL => {}
+            T_QUIT_SHELL => self.quit(),
+            T_HIDE => fg_windows.iter().for_each(|&w| winops::minimize(w)),
+            T_HIDE_OTHERS => {
+                for a in &self.running {
+                    if !a.windows.iter().any(|w| fg_windows.contains(w)) {
+                        a.windows.iter().for_each(|&w| winops::minimize(w));
+                    }
+                }
+            }
+            T_SHOW_ALL => {
+                for a in &self.running {
+                    a.windows.iter().filter(|&&w| winops::is_minimized(w)).for_each(|&w| winops::restore(w));
+                }
+            }
+            T_QUIT_APP => fg_windows.iter().for_each(|&w| winops::close(w)),
+            T_MINIMIZE | T_ZOOM | T_LEFT | T_RIGHT | T_CENTER => {
+                if let Some(w) = self.fg {
+                    match tag {
+                        T_MINIMIZE => winops::minimize(w),
+                        T_ZOOM => winops::toggle_zoom(w),
+                        T_LEFT => winops::tile(w, true),
+                        T_RIGHT => winops::tile(w, false),
+                        _ => winops::center(w),
+                    }
+                }
+            }
+            T_BRING_ALL => {
+                for &w in fg_windows.iter().rev() {
+                    winops::raise(w);
+                }
+                if let Some(&w) = fg_windows.first() {
+                    winops::activate(w);
+                }
+            }
+            _ => {
+                let Some(MenuOwner::Dock(key)) = owner else { return };
+                self.handle_dock_pick(tag, &key);
+            }
+        }
+    }
+
+    fn handle_dock_pick(&mut self, tag: u32, key: &str) {
+        let Some(t) = self.targets.get(key).cloned() else { return };
+        match tag {
+            T_DOCK_OPEN => self.dock_click(key),
+            T_DOCK_NEW => {
+                if let Some(src) = &t.source {
+                    self.launch(key, src);
+                }
+            }
+            T_DOCK_PIN => {
+                if let Some(src) = t.source {
+                    self.pins.push(Pin { name: t.name.clone(), source: src });
+                    config::save_pins(&self.pins);
+                    self.rebuild_dock();
+                }
+            }
+            T_DOCK_UNPIN => {
+                self.pins.retain(|p| p.source.key() != key);
+                config::save_pins(&self.pins);
+                self.rebuild_dock();
+            }
+            T_DOCK_REVEAL => match (&t.special, &t.source) {
+                (Special::Downloads(p), _) => system::open(p),
+                (_, Some(Source::Exe(p))) => system::reveal(p),
+                _ => {}
+            },
+            T_DOCK_QUIT => {
+                if let Some(app) = t.app.as_deref().and_then(|k| self.app_by_key(k)) {
+                    app.windows.iter().for_each(|&w| winops::close(w));
+                }
+            }
+            T_EMPTY_TRASH => {
+                // The shell shows its own confirmation, a modal loop: keep it off this thread.
+                std::thread::spawn(|| unsafe {
+                    let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+                    let _ = SHEmptyRecycleBinW(None, PCWSTR::null(), 0);
+                    notify(WM_APP_TRASH, 0);
+                });
+            }
+            t if t >= T_WINDOW_BASE => {
+                if let Some(&w) = self.menu_windows.get((t - T_WINDOW_BASE) as usize) {
+                    winops::activate(w);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Search
+
+    fn show_search(&mut self) {
+        self.close_menu(false);
+        self.spot.show();
+        self.spot_clock = Instant::now();
+        self.spot_s.dirty = true;
+        self.render();
+        self.spot_s.raise();
+        unsafe {
+            if !SetForegroundWindow(self.spot_s.hwnd).as_bool() {
+                winops::activate(self.spot_s.hwnd);
+            }
+            let _ = SetFocus(Some(self.spot_s.hwnd));
+            SetTimer(Some(self.spot_s.hwnd), TIMER_CARET, 265, None);
+        }
+        if !self.spot.query().is_empty() {
+            self.on_query(self.spot.query());
+        }
+    }
+
+    fn hide_search(&mut self) {
+        self.spot.hide();
+        self.spot_s.dirty = true;
+        unsafe {
+            let _ = KillTimer(Some(self.spot_s.hwnd), TIMER_CARET);
+        }
+    }
+
+    fn on_query(&mut self, q: String) {
+        let s = self.ctx.strings;
+        let mut rows = Vec::new();
+        self.row_actions.clear();
+        self.row_icon_keys.clear();
+        if let Some(v) = search::calc(&q) {
+            let text = search::format_number(v);
+            rows.push(Row { title: format!("= {text}"), subtitle: format!("{} · {}", s.kind_calc, s.calc_hint), icon: None, glyph: Glyph::Calculator });
+            self.row_actions.push(RowAction::Calc(text));
+            self.row_icon_keys.push(None);
+        }
+        for i in self.index.search(&q, 40) {
+            let e = self.index.get(i);
+            let parent = || std::path::Path::new(&e.target).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            let (subtitle, glyph) = match e.kind {
+                Kind::App => (s.kind_app.to_string(), Glyph::App),
+                Kind::Setting => (s.kind_setting.to_string(), Glyph::Settings),
+                Kind::Folder => (parent(), Glyph::Folder),
+                Kind::File => (parent(), Glyph::Document),
+            };
+            let icon_key = match e.kind {
+                Kind::Setting => None,
+                Kind::File => {
+                    let ext = std::path::Path::new(&e.target)
+                        .extension()
+                        .map(|x| x.to_string_lossy().to_lowercase())
+                        .unwrap_or_default();
+                    // Type icons are shared; these types carry their own.
+                    if matches!(ext.as_str(), "exe" | "lnk" | "url" | "ico" | "appref-ms" | "") {
+                        Some(e.target.clone())
+                    } else {
+                        Some(format!("ext:{ext}|{}", e.target))
+                    }
+                }
+                _ => Some(e.target.clone()),
+            };
+            let icon = icon_key.as_ref().and_then(|k| self.small_icons.get(&cache_key(k)).cloned().flatten());
+            rows.push(Row { title: e.name.clone(), subtitle, icon, glyph });
+            self.row_actions.push(RowAction::Open { target: e.target.clone(), kind: e.kind });
+            self.row_icon_keys.push(icon_key.map(|k| cache_key(&k)));
+            if let Some(k) = self.row_icon_keys.last().cloned().flatten() {
+                let parse = e.target.clone();
+                self.request_icon(k, parse);
+            }
+        }
+        if !q.trim().is_empty() {
+            rows.push(Row { title: format!("{} «{}»", s.web_search, q.trim()), subtitle: String::new(), icon: None, glyph: Glyph::Web });
+            self.row_actions.push(RowAction::Web(q.trim().to_string()));
+            self.row_icon_keys.push(None);
+        }
+        self.spot.set_rows(rows);
+        self.spot_s.dirty = true;
+    }
+
+    fn request_icon(&mut self, key: String, parse_name: String) {
+        if self.small_icons.contains_key(&key) || self.icon_pending.contains(&key) {
+            return;
+        }
+        let id = self.next_req;
+        self.next_req += 1;
+        self.icon_pending.insert(key.clone());
+        self.icon_reqs.insert(id, (key, false));
+        self.icon_worker.request(Request { id, parse_name, size: icon_size_for(self.screen.scale) });
+    }
+
+    fn icons_arrived(&mut self) {
+        let mut dock_changed = false;
+        while let Ok((id, rgba)) = self.icon_worker.rx.try_recv() {
+            let Some((key, dock)) = self.icon_reqs.remove(&id) else { continue };
+            self.icon_pending.remove(&key);
+            if dock {
+                match rgba.and_then(|r| image_from(r, true)) {
+                    Some(img) => {
+                        self.dock_icons.insert(key, img);
+                        dock_changed = true;
+                    }
+                    None => {
+                        self.dock_failed.insert(key, Instant::now());
+                    }
+                }
+                continue;
+            }
+            let img = rgba.and_then(|r| image_from(r, false));
+            if let Some(img) = &img {
+                for (i, k) in self.row_icon_keys.iter().enumerate() {
+                    if k.as_deref() == Some(key.as_str()) {
+                        self.spot.set_row_icon(i, img.clone());
+                    }
+                }
+                self.spot_s.dirty = true;
+            }
+            self.small_icons.insert(key, img);
+        }
+        if dock_changed {
+            self.rebuild_dock();
+        }
+    }
+
+    fn catalog_arrived(&mut self) {
+        let mut changed = false;
+        while let Ok(b) = self.catalog.try_recv() {
+            changed = true;
+            match b {
+                Batch::Apps(list) => {
+                    self.index.remove_kind(Kind::App);
+                    self.index.remove_kind(Kind::Setting);
+                    self.index.extend(list);
+                }
+                Batch::Files { entries, first } => {
+                    if first {
+                        self.index.remove_kind(Kind::File);
+                        self.index.remove_kind(Kind::Folder);
+                    }
+                    self.index.extend(entries);
+                }
+            }
+        }
+        // Refresh visible results unless the user is already moving through them.
+        if changed && self.spot.is_visible() && self.spot.selected().unwrap_or(0) == 0 && !self.spot.query().is_empty() {
+            self.on_query(self.spot.query());
+        }
+    }
+
+    fn run_row(&mut self, i: usize, reveal: bool) {
+        let Some(a) = self.row_actions.get(i) else { return };
+        match a {
+            RowAction::Calc(text) => system::set_clipboard(self.spot_s.hwnd, text),
+            RowAction::Web(q) => {
+                let enc: String = q
+                    .bytes()
+                    .map(|b| match b {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+                        b' ' => "+".into(),
+                        _ => format!("%{b:02X}"),
+                    })
+                    .collect();
+                system::open(&format!("https://www.google.com/search?q={enc}"));
+            }
+            RowAction::Open { target, kind } => {
+                if reveal && matches!(kind, Kind::File | Kind::Folder) {
+                    system::reveal(target);
+                } else {
+                    system::open(target);
+                }
+            }
+        }
+        self.hide_search();
+    }
+
+    fn bar_click(&mut self, item: BarItem) {
+        match item {
+            BarItem::Search => {
+                if self.spot.is_visible() {
+                    self.hide_search();
+                } else {
+                    self.show_search();
+                }
+            }
+            BarItem::Lang => {
+                if let Some(w) = self.fg {
+                    const HKL_NEXT: isize = 1;
+                    unsafe {
+                        let _ = PostMessageW(Some(w), WM_INPUTLANGCHANGEREQUEST, WPARAM(0), LPARAM(HKL_NEXT));
+                    }
+                }
+            }
+            BarItem::Battery => system::open("ms-settings:batterysaver"),
+            BarItem::Wifi => system::open("ms-availablenetworks:"),
+            BarItem::Clock => system::open("ms-actioncenter:"),
+            _ => {}
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Events and frames
+
+    fn pump_events(&mut self) {
+        for e in std::mem::take(&mut self.bar.events) {
+            match e {
+                BarEvent::Open { item, x, bottom } => {
+                    self.close_menu(false);
+                    self.bar.set_open(Some(item));
+                    let entries = self.bar_menu(item);
+                    self.open_menu(entries, MenuOwner::Bar(item), Anchor::Below(x, bottom));
+                }
+                BarEvent::CloseMenus => self.close_menu(true),
+                BarEvent::Click(item) => self.bar_click(item),
+            }
+        }
+        for e in std::mem::take(&mut self.dock.events) {
+            match e {
+                DockEvent::Click(key) => {
+                    self.close_menu(true);
+                    self.dock_click(&key);
+                }
+                DockEvent::Menu { key, x, y } => {
+                    self.close_menu(false);
+                    let entries = self.dock_menu(&key);
+                    let r = self.dock.window_rect();
+                    let gap = 10.0 * self.screen.scale;
+                    self.open_menu(entries, MenuOwner::Dock(key), Anchor::Above(r.x as f32 + x, r.y as f32 + y - gap));
+                }
+            }
+        }
+        for e in std::mem::take(&mut self.spot.events) {
+            match e {
+                SpotEvent::Query(q) => self.on_query(q),
+                SpotEvent::Run(i) => self.run_row(i, false),
+                SpotEvent::Reveal(i) => self.run_row(i, true),
+                SpotEvent::Close => self.hide_search(),
+            }
+        }
+        let picks: Vec<MenuEvent> = self.menu.as_mut().map(|m| std::mem::take(&mut m.events)).unwrap_or_default();
+        for MenuEvent::Pick(tag) in picks {
+            let owner = self.menu_owner.clone();
+            self.close_menu(true);
+            self.handle_pick(tag, owner);
+        }
+    }
+
+    pub fn animating(&self) -> bool {
+        self.dock.animating() || self.spot.animating() || self.menu.as_ref().is_some_and(|m| m.animating())
+    }
+
+    pub fn frame(&mut self) {
+        let now = Instant::now();
+        let dt = self.last_frame.map(|l| (now - l).as_secs_f32()).unwrap_or(1.0 / 120.0).min(0.05);
+        self.last_frame = Some(now);
+        if self.dock.animating() {
+            self.dock.update(dt);
+            self.dock_s.dirty = true;
+        }
+        if self.spot.shown() {
+            let caret = self.spot.caret_visible();
+            let sdt = (now - self.spot_clock).as_secs_f32();
+            self.spot_clock = now;
+            let moving = self.spot.animating();
+            self.spot.update(sdt);
+            if moving || caret != self.spot.caret_visible() {
+                self.spot_s.dirty = true;
+            }
+        }
+        if let Some(m) = &mut self.menu
+            && m.animating()
+        {
+            m.update(dt);
+            self.menu_s.dirty = true;
+        }
+        self.pump_events();
+        if self.menu.as_ref().is_some_and(|m| m.finished()) {
+            self.menu = None;
+            self.menu_s.hide();
+        }
+        if !self.spot.shown() && self.spot_s.shown {
+            self.spot_s.hide();
+        }
+        self.render();
+        if !self.animating() {
+            self.last_frame = None;
+        }
+    }
+
+    fn render(&mut self) {
+        if !self.fullscreen {
+            if self.bar_s.dirty {
+                self.bar_s.prepare(self.bar.window_rect());
+                self.bar.draw(&mut self.bar_s.pm, &self.ctx);
+                self.bar_s.present();
+            }
+            if self.dock_s.dirty {
+                self.dock_s.prepare(self.dock.window_rect());
+                self.dock.draw(&mut self.dock_s.pm, &self.ctx);
+                self.dock_s.present();
+            }
+        }
+        if self.spot_s.dirty && self.spot.shown() {
+            self.spot_s.prepare(self.spot.window_rect());
+            self.spot.draw(&mut self.spot_s.pm, &self.ctx);
+            self.spot_s.present();
+        }
+        if self.menu_s.dirty
+            && let Some(m) = &self.menu
+        {
+            let r = self.menu_s.rect;
+            self.menu_s.prepare(r);
+            m.draw(&mut self.menu_s.pm, &self.ctx);
+            self.menu_s.present();
+        }
+    }
+
+    fn set_fullscreen(&mut self, on: bool) {
+        if on == self.fullscreen {
+            return;
+        }
+        self.fullscreen = on;
+        if on {
+            self.close_menu(false);
+            self.bar_s.hide();
+            self.dock_s.hide();
+        } else {
+            self.bar_s.dirty = true;
+            self.dock_s.dirty = true;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Win32 messages
+
+    pub fn handle(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let is_bar = hwnd == self.bar_s.hwnd;
+        let is_dock = hwnd == self.dock_s.hwnd;
+        let is_spot = hwnd == self.spot_s.hwnd;
+        let is_menu = hwnd == self.menu_s.hwnd;
+        if msg == self.taskbar_msg && self.taskbar_msg != 0 && is_bar {
+            // Explorer restarted: its taskbar is back and our app bars are gone.
+            if self.settings.hide_taskbar {
+                system::hide_taskbar();
+            }
+            system::appbar_register(self.bar_s.hwnd);
+            if self.settings.reserve_dock {
+                system::appbar_register(self.dock_s.hwnd);
+            }
+            self.place_appbars();
+            return Some(LRESULT(0));
+        }
+        match msg {
+            WM_MOUSEACTIVATE if !is_spot => {
+                const MA_NOACTIVATE: isize = 3;
+                return Some(LRESULT(MA_NOACTIVATE));
+            }
+            WM_MOUSEMOVE => {
+                let (x, y) = lparam_point(lp);
+                if is_bar {
+                    self.bar_s.track_leave();
+                    self.bar.mouse_move(x, y);
+                    self.bar_s.dirty = true;
+                } else if is_dock {
+                    self.dock_s.track_leave();
+                    self.dock.mouse_move(x, y);
+                    self.dock_s.dirty = true;
+                } else if is_spot {
+                    self.spot.mouse_move(x, y);
+                    self.spot_s.dirty = true;
+                } else if is_menu && let Some(m) = &mut self.menu {
+                    self.menu_s.track_leave();
+                    m.mouse_move(x, y);
+                    self.menu_s.dirty = true;
+                }
+            }
+            WM_MOUSELEAVE => {
+                if is_bar {
+                    self.bar_s.left();
+                    self.bar.mouse_leave();
+                    self.bar_s.dirty = true;
+                } else if is_dock {
+                    self.dock_s.left();
+                    self.dock.mouse_leave();
+                    self.dock_s.dirty = true;
+                } else if is_menu {
+                    self.menu_s.left();
+                    if let Some(m) = &mut self.menu {
+                        m.mouse_leave();
+                    }
+                    self.menu_s.dirty = true;
+                }
+            }
+            WM_LBUTTONDOWN => {
+                let (x, y) = lparam_point(lp);
+                if is_bar {
+                    self.bar.mouse_down(x, y);
+                    self.bar_s.dirty = true;
+                } else if is_dock {
+                    self.dock.mouse_down(x, y);
+                    self.dock_s.dirty = true;
+                } else if is_spot {
+                    if !self.spot.mouse_down(x, y, &self.ctx) {
+                        self.hide_search();
+                    }
+                    self.spot_s.dirty = true;
+                }
+            }
+            WM_LBUTTONUP => {
+                let (x, y) = lparam_point(lp);
+                if is_bar {
+                    self.bar.mouse_up(x, y);
+                    self.bar_s.dirty = true;
+                } else if is_dock {
+                    self.dock.mouse_up(x, y);
+                    self.dock_s.dirty = true;
+                } else if is_menu && let Some(m) = &mut self.menu {
+                    m.mouse_up(x, y);
+                    self.menu_s.dirty = true;
+                }
+            }
+            WM_RBUTTONUP if is_dock => {
+                let (x, y) = lparam_point(lp);
+                self.dock.right_click(x, y);
+                self.dock_s.dirty = true;
+            }
+            WM_RBUTTONUP if is_menu => {
+                let (x, y) = lparam_point(lp);
+                if let Some(m) = &mut self.menu {
+                    m.mouse_up(x, y);
+                }
+            }
+            WM_MOUSEWHEEL if is_spot => {
+                let delta = ((wp.0 >> 16) & 0xffff) as u16 as i16 as f32;
+                self.spot.wheel(delta);
+                self.spot_s.dirty = true;
+            }
+            WM_KEYDOWN | WM_SYSKEYDOWN if is_spot => {
+                let vk = VIRTUAL_KEY(wp.0 as u16);
+                let mods = Mods { ctrl: key_down(VK_CONTROL), shift: key_down(VK_SHIFT), alt: false };
+                let key = match vk {
+                    VK_UP => Some(Key::Up),
+                    VK_DOWN => Some(Key::Down),
+                    VK_LEFT => Some(Key::Left),
+                    VK_RIGHT => Some(Key::Right),
+                    VK_HOME => Some(Key::Home),
+                    VK_END => Some(Key::End),
+                    VK_PRIOR => Some(Key::PageUp),
+                    VK_NEXT => Some(Key::PageDown),
+                    VK_RETURN => Some(Key::Enter),
+                    VK_ESCAPE => Some(Key::Escape),
+                    VK_BACK => Some(Key::Backspace),
+                    VK_DELETE => Some(Key::Delete),
+                    VK_TAB => Some(Key::Tab),
+                    VIRTUAL_KEY(0x41) if mods.ctrl => Some(Key::SelectAll),
+                    _ => None,
+                };
+                if vk == VIRTUAL_KEY(0x56) && mods.ctrl {
+                    if let Some(t) = system::clipboard_text(self.spot_s.hwnd) {
+                        for c in t.chars().filter(|c| !c.is_control()) {
+                            self.spot.char_input(c);
+                        }
+                    }
+                } else if let Some(k) = key {
+                    self.spot.key(k, mods);
+                }
+                self.spot_s.dirty = true;
+                if msg == WM_SYSKEYDOWN {
+                    return None;
+                }
+            }
+            WM_CHAR if is_spot => {
+                // Ctrl+letter arrives as control characters; the spotlight ignores them.
+                if let Some(c) = char::from_u32(wp.0 as u32) {
+                    self.spot.char_input(c);
+                    self.spot_s.dirty = true;
+                }
+            }
+            WM_ACTIVATE if is_spot => {
+                const WA_INACTIVE: usize = 0;
+                if wp.0 & 0xffff == WA_INACTIVE && self.spot.is_visible() {
+                    self.hide_search();
+                }
+            }
+            WM_CLOSE => {
+                if is_spot {
+                    self.hide_search();
+                }
+                return Some(LRESULT(0));
+            }
+            WM_HOTKEY if wp.0 as i32 == HOTKEY_SEARCH => {
+                if self.spot.is_visible() {
+                    self.hide_search();
+                } else {
+                    self.show_search();
+                }
+            }
+            WM_TIMER => match wp.0 {
+                TIMER_CLOCK => {
+                    self.refresh_status();
+                    self.schedule_clock();
+                }
+                TIMER_STATUS => self.refresh_status(),
+                TIMER_CARET => self.spot_s.dirty = self.spot.shown(),
+                TIMER_WINDOWS => {
+                    unsafe {
+                        let _ = KillTimer(Some(self.bar_s.hwnd), TIMER_WINDOWS);
+                    }
+                    WINDOWS_PENDING.store(false, Ordering::Relaxed);
+                    self.refresh_windows();
+                }
+                _ => {}
+            },
+            WM_APP_WINDOWS => unsafe {
+                // Window storms (an app opening ten tool windows) collapse into one refresh.
+                SetTimer(Some(self.bar_s.hwnd), TIMER_WINDOWS, 60, None);
+            },
+            WM_APP_FOREGROUND => {
+                // Alt+Tab or a notification took the foreground: the open menu goes away.
+                let fg = unsafe { GetForegroundWindow() };
+                if self.menu_owner.is_some() && !fg.is_invalid() && tracker::window_pid(fg) != self.own_pid {
+                    self.close_menu(true);
+                }
+                self.refresh_foreground();
+            }
+            WM_APP_TRASH => {
+                self.dock_icons.remove(&TRASH.to_lowercase());
+                self.rebuild_dock();
+            }
+            WM_APP_ICON => self.icons_arrived(),
+            WM_APP_CATALOG => self.catalog_arrived(),
+            WM_APP_DISMISS => self.close_menu(true),
+            WM_APP_MENUKEY => {
+                let key = match VIRTUAL_KEY(wp.0 as u16) {
+                    VK_UP => Key::Up,
+                    VK_DOWN => Key::Down,
+                    VK_RETURN => Key::Enter,
+                    _ => Key::Escape,
+                };
+                if key == Key::Escape {
+                    self.close_menu(true);
+                } else if let Some(m) = &mut self.menu {
+                    m.key(key);
+                    self.menu_s.dirty = true;
+                }
+            }
+            WM_APPBAR => {
+                const ABN_POSCHANGED: usize = 1;
+                const ABN_FULLSCREENAPP: usize = 2;
+                match wp.0 {
+                    // Our own SETPOS notifies the other bar; ignore the echo.
+                    ABN_POSCHANGED if self.last_appbar_place.is_none_or(|t| t.elapsed().as_millis() > 500) => {
+                        self.place_appbars()
+                    }
+                    ABN_FULLSCREENAPP if is_bar => self.set_fullscreen(lp.0 != 0),
+                    _ => {}
+                }
+            }
+            WM_DISPLAYCHANGE | WM_DPICHANGED if is_bar => self.configure(true),
+            WM_SETTINGCHANGE if is_bar => {
+                const SPI_SETDESKWALLPAPER: usize = 0x14;
+                // lParam is a string only for the wParam == 0 broadcasts.
+                let topic = if wp.0 == 0 && lp.0 != 0 {
+                    unsafe { PCWSTR(lp.0 as *const u16).to_string().unwrap_or_default() }
+                } else {
+                    String::new()
+                };
+                if wp.0 == SPI_SETDESKWALLPAPER {
+                    self.configure(true);
+                } else if topic == "ImmersiveColorSet" && self.settings.appearance == "auto" {
+                    self.ctx.theme = Theme { dark: system::system_dark() };
+                    self.configure(true);
+                }
+            }
+            WM_POWERBROADCAST => self.refresh_status(),
+            WM_ENDSESSION if wp.0 != 0 => self.shutdown(),
+            _ => return None,
+        }
+        Some(LRESULT(0))
+    }
+
+    pub fn has_work(&self) -> bool {
+        self.animating() || self.bar_s.dirty || self.dock_s.dirty || self.menu_s.dirty || (self.spot_s.dirty && self.spot.shown())
+    }
+}
+
+fn cache_key(k: &str) -> String {
+    // "ext:pdf|C:\\a.pdf" shares one icon per extension.
+    match k.split_once('|') {
+        Some((ext, _)) if ext.starts_with("ext:") => ext.to_string(),
+        _ => k.to_lowercase(),
+    }
+}
