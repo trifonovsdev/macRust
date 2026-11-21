@@ -571,6 +571,7 @@ impl App {
         self.dock.set_screen(w, h, s);
         self.spot.set_screen(w, h, s);
         BAR_H.store(self.bar.height_px(), Ordering::Relaxed);
+        self.genie.set_top(self.bar.height_px());
         if reload_wallpaper {
             let wall = system::wallpaper(self.screen.w as u32, self.screen.h as u32)
                 .unwrap_or_else(|| wallpaper::procedural(self.screen.w as u32, self.screen.h as u32, self.ctx.theme.dark));
@@ -2014,7 +2015,9 @@ impl App {
                     ABN_POSCHANGED if self.last_appbar_place.is_none_or(|t| t.elapsed().as_millis() > 500) => {
                         self.place_appbars()
                     }
-                    ABN_FULLSCREENAPP if is_bar => self.set_fullscreen(lp.0 != 0),
+                    // Explorer also announces our own layered windows and
+                    // topmost tool windows; hide only for a real one.
+                    ABN_FULLSCREENAPP if is_bar => self.set_fullscreen(lp.0 != 0 && winops::foreground_is_fullscreen(self.own_pid)),
                     _ => {}
                 }
             }

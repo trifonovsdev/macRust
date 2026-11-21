@@ -105,13 +105,18 @@ struct Overlay {
     bits: *mut u8,
     w: i32,
     h: i32,
+    /// Rows above this stay out of the window: a layered window covering the
+    /// whole monitor makes Explorer announce a full-screen app, which hid the
+    /// menu bar and the Dock for the length of every Genie.
+    top: i32,
     shown: bool,
     /// What the last presented frame covered.
     drawn: Bounds,
 }
 
 impl Overlay {
-    fn new(w: i32, h: i32) -> Option<Overlay> {
+    fn new(w: i32, h: i32, top: i32) -> Option<Overlay> {
+        let top = top.clamp(0, h - 1);
         let class = wide(super::surface::CLASS);
         let title = wide("macRust genie");
         unsafe {
@@ -121,9 +126,9 @@ impl Overlay {
                 PCWSTR(title.as_ptr()),
                 WS_POPUP,
                 0,
-                0,
+                top,
                 w,
-                h,
+                h - top,
                 None,
                 None,
                 GetModuleHandleW(PCWSTR::null()).ok().map(Into::into),
@@ -152,7 +157,7 @@ impl Overlay {
                 return None;
             };
             let old = SelectObject(dc, bmp.into());
-            Some(Overlay { hwnd, dc, bmp, old, bits: bits as *mut u8, w, h, shown: false, drawn: Bounds::default() })
+            Some(Overlay { hwnd, dc, bmp, old, bits: bits as *mut u8, w, h, top, shown: false, drawn: Bounds::default() })
         }
     }
 
@@ -165,16 +170,18 @@ impl Overlay {
     fn present(&mut self, drawn: Bounds, below: HWND) {
         let dirty = drawn.union(self.drawn);
         self.drawn = drawn;
-        let pt = POINT::default();
-        let size = SIZE { cx: self.w, cy: self.h };
-        let src = POINT::default();
+        // The bitmap keeps screen coordinates; the window shows it from `top` down.
+        let pt = POINT { x: 0, y: self.top };
+        let size = SIZE { cx: self.w, cy: self.h - self.top };
+        let src = POINT { x: 0, y: self.top };
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        let rc = RECT { left: dirty.x0, top: dirty.y0, right: dirty.x1, bottom: dirty.y1 };
+        // prcDirty is in window coordinates.
+        let rc = RECT { left: dirty.x0, top: (dirty.y0 - self.top).max(0), right: dirty.x1, bottom: (dirty.y1 - self.top).max(0) };
         let info = UPDATELAYEREDWINDOWINFO {
             cbSize: size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
             hdcDst: HDC::default(),
@@ -343,6 +350,8 @@ struct Cached {
 pub struct Genie {
     /// The user has Windows' minimize animation on.
     pub enabled: bool,
+    /// The menu bar's height in px: the overlay starts below it.
+    top: i32,
     /// Windows' animation is off for the whole session (title-bar minimizes
     /// play the Genie too); otherwise only around our own calls.
     session: bool,
@@ -391,7 +400,12 @@ impl Genie {
             native: Vec::new(),
             borders: HashMap::new(),
             cost: (0.0, 0.0, 0),
+            top: 0,
         }
+    }
+
+    pub fn set_top(&mut self, px: i32) {
+        self.top = px;
     }
 
     /// Whether a title-bar minimize can play the Genie: the snapshot then has
@@ -525,9 +539,9 @@ impl Genie {
             self.finish_all();
             return;
         }
-        if self.overlay.as_ref().is_none_or(|o| (o.w, o.h) != screen) {
+        if self.overlay.as_ref().is_none_or(|o| (o.w, o.h, o.top) != (screen.0, screen.1, self.top)) {
             self.overlay = None;
-            self.overlay = Overlay::new(screen.0, screen.1);
+            self.overlay = Overlay::new(screen.0, screen.1, self.top);
         }
         let Some(ov) = &mut self.overlay else {
             // No overlay: finish without the effect.

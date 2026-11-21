@@ -184,3 +184,29 @@ pub fn restore_frame(h: HWND, borders: Option<(i32, i32, i32, i32)>) -> Option<(
     let r = RECT { left: r.left + l, top: r.top + t, right: r.right - rr, bottom: r.bottom - b };
     (r.right > r.left && r.bottom > r.top).then(|| (rect(r), false))
 }
+
+/// The foreground window belongs to another process and covers its whole
+/// monitor (a game, a video, a browser in F11).
+pub fn foreground_is_fullscreen(own_pid: u32) -> bool {
+    unsafe {
+        let h = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+        if h.is_invalid() {
+            return false;
+        }
+        let mut pid = 0;
+        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(h, Some(&mut pid));
+        if pid == own_pid {
+            return false;
+        }
+        let mut wr = RECT::default();
+        if GetWindowRect(h, &mut wr).is_err() {
+            return false;
+        }
+        let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+            return false;
+        }
+        let mon = mi.rcMonitor;
+        wr.left <= mon.left && wr.top <= mon.top && wr.right >= mon.right && wr.bottom >= mon.bottom
+    }
+}
