@@ -29,20 +29,6 @@ pub struct GlassStyle {
 }
 
 impl GlassStyle {
-    /// The dock as measured on macOS 26: the backdrop darkened to about 0.78
-    /// with its hue kept (dark) or lifted by about 13% white (light), no
-    /// bevel, highlight or lens; the edge is a hairline drawn by `rim`.
-    pub fn dock(dark: bool, scale: f32) -> Self {
-        Self {
-            tint: if dark { Color::from_rgba8(0, 0, 0, 56) } else { Color::from_rgba8(255, 255, 255, 33) },
-            bevel: scale.max(1.0),
-            refraction: 0.0,
-            specular: 0.0,
-            glow: 0.0,
-            frost: false,
-        }
-    }
-
     /// Notification Center widgets, notification cards and banners. Dark:
     /// the blurred backdrop at about x0.5 with its hue kept (a black desktop
     /// reads (17,17,17)); light: near-opaque white cards. Rim: `hairline`.
@@ -302,6 +288,69 @@ pub fn draw(pm: &mut Pixmap, v: &Vibrancy, mat: &Pixmap, ox: f32, oy: f32, shape
 /// `top` on the upper edge, `bottom` on the lower one and `side` on the
 /// vertical sides, blended by the edge normal. `width` px, at least one.
 /// Negative values darken. This is the hairline rim of macOS 26 glass.
+/// The Dock's glass as measured on macOS 26 (TAHOE-DOCK-2.md section 4):
+/// the blurred backdrop pulled towards a lifted luminance (dark: 0.70 L + 14,
+/// so the bar never goes darker than black + 14; light: 17% towards white),
+/// a 1 pt rim screened with white whose strength runs around the outline,
+/// no bevel, no lens and no shadow. `ox, oy` is the window's position in the
+/// sampler's coordinates.
+pub fn dock_slab(pm: &mut Pixmap, v: &Vibrancy, ox: f32, oy: f32, shape: Shape, dark: bool, scale: f32) {
+    if shape.w < 1.0 || shape.h < 1.0 {
+        return;
+    }
+    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+    let x0 = (shape.x.floor() as i32 - 1).clamp(0, pw);
+    let x1 = ((shape.x + shape.w).ceil() as i32 + 1).clamp(0, pw);
+    let y0 = (shape.y.floor() as i32 - 1).clamp(0, ph);
+    let y1 = ((shape.y + shape.h).ceil() as i32 + 1).clamp(0, ph);
+    let (cx, hx) = (shape.x + shape.w * 0.5, shape.w * 0.5);
+    let half = 0.5 * scale;
+    // The sampler's blur level carries a 1.25 saturation boost; the Dock keeps
+    // 1.05 of the backdrop's chroma in dark mode and 1.0 in light mode.
+    let chroma = if dark { 1.05 / 1.25 } else { 1.0 / 1.25 };
+    let stride = pw as usize * 4;
+    let dst = pm.data_mut();
+    for y in y0..y1 {
+        let fy = y as f32 + 0.5;
+        for x in x0..x1 {
+            let fx = x as f32 + 0.5;
+            let (d, nx, ny) = shape.sdf(fx, fy);
+            let cov = (0.5 - d).clamp(0.0, 1.0);
+            if cov <= 0.0 {
+                continue;
+            }
+            let c0 = v.sample_clear(ox + fx, oy + fy);
+            let l = 0.2126 * c0[0] + 0.7152 * c0[1] + 0.0722 * c0[2];
+            let mut col = [0.0f32; 3];
+            for k in 0..3 {
+                let c = l + (c0[k] - l) * chroma;
+                col[k] = if dark { 0.70 * l + 14.0 + (c - l) } else { c + (255.0 - c) * 0.17 };
+            }
+            // Pixel overlap with the outer 0.5 pt band and the inner 0.5 pt band.
+            let band = |outer: f32, inner: f32| ((d + 0.5).min(-outer) - (d - 0.5).max(-inner)).clamp(0.0, 1.0);
+            let (b_out, b_in) = (band(0.0, half), band(half, 2.0 * half));
+            if b_out + b_in > 0.0 {
+                let a = if dark {
+                    let px = ((fx - cx) / hx).clamp(-1.0, 1.0);
+                    let a = 0.085 + 0.04 * px * ny + 0.04 * nx.abs();
+                    a * (b_out + 0.38 * b_in)
+                } else {
+                    0.38 * b_out + 0.22 * b_in
+                };
+                for c in &mut col {
+                    *c += (255.0 - *c) * a;
+                }
+            }
+            let o = y as usize * stride + x as usize * 4;
+            let inv = 1.0 - cov;
+            for k in 0..3 {
+                dst[o + k] = (col[k].clamp(0.0, 255.0) * cov + dst[o + k] as f32 * inv + 0.5).min(255.0) as u8;
+            }
+            dst[o + 3] = (255.0 * cov + dst[o + 3] as f32 * inv + 0.5).min(255.0) as u8;
+        }
+    }
+}
+
 pub fn rim(pm: &mut Pixmap, shape: Shape, top: f32, bottom: f32, side: f32, width: f32) {
     let width = width.max(1.0);
     let (pw, ph) = (pm.width() as i32, pm.height() as i32);
@@ -358,6 +407,11 @@ impl Backdrop {
         let vib = Vibrancy::new(behind);
         let luma = vib.luma(0.0, 0.0, behind.width() as f32, behind.height() as f32);
         Self { vib, luma, mats: std::cell::RefCell::new(Vec::new()) }
+    }
+
+    /// The Dock's glass over this backdrop (`dock_slab`).
+    pub fn dock(&self, pm: &mut Pixmap, shape: Shape, dark: bool, scale: f32) {
+        dock_slab(pm, &self.vib, 0.0, 0.0, shape, dark, scale);
     }
 
     /// Draws a glass shape; `pm` must be the window the backdrop was taken for.

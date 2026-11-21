@@ -7,9 +7,9 @@ use std::rc::Rc;
 
 use tiny_skia::Pixmap;
 
-use crate::anim::{BOUNCE_PERIOD, Spring, launch_bounce};
+use crate::anim::{BOUNCE_PERIOD, Spring, Tween, ease_out, launch_bounce, smoothstep};
 use crate::gfx::{self, Image, rgba};
-use crate::glass::{self, GlassStyle};
+use crate::glass;
 use crate::text::Weight;
 use crate::{Ctx, WinRect, glyphs};
 
@@ -62,7 +62,7 @@ impl Default for DockConfig {
 
 struct Slot {
     e: DockEntry,
-    appear: Spring,
+    appear: Tween,
     removing: bool,
     bounce: Option<f32>,
     /// Keep bouncing until the app shows a window.
@@ -82,8 +82,6 @@ struct Geo {
     icon0: f32,
 }
 
-/// Wallpaper id, dark theme, window rect.
-type MaterialKey = (u64, bool, WinRect);
 /// Dark theme, Downloads folder, Trash.
 type Stacks = (bool, Rc<Image>, Rc<Image>);
 
@@ -103,8 +101,16 @@ const SEP_H: f32 = 1.22;
 /// The bar floats this many points above the bottom of the screen.
 const GAP_BOTTOM: f32 = 5.5;
 /// Launch hop height and the running dot's centre below the tile.
-const HOP: f32 = 0.36;
+const HOP: f32 = 0.355;
+/// Corner radius / bar height: 20 pt on a 72.5 pt bar.
+const RADIUS: f32 = 0.276;
 const DOT_BELOW: f32 = 0.2;
+/// Measured at 60 fps: the gap for a new icon opens over 0.4 s (ease-out),
+/// a removed icon's gap closes over 0.27 s (ease-in-out), the label fades
+/// out over 0.09 s when the pointer leaves (it appears and moves at once).
+const INSERT_S: f32 = 0.4;
+const REMOVE_S: f32 = 0.27;
+const LABEL_OUT_S: f32 = 0.09;
 /// Half-width of the magnification bell, in tiles.
 const RANGE: f32 = 2.7;
 const TIP_SPACE: f32 = 46.0;
@@ -119,14 +125,12 @@ pub struct Dock {
     mouse: Option<(f32, f32)>,
     last_mx: f32,
     mag: Spring,
-    tip: Spring,
+    tip: Tween,
     tip_slot: Option<usize>,
     hover: Option<usize>,
     pressed: Option<usize>,
     menu_open: bool,
     initialized: bool,
-    /// Blurred wallpaper + tint for this window: (vibrancy id, dark, rect) -> pixels.
-    material: RefCell<Option<(MaterialKey, Pixmap)>>,
     /// Live picture of what is behind the window; replaces the wallpaper.
     backdrop: Option<glass::Backdrop>,
     /// Drawn Downloads and Trash for this appearance.
@@ -149,13 +153,12 @@ impl Dock {
             mouse: None,
             last_mx: 0.0,
             mag: Spring::new(0.0, 0.32, 0.92),
-            tip: Spring::new(0.0, 0.18, 1.0),
+            tip: Tween::new(0.0),
             tip_slot: None,
             hover: None,
             pressed: None,
             menu_open: false,
             initialized: false,
-            material: RefCell::new(None),
             backdrop: None,
             stacks: RefCell::new(None),
             events: Vec::new(),
@@ -204,14 +207,14 @@ impl Dock {
                 s.e = e;
                 if s.removing {
                     s.removing = false;
-                    s.appear.to(1.0);
+                    s.appear.to(1.0, INSERT_S, ease_out);
                 }
                 next.push(s);
             } else {
                 // Critically damped: neighbours slide apart in about 0.4 s, no overshoot.
-                let mut appear = Spring::new(0.0, 0.45, 1.0);
+                let mut appear = Tween::new(0.0);
                 if self.initialized {
-                    appear.to(1.0);
+                    appear.to(1.0, INSERT_S, ease_out);
                 } else {
                     appear.snap(1.0);
                 }
@@ -222,7 +225,7 @@ impl Dock {
         for (i, s) in pool.into_iter().enumerate() {
             if let Some(mut s) = s {
                 s.removing = true;
-                s.appear.to(0.0);
+                s.appear.to(0.0, REMOVE_S, smoothstep);
                 next.insert(i.min(next.len()), s);
             }
         }
@@ -266,7 +269,7 @@ impl Dock {
     pub fn set_menu_open(&mut self, open: bool) {
         self.menu_open = open;
         if open {
-            self.tip.to(0.0);
+            self.tip.to(0.0, LABEL_OUT_S, |u| u);
         }
     }
 
@@ -378,7 +381,7 @@ impl Dock {
         let wr = self.window_rect();
         let Some((mx, my)) = self.mouse else {
             self.hover = None;
-            self.tip.to(0.0);
+            self.tip.to(0.0, LABEL_OUT_S, |u| u);
             return;
         };
         let g = self.geo(wr.w as f32, wr.h as f32);
@@ -400,9 +403,9 @@ impl Dock {
             && !self.menu_open
         {
             self.tip_slot = Some(h);
-            self.tip.to(1.0);
+            self.tip.snap(1.0);
         } else {
-            self.tip.to(0.0);
+            self.tip.to(0.0, LABEL_OUT_S, |u| u);
         }
     }
 
@@ -498,33 +501,15 @@ impl Dock {
         gfx::put_rect(pm, bx, top, bw + 1.0, wh - top.floor(), [0, 0, 0, 1]);
 
         // No shadow: macOS 26 draws none under the dock.
-        let shape = glass::Shape { x: bx, y: by, w: bw, h: bh, r: bh * 0.25 };
-        let st = GlassStyle::dock(th.dark, s);
+        let shape = glass::Shape { x: bx, y: by, w: bw, h: bh, r: bh * RADIUS };
         match (&self.backdrop, &ctx.vibrancy) {
-            (Some(b), _) => b.draw(pm, shape, &st),
-            (None, Some(v)) => {
-                let key = (v.id, th.dark, wr);
-                let mut cache = self.material.borrow_mut();
-                if cache.as_ref().is_none_or(|(k, _)| *k != key) {
-                    *cache = glass::material(v, wr.x as f32, wr.y as f32, pm.width(), pm.height(), st.tint).map(|m| (key, m));
-                }
-                if let Some((_, m)) = cache.as_ref() {
-                    glass::draw(pm, v, m, wr.x as f32, wr.y as f32, shape, &st);
-                }
-            }
+            (Some(b), _) => b.dock(pm, shape, th.dark, s),
+            (None, Some(v)) => glass::dock_slab(pm, v, wr.x as f32, wr.y as f32, shape, th.dark, s),
             (None, None) => {
                 if let Some(path) = gfx::squircle(bx, by, bw, bh, shape.r) {
                     gfx::fill(pm, &path, th.dock_fallback());
                 }
             }
-        }
-        // The hairline rim: in dark mode only the bottom edge shows; in light
-        // mode the top is brightest over two device pixels (+80, then +55).
-        if th.dark {
-            glass::rim(pm, shape, 4.0, 20.0, 6.0, 0.5 * s);
-        } else {
-            glass::rim(pm, shape, 55.0, 0.0, 0.0, s);
-            glass::rim(pm, shape, 25.0, 30.0, 25.0, 0.5 * s);
         }
 
         for (c, x, w) in &g.cells {
@@ -574,7 +559,9 @@ impl Dock {
             && t < self.slots.len()
             && let Some((_, x, w)) = g.cells.iter().find(|c| matches!(c.0, Cell::Slot(i) if i == t))
         {
-            let (ix, _, size) = self.icon_box(&g, t, *x, *w);
+            let (ix, iy, size) = self.icon_box(&g, t, *x, *w);
+            // The label rides the launch hop with its icon (measured).
+            let lift = g.icon_bottom - size - iy;
             let a = self.tip.value.clamp(0.0, 1.0);
             let fs = 13.0 * s;
             let label = ctx.text.ellipsize(&self.slots[t].e.label, fs, Weight::Regular, 280.0 * s);
@@ -583,7 +570,7 @@ impl Dock {
             let (tip_w, tip_h) = (11.0 * s, 5.5 * s);
             // The bar's top, or the tile's when magnification lifts it out of the bar.
             let rest_top = g.icon_bottom - size + size * (1.0 - ART) / 2.0;
-            let anchor = by.min(rest_top - v0 * (BAR - 1.0) / 2.0);
+            let anchor = by.min(rest_top - v0 * (BAR - 1.0) / 2.0) - lift;
             let cx = ix + size / 2.0;
             let px = (cx - pw / 2.0).clamp(2.0, ww - pw - 2.0).round();
             let py = (anchor - 9.0 * s - tip_h - ph).round();
@@ -735,7 +722,9 @@ mod tests {
             }
         }
         assert!(peak <= 1.0 + 1e-4, "overshoot {peak}");
+        // Ease-out over 0.4 s: most of the way early, settled at 0.4 s.
         let at95 = at95.unwrap();
-        assert!((0.3..0.45).contains(&at95), "95% at {at95} s");
+        assert!((0.2..0.3).contains(&at95), "95% at {at95} s");
+        assert!((t - 0.4).abs() < 0.02, "settled at {t} s");
     }
 }

@@ -924,7 +924,7 @@ fn main() {
     let t0 = Instant::now();
     for _ in 0..10 {
         let b = macrust_ui::glass::Backdrop::new(&behind);
-        b.draw(&mut dpm_probe(&dr), macrust_ui::glass::Shape { x: 0.0, y: 0.0, w: 100.0, h: 50.0, r: 10.0 }, &macrust_ui::glass::GlassStyle::dock(true, sc.scale));
+        b.dock(&mut dpm_probe(&dr), macrust_ui::glass::Shape { x: 0.0, y: 0.0, w: 100.0, h: 50.0, r: 10.0 }, true, sc.scale);
     }
     println!("live backdrop for the dock at 2x: {:.2} ms", t0.elapsed().as_secs_f64() * 100.0);
     let t0 = Instant::now();
