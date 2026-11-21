@@ -83,14 +83,30 @@ fn legacy_round() -> Rc<Image> {
         gfx::fill(&mut pm, &c, rgba(40, 160, 230, 1.0));
     }
     macrust_ui::glyphs::play(&mut pm, 78.0, 78.0, 100.0, rgba(255, 255, 255, 1.0));
-    Rc::new(Image::with_shadow(gfx::mac_icon(&pm).unwrap()))
+    windows_icon(&pm)
 }
 
 /// A classic Win32 glyph icon with transparency.
 fn legacy_glyph() -> Rc<Image> {
     let mut pm = Pixmap::new(256, 256).unwrap();
     macrust_ui::glyphs::document(&mut pm, 0.0, 0.0, 256.0);
-    Rc::new(Image::with_shadow(gfx::mac_icon(&pm).unwrap()))
+    windows_icon(&pm)
+}
+
+/// A Windows icon as the shell shows it: cut to the squircle when it is a
+/// full tile, else free-standing with its own shadow.
+fn windows_icon(pm: &Pixmap) -> Rc<Image> {
+    let m = gfx::mac_icon(&gfx::shrink(pm, 256)).unwrap();
+    Rc::new(if m.tile { Image::with_shadow(m.pixmap) } else { Image::new(m.pixmap) })
+}
+
+/// A downloaded macOS icon as the shell shows it: as is, or cut to the
+/// squircle when it is full-bleed square art.
+fn macos_icon(pm: &Pixmap) -> Rc<Image> {
+    let pm = gfx::shrink(pm, 256);
+    let (w, h) = (pm.width(), pm.height());
+    let opaque = [(1, 1), (w - 2, 1), (1, h - 2), (w - 2, h - 2)].iter().all(|&(x, y)| pm.pixel(x, y).is_some_and(|p| p.alpha() > 200));
+    if opaque { windows_icon(&pm) } else { Rc::new(Image::new(pm)) }
 }
 
 fn tpl(img: &Rc<Image>, rgb: [u8; 3]) -> Option<Rc<Image>> {
@@ -399,7 +415,7 @@ fn panels(sc: &Scene, out: &str, name: &str) {
     screen.save_png(format!("{out}/{name}-banner.png")).unwrap();
 }
 
-/// Windows-style icons before and after `mac_icon`, light and dark plates.
+/// Windows-style icons before and after `mac_icon`, on light and dark.
 fn icon_sheet(out: &str) {
     let n = 256u32;
     let mut sources = Vec::new();
@@ -429,7 +445,7 @@ fn icon_sheet(out: &str) {
     for (i, src) in sources.iter().enumerate() {
         let x = (i as u32 * cell + 12) as i32;
         sheet.draw_pixmap(x, 12, src.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
-        let m = gfx::mac_icon(src).unwrap();
+        let m = gfx::mac_icon(src).unwrap().pixmap;
         for row in [1, 2] {
             sheet.draw_pixmap(x, (row * cell + 12) as i32, m.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
         }
@@ -528,6 +544,40 @@ fn dock_studies(sc: &Scene, out: &str, name: &str) {
             dock.update(1.0 / 120.0);
         }
     }
+}
+
+/// The dock with real icons from `PREVIEW_ICON_DIR` (never committed):
+/// `mac_*.png` are downloaded macOS icons, `win_*.png` Windows icons.
+fn icon_dock(out: &str) {
+    let Ok(dir) = std::env::var("PREVIEW_ICON_DIR") else { return };
+    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    files.sort();
+    let mut list = Vec::new();
+    for f in files {
+        let name = f.file_stem().unwrap().to_string_lossy().into_owned();
+        let Ok(pm) = Pixmap::load_png(&f) else { continue };
+        let icon = match name.split_once('_') {
+            Some(("mac", _)) => macos_icon(&pm),
+            Some(("win", _)) => windows_icon(&pm),
+            _ => continue,
+        };
+        list.push(DockEntry { key: name.clone(), label: name, icon: Some(icon), running: false, section: Section::Apps, fallback: Fallback::App });
+    }
+    list.push(app_entry("legacy", legacy_round()));
+    list.push(app_entry("exe", legacy_glyph()));
+    let sc = dock_scene(stripes_wall(3840, 2160), 2.0, true);
+    let mut dock = Dock::new(DockConfig::default());
+    dock.set_screen(sc.w, sc.h, sc.scale);
+    dock.set_entries(list);
+    let dr = dock.window_rect();
+    let mut behind = Pixmap::new(dr.w as u32, dr.h as u32).unwrap();
+    behind.draw_pixmap(-dr.x, -dr.y, sc.wall.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    dock.set_backdrop(&behind);
+    crop_dock(&sc, out, "dock-icons", &dock);
+}
+
+fn app_entry(key: &str, icon: Rc<Image>) -> DockEntry {
+    DockEntry { key: key.into(), label: key.into(), icon: Some(icon), running: false, section: Section::Apps, fallback: Fallback::App }
 }
 
 fn crop_dock(sc: &Scene, out: &str, name: &str, dock: &Dock) {
@@ -769,6 +819,7 @@ fn main() {
     }
 
     icon_sheet(&out);
+    icon_dock(&out);
     dock_studies(&dock_scene(stripes_wall(3840, 2160), 2.0, true), &out, "dock-dark-cyan");
     dock_studies(&dock_scene(flat_wall(1920, 1080, [0, 0, 0]), 1.0, true), &out, "dock-dark-black");
     dock_studies(&dock_scene(flat_wall(2560, 1440, [17, 83, 130]), 2.0, false), &out, "dock-light-blue");
