@@ -69,7 +69,7 @@ pub fn primary_screen() -> Screen {
     }
 }
 
-fn reg_dword(root: HKEY, sub: &str, value: &str) -> Option<u32> {
+pub fn reg_dword(root: HKEY, sub: &str, value: &str) -> Option<u32> {
     let (sub, value) = (wide(sub), wide(value));
     let mut data = 0u32;
     let mut len = 4u32;
@@ -87,7 +87,7 @@ fn reg_dword(root: HKEY, sub: &str, value: &str) -> Option<u32> {
     (r == ERROR_SUCCESS).then_some(data)
 }
 
-fn reg_string(root: HKEY, sub: &str, value: &str) -> Option<String> {
+pub fn reg_string(root: HKEY, sub: &str, value: &str) -> Option<String> {
     let (sub, value) = (wide(sub), wide(value));
     let mut buf = [0u16; 1024];
     let mut len = (buf.len() * 2) as u32;

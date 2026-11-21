@@ -46,7 +46,9 @@ pub enum BarEvent {
 #[derive(Clone)]
 pub struct TrayItem {
     pub id: u64,
-    pub icon: Option<Rc<Image>>,
+    /// Template versions: dark glyph for light wallpapers, light glyph for dark ones.
+    pub icon_dark: Option<Rc<Image>>,
+    pub icon_light: Option<Rc<Image>>,
     /// Changes whenever the icon picture changes.
     pub stamp: u64,
 }
@@ -339,7 +341,9 @@ impl MenuBar {
                     }
                 }
                 BarItem::Tray(id) => {
-                    if let Some(img) = self.tray.iter().find(|t| t.id == id).and_then(|t| t.icon.as_ref()) {
+                    let item = self.tray.iter().find(|t| t.id == id);
+                    let img = item.and_then(|t| if self.dark_text { t.icon_dark.as_ref() } else { t.icon_light.as_ref() });
+                    if let Some(img) = img {
                         let size = (16.0 * s).round();
                         img.draw(pm, (cx - size / 2.0).round(), (h / 2.0 - size / 2.0).round(), size, 1.0, false);
                     }

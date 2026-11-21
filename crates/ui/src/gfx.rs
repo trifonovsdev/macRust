@@ -323,6 +323,11 @@ impl Image {
         Some(Self::new(Pixmap::from_vec(data, size)?))
     }
 
+    /// The full-size picture.
+    pub fn base(&self) -> &Pixmap {
+        &self.levels[0]
+    }
+
     pub fn width(&self) -> u32 {
         self.levels[0].width()
     }
@@ -482,5 +487,49 @@ pub fn mac_icon(src: &Pixmap, dark: bool) -> Option<Pixmap> {
     let k = size * 0.64 / bw.max(bh);
     let t = Transform::from_row(k, 0.0, 0.0, k, n / 2.0 - (x0 as f32 + bw / 2.0) * k, n / 2.0 - (y0 as f32 + bh / 2.0) * k);
     out.draw_pixmap(0, 0, src.as_ref(), &quality, t, None);
+    Some(out)
+}
+
+/// A menu-bar "template" version of a colour icon, as macOS draws menu extras:
+/// one colour, shape from alpha (and, for colourful icons, from darkness, so a
+/// white logo on a coloured disc becomes a cut-out). Strong reds stay red:
+/// they are status (a recording dot, an unread badge).
+pub fn template(src: &Pixmap, rgb: [u8; 3]) -> Option<Pixmap> {
+    let mut out = Pixmap::new(src.width(), src.height())?;
+    let d = src.data();
+    // Colourful icons take their shape from luminance, flat ones from alpha.
+    let (mut sat_sum, mut n) = (0.0f32, 0.0f32);
+    for px in d.chunks_exact(4) {
+        if px[3] > 128 {
+            let (mx, mn) = (px[0].max(px[1]).max(px[2]) as f32, px[0].min(px[1]).min(px[2]) as f32);
+            sat_sum += if mx > 0.0 { (mx - mn) / mx } else { 0.0 };
+            n += 1.0;
+        }
+    }
+    let colourful = n > 0.0 && sat_sum / n > 0.25;
+    for (o, px) in out.data_mut().chunks_exact_mut(4).zip(d.chunks_exact(4)) {
+        let a = px[3] as f32 / 255.0;
+        if a <= 0.0 {
+            continue;
+        }
+        let (r, g, b) = (px[0] as f32 / 255.0 / a, px[1] as f32 / 255.0 / a, px[2] as f32 / 255.0 / a);
+        let red = r > 0.55 && r > g * 1.7 && r > b * 1.7;
+        if red {
+            o.copy_from_slice(px);
+            continue;
+        }
+        let k = if colourful {
+            let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            // Dark and mid tones are the shape; near-white parts are holes.
+            ((0.88 - l) / 0.5).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let oa = a * k;
+        o[0] = (rgb[0] as f32 * oa) as u8;
+        o[1] = (rgb[1] as f32 * oa) as u8;
+        o[2] = (rgb[2] as f32 * oa) as u8;
+        o[3] = (oa * 255.0) as u8;
+    }
     Some(out)
 }

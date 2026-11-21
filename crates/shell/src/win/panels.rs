@@ -21,6 +21,7 @@ use super::super::media::{ArtId, Command, Media, Snapshot};
 use super::super::notifications::{self, Toast, Update, Watcher};
 use super::super::surface::Surface;
 use super::super::system;
+use super::super::util::trace;
 use super::super::tray::{Tray, TrayButton, TrayEvent};
 use super::{App, ESC_ONLY, MENU_FROM_BAR, MENU_RECT, TIMER_BANNER, WM_APP_MEDIA, WM_APP_NOTES, WM_APP_TRAY, image_from};
 
@@ -30,7 +31,8 @@ const BANNER_MS: u32 = 5000;
 
 pub(super) struct Extras {
     pub(super) tray: Option<Tray>,
-    tray_images: HashMap<u64, (u64, Rc<Image>)>,
+    /// Per tray icon: picture hash and its templates.
+    tray_images: HashMap<u64, (u64, Templates)>,
     /// Lower-case exe paths of apps with a tray icon: alive even without windows.
     pub(super) tray_exes: HashSet<String>,
     media: Media,
@@ -94,6 +96,17 @@ impl Extras {
     }
 }
 
+/// (dark glyph, light glyph) versions of a tray icon.
+type Templates = (Rc<Image>, Rc<Image>);
+
+/// Menu-bar templates of a tray icon, as macOS shows menu extras.
+fn tray_images(r: &super::super::icons::Rgba) -> Option<Templates> {
+    let pm = system::pixmap_from_rgba(r.w, r.h, r.data.clone())?;
+    let dark = macrust_ui::gfx::template(&pm, [0, 0, 0])?;
+    let light = macrust_ui::gfx::template(&pm, [255, 255, 255])?;
+    Some((Rc::new(Image::new(dark)), Rc::new(Image::new(light))))
+}
+
 fn hash_of(data: &[u8]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     data.hash(&mut h);
@@ -109,6 +122,15 @@ fn app_parse_name(app_id: &str) -> String {
     }
 }
 
+/// Panels hang from the bar and their shadow margin reaches over it. Any pixel
+/// with alpha takes clicks on a layered window, so the rows over the bar are
+/// cleared: otherwise the panel swallows the click meant to close it.
+pub(super) fn clear_rows(pm: &mut macrust_ui::tiny_skia::Pixmap, rows: i32) {
+    let rows = rows.clamp(0, pm.height() as i32) as usize;
+    let stride = pm.width() as usize * 4;
+    pm.data_mut()[..rows * stride].fill(0);
+}
+
 fn minutes_since(t: SystemTime) -> u64 {
     SystemTime::now().duration_since(t).map(|d| d.as_secs() / 60).unwrap_or(0)
 }
@@ -118,6 +140,7 @@ impl App {
         if self.settings.tray_icons {
             self.x.tray = Tray::start(self.bar_s.hwnd, WM_APP_TRAY);
         }
+        trace(format!("tray host started: {}", self.x.tray.is_some()));
         self.x.privacy = system::privacy_in_use();
     }
 
@@ -164,17 +187,20 @@ impl App {
             if let Some(e) = &ic.owner_exe {
                 exes.insert(e.to_lowercase());
             }
-            let image = ic.icon.as_ref().and_then(|rgba| {
-                let stamp = hash_of(&rgba.data);
-                match self.x.tray_images.get(&ic.id) {
-                    Some((s, img)) if *s == stamp => Some((stamp, img.clone())),
-                    _ => image_from(rgba.clone(), false).map(|img| (stamp, img)),
-                }
-            });
-            if let Some((stamp, img)) = &image {
-                self.x.tray_images.insert(ic.id, (*stamp, img.clone()));
+            let stamp = ic.icon.as_ref().map(|r| hash_of(&r.data)).unwrap_or(0);
+            let images = match self.x.tray_images.get(&ic.id) {
+                Some((s, imgs)) if *s == stamp => Some(imgs.clone()),
+                _ => ic.icon.as_ref().and_then(tray_images),
+            };
+            if let Some(imgs) = &images {
+                self.x.tray_images.insert(ic.id, (stamp, imgs.clone()));
             }
-            items.push(TrayItem { id: ic.id, icon: image.as_ref().map(|i| i.1.clone()), stamp: image.map(|i| i.0).unwrap_or(0) });
+            items.push(TrayItem {
+                id: ic.id,
+                icon_dark: images.as_ref().map(|i| i.0.clone()),
+                icon_light: images.as_ref().map(|i| i.1.clone()),
+                stamp,
+            });
         }
         self.x.tray_images.retain(|id, _| icons.iter().any(|i| i.id == *id));
         if self.bar.set_tray(items, &self.ctx) {
@@ -262,6 +288,7 @@ impl App {
     }
 
     pub(super) fn toggle_control(&mut self) {
+        trace(format!("control center toggle: open {:?}", self.x.cc.as_ref().map(|c| !c.closing())));
         // A click on the item while the panel is up first closes it through
         // the bar's CloseMenus; the panel is then on its way out.
         if self.x.cc.is_some() {
@@ -442,6 +469,7 @@ impl App {
     }
 
     pub(super) fn toggle_notes(&mut self) {
+        trace(format!("notification center toggle: open {:?}", self.x.nc.as_ref().map(|n| !n.closing())));
         if self.x.nc.is_some() {
             self.close_panels(true);
             return;
@@ -509,10 +537,116 @@ impl App {
     }
 
     // -------------------------------------------------------------------
+    // Diagnostic report (no titles, texts or network names)
+
+    pub(super) fn report_extras(&self, info: &mut String) {
+        use std::fmt::Write as _;
+        let _ = writeln!(info, "\n[tray] hosted {}", self.x.tray.is_some());
+        if let Some(t) = &self.x.tray {
+            for ic in t.icons() {
+                let size = ic.icon.as_ref().map(|r| format!("{}x{}", r.w, r.h)).unwrap_or_else(|| "no picture".into());
+                let owner = ic.owner_exe.as_deref().map(super::report::file_name).unwrap_or_else(|| "?".into());
+                let _ = writeln!(info, "{owner} | {size}");
+            }
+        }
+        let m = &self.x.snap;
+        let _ = writeln!(
+            info,
+            "\n[media] volume {:?} muted {} wifi {:?} bluetooth {:?} brightness {} now playing {:?}",
+            m.volume,
+            m.muted,
+            m.wifi.as_ref().map(|w| (w.on, w.ssid.is_some(), w.signal)),
+            m.bluetooth,
+            m.brightness.is_some(),
+            m.now_playing.as_ref().map(|p| (p.app.clone(), p.playing, p.art.is_some()))
+        );
+        let _ = writeln!(info, "\n[notifications] {} kept, {} dismissed here", self.x.toasts.len(), self.x.hidden.len());
+        let mut apps: Vec<&str> = self.x.toasts.iter().map(|t| t.app_id.as_str()).collect();
+        apps.sort_unstable();
+        apps.dedup();
+        for a in apps {
+            let _ = writeln!(info, "{}", super::report::file_name(a));
+        }
+        let _ = writeln!(info, "\n[privacy] microphone {} camera {}", self.x.privacy.0, self.x.privacy.1);
+        let _ = writeln!(info, "[panels] control open {} notifications open {} banner {}", self.x.cc.is_some(), self.x.nc.is_some(), self.x.banner.is_some());
+    }
+
+    pub(super) fn report_images(&mut self, wall: &macrust_ui::tiny_skia::Pixmap, dir: &std::path::Path, notes: &mut String) {
+        use macrust_ui::tiny_skia::Pixmap;
+        let s = self.screen.scale;
+        let mut st = self.control_state();
+        if let Some((_, ssid)) = &mut st.wifi
+            && ssid.is_some()
+        {
+            *ssid = Some("Network".into());
+        }
+        if let Some(p) = &mut st.playing {
+            p.title = "Title".into();
+            p.artist = "Artist".into();
+        }
+        let mut cc = ControlCenter::new(st, s);
+        for _ in 0..240 {
+            cc.update(1.0 / 60.0);
+        }
+        let r = self.panel_rect(cc.window_size());
+        if let Some(mut pm) = Pixmap::new(r.w as u32, r.h as u32) {
+            cc.draw(&mut pm, &self.ctx);
+            if let Some(out) = super::report::over_wallpaper(wall, &pm, r) {
+                let _ = out.save_png(dir.join("control-center.png")).map_err(|e| notes.push_str(&format!("control: {e}\n")));
+            }
+        }
+        let mut views: Vec<NoteView> = self.visible_toasts().iter().take(6).map(|t| self.note_view(t)).collect();
+        for v in &mut views {
+            v.title = "Title".into();
+            v.body = "Message text".into();
+            v.image = None;
+        }
+        let max_h = (self.screen.h - self.bar.height_px()) as f32 - self.dock.reserved_height() as f32;
+        let mut nc = NotificationCenter::new(views, self.today(), s, max_h);
+        for _ in 0..240 {
+            nc.update(1.0 / 60.0);
+        }
+        let r = self.panel_rect(nc.window_size(&self.ctx));
+        if let Some(mut pm) = Pixmap::new(r.w as u32, r.h as u32) {
+            nc.draw(&mut pm, &self.ctx);
+            if let Some(out) = super::report::over_wallpaper(wall, &pm, r) {
+                let _ = out.save_png(dir.join("notification-center.png")).map_err(|e| notes.push_str(&format!("notifications: {e}\n")));
+            }
+        }
+        // The status area of the bar, enlarged, to judge tray icons pixel by pixel.
+        let br = self.bar.window_rect();
+        if let Some(mut pm) = Pixmap::new(br.w.max(1) as u32, br.h.max(1) as u32) {
+            self.bar.draw(&mut pm, &self.ctx);
+            if let Some(full) = super::report::over_wallpaper(wall, &pm, br) {
+                let cw = (700.0 * s).min(full.width() as f32) as u32;
+                let k = 3u32;
+                if let Some(mut zoom) = Pixmap::new(cw * k, full.height() * k) {
+                    let src = full.data();
+                    let fw = full.width();
+                    let x0 = fw - cw;
+                    let zw = cw * k;
+                    let d = zoom.data_mut();
+                    for y in 0..full.height() * k {
+                        for x in 0..zw {
+                            let si = (((y / k) * fw + x0 + x / k) * 4) as usize;
+                            let di = ((y * zw + x) * 4) as usize;
+                            d[di..di + 4].copy_from_slice(&src[si..si + 4]);
+                        }
+                    }
+                    let _ = zoom.save_png(dir.join("menu-bar-right-x3.png")).map_err(|e| notes.push_str(&format!("zoom: {e}\n")));
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
     // Panels: lifetime, input, frames
 
     pub(super) fn close_panels(&mut self, animated: bool) {
         let was_open = self.x.cc.is_some() || self.x.nc.is_some();
+        if was_open {
+            trace(format!("panels close (animated {animated})"));
+        }
         if animated {
             if let Some(c) = &mut self.x.cc {
                 c.close();
@@ -538,6 +672,9 @@ impl App {
     pub(super) fn panel_mouse(&mut self, hwnd: HWND, msg: u32, x: f32, y: f32) -> Option<()> {
         use windows::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
         const WM_MOUSELEAVE: u32 = 0x02A3;
+        if msg != WM_MOUSEMOVE {
+            trace(format!("panel input {msg:#x} at {x:.0},{y:.0}"));
+        }
         if hwnd == self.x.cc_s.hwnd {
             let cc = self.x.cc.as_mut()?;
             match msg {
@@ -644,12 +781,14 @@ impl App {
     }
 
     pub(super) fn extras_render(&mut self) {
+        let bar_h = self.bar.height_px();
         if self.x.cc_s.dirty
             && let Some(cc) = &self.x.cc
         {
             let r = self.panel_rect(cc.window_size());
             self.x.cc_s.prepare(r);
             cc.draw(&mut self.x.cc_s.pm, &self.ctx);
+            clear_rows(&mut self.x.cc_s.pm, bar_h - r.y);
             self.x.cc_s.present();
         }
         if self.x.nc_s.dirty
@@ -658,6 +797,7 @@ impl App {
             let r = self.panel_rect(nc.window_size(&self.ctx));
             self.x.nc_s.prepare(r);
             nc.draw(&mut self.x.nc_s.pm, &self.ctx);
+            clear_rows(&mut self.x.nc_s.pm, bar_h - r.y);
             self.x.nc_s.present();
         }
         if self.x.banner_s.dirty
@@ -666,6 +806,7 @@ impl App {
             let r = self.panel_rect(b.window_size(&self.ctx));
             self.x.banner_s.prepare(r);
             b.draw(&mut self.x.banner_s.pm, &self.ctx);
+            clear_rows(&mut self.x.banner_s.pm, bar_h - r.y);
             self.x.banner_s.present();
         }
     }

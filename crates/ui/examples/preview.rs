@@ -76,6 +76,10 @@ fn fake_icon(top: Color, bottom: Color, mark: u8) -> Rc<Image> {
     Rc::new(Image::with_shadow(pm))
 }
 
+fn tpl(img: &Rc<Image>, rgb: [u8; 3]) -> Option<Rc<Image>> {
+    gfx::template(img.base(), rgb).map(|p| Rc::new(Image::new(p)))
+}
+
 fn entries() -> Vec<DockEntry> {
     let app = |key: &str, label: &str, icon: Rc<Image>, running: bool| DockEntry {
         key: key.into(),
@@ -158,11 +162,15 @@ fn desktop(sc: &Scene, out: &str, name: &str, with_menu: bool, with_spot: bool, 
         &sc.ctx,
     );
     bar.update_contrast(&sc.ctx);
-    let tray = vec![
-        TrayItem { id: 1, icon: Some(fake_icon(rgba(255, 90, 90, 1.0), rgba(200, 20, 30, 1.0), 5)), stamp: 1 },
-        TrayItem { id: 2, icon: Some(fake_icon(rgba(90, 190, 255, 1.0), rgba(30, 140, 230, 1.0), 4)), stamp: 1 },
-        TrayItem { id: 3, icon: Some(fake_icon(rgba(130, 140, 255, 1.0), rgba(88, 101, 242, 1.0), 0)), stamp: 1 },
-    ];
+    let tray: Vec<TrayItem> = [
+        fake_icon(rgba(255, 90, 90, 1.0), rgba(200, 20, 30, 1.0), 5),
+        fake_icon(rgba(90, 190, 255, 1.0), rgba(30, 140, 230, 1.0), 4),
+        fake_icon(rgba(130, 140, 255, 1.0), rgba(88, 101, 242, 1.0), 0),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, ic)| TrayItem { id: i as u64 + 1, icon_dark: tpl(ic, [0, 0, 0]), icon_light: tpl(ic, [255, 255, 255]), stamp: 1 })
+    .collect();
     bar.set_tray(tray, &sc.ctx);
 
     let mut dock = Dock::new(DockConfig::default());

@@ -54,3 +54,41 @@ pub fn hwnd_to_isize(h: HWND) -> isize {
 pub fn hwnd_from_isize(v: isize) -> HWND {
     HWND(v as *mut _)
 }
+
+// ---------------------------------------------------------------------------
+// Event trace for the diagnostic report: the last few hundred UI events, kept
+// in memory only. Callers pass no window titles, file names or message text.
+
+static TRACE: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+pub fn trace(msg: impl AsRef<str>) {
+    let t = START.get_or_init(std::time::Instant::now).elapsed().as_millis();
+    if let Ok(mut q) = TRACE.lock() {
+        if q.len() >= 600 {
+            q.pop_front();
+        }
+        q.push_back(format!("{t:>9} {}", msg.as_ref()));
+    }
+}
+
+pub fn trace_dump() -> String {
+    TRACE.lock().map(|q| q.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default()
+}
+
+/// Replaces the user's profile path and name, so a report names no one.
+pub fn redact(s: &str) -> String {
+    let mut out = s.to_string();
+    if let Ok(p) = std::env::var("USERPROFILE")
+        && !p.is_empty()
+    {
+        out = out.replace(&p, "%USERPROFILE%").replace(&p.to_lowercase(), "%USERPROFILE%");
+    }
+    if let Ok(u) = std::env::var("USERNAME")
+        && u.len() > 2
+    {
+        out = out.replace(&u, "<user>");
+    }
+    out
+}

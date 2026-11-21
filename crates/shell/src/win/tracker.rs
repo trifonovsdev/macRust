@@ -5,7 +5,11 @@ use std::collections::HashMap;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HWND, LPARAM, TRUE};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
-use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+use windows::Win32::Foundation::PROPERTYKEY;
+use windows::Win32::Storage::EnhancedStorage::{
+    PKEY_AppUserModel_ID, PKEY_AppUserModel_RelaunchCommand, PKEY_AppUserModel_RelaunchDisplayNameResource,
+    PKEY_AppUserModel_RelaunchIconResource,
+};
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -15,7 +19,7 @@ use windows::Win32::System::Threading::{
     QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
-use windows::Win32::UI::Shell::SIGDN_NORMALDISPLAY;
+use windows::Win32::UI::Shell::{SHLoadIndirectString, SIGDN_NORMALDISPLAY};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetWindow, GetWindowLongPtrW,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, WS_EX_APPWINDOW,
@@ -35,6 +39,12 @@ pub struct RunningApp {
     /// In z-order, topmost first.
     pub windows: Vec<HWND>,
     pub pids: Vec<u32>,
+    /// The program the taskbar would relaunch for this group (Steam for
+    /// steamwebhelper windows), from the window's relaunch properties.
+    pub relaunch_exe: Option<String>,
+    /// The AppUserModelID is a registered app (has a Start entry): its icon
+    /// and name resolve through shell:AppsFolder.
+    pub registered: bool,
 }
 
 pub fn class_name(h: HWND) -> String {
@@ -100,15 +110,51 @@ fn process_info(pid: u32) -> (Option<String>, Option<String>) {
     }
 }
 
-fn window_aumid(h: HWND) -> Option<String> {
+fn window_prop(h: HWND, key: &PROPERTYKEY) -> Option<String> {
     unsafe {
         let store: IPropertyStore = SHGetPropertyStoreForWindow(h).ok()?;
-        let v = store.GetValue(&PKEY_AppUserModel_ID).ok()?;
+        let v = store.GetValue(key).ok()?;
         let p = PropVariantToStringAlloc(&v).ok()?;
         let s = p.to_string().ok();
         CoTaskMemFree(Some(p.0 as *const _));
         s.filter(|s| !s.is_empty())
     }
+}
+
+fn window_aumid(h: HWND) -> Option<String> {
+    window_prop(h, &PKEY_AppUserModel_ID)
+}
+
+/// "C:\x\steam.exe" -silent  ->  C:\x\steam.exe; "C:\x\steam.exe,0" -> same.
+fn command_exe(cmd: &str) -> Option<String> {
+    let cmd = cmd.trim();
+    let path = if let Some(rest) = cmd.strip_prefix('"') {
+        rest.split('"').next()?
+    } else {
+        let lower = cmd.to_lowercase();
+        let end = lower.find(".exe").map(|i| i + 4).unwrap_or(cmd.len());
+        &cmd[..end]
+    };
+    let path = path.split(',').next()?.trim();
+    (path.to_lowercase().ends_with(".exe")).then(|| path.to_string())
+}
+
+/// (relaunch exe, relaunch display name) a window advertises to the taskbar.
+fn relaunch(h: HWND) -> (Option<String>, Option<String>) {
+    let exe = window_prop(h, &PKEY_AppUserModel_RelaunchCommand)
+        .and_then(|c| command_exe(&c))
+        .or_else(|| window_prop(h, &PKEY_AppUserModel_RelaunchIconResource).and_then(|c| command_exe(&c)));
+    let name = window_prop(h, &PKEY_AppUserModel_RelaunchDisplayNameResource).and_then(|n| {
+        if n.starts_with('@') {
+            let src = wide(&n);
+            let mut buf = [0u16; 260];
+            unsafe { SHLoadIndirectString(PCWSTR(src.as_ptr()), &mut buf, None).ok()? };
+            Some(from_wide(&buf)).filter(|s| !s.is_empty())
+        } else {
+            Some(n)
+        }
+    });
+    (exe, name)
 }
 
 /// Whether a process still runs. Pids are reused, so the image path must match too.
@@ -192,20 +238,42 @@ pub fn display_name(parse_name: &str) -> Option<String> {
     }
 }
 
-/// Human name of an app, cached by key.
+/// Human name of an app, cached by key. `fallback` is the name the window
+/// gives the taskbar, used when the AppUserModelID is not a registered app.
 pub fn app_name(cache: &mut HashMap<String, String>, exe: &str, aumid: Option<&str>) -> String {
+    app_name_with(cache, exe, aumid, None)
+}
+
+fn app_name_with(cache: &mut HashMap<String, String>, exe: &str, aumid: Option<&str>, fallback: Option<&str>) -> String {
     let key = app_key(exe, aumid);
     if let Some(n) = cache.get(&key) {
         return n.clone();
     }
     let name = aumid
-        .and_then(|a| display_name(&format!("shell:AppsFolder\\{a}")))
+        .and_then(registered_name)
+        .or_else(|| fallback.map(str::to_string))
         .or_else(|| file_description(exe))
         .unwrap_or_else(|| {
             std::path::Path::new(exe).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
         });
     cache.insert(key, name.clone());
     name
+}
+
+thread_local! {
+    static REGISTERED: std::cell::RefCell<HashMap<String, Option<String>>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Start-menu name of a registered AppUserModelID; None when it is not one
+/// (apps may set any id on their windows, e.g. Steam's web helper).
+fn registered_name(aumid: &str) -> Option<String> {
+    let key = aumid.to_lowercase();
+    if let Some(v) = REGISTERED.with(|r| r.borrow().get(&key).cloned()) {
+        return v;
+    }
+    let v = display_name(&format!("shell:AppsFolder\\{aumid}"));
+    REGISTERED.with(|r| r.borrow_mut().insert(key, v.clone()));
+    v
 }
 
 pub fn snapshot(names: &mut HashMap<String, String>) -> Vec<RunningApp> {
@@ -229,8 +297,10 @@ pub fn snapshot(names: &mut HashMap<String, String>) -> Vec<RunningApp> {
                 a.pids.push(pid);
             }
         } else {
-            let name = app_name(names, &exe, aumid.as_deref());
-            apps.push(RunningApp { key, exe, aumid, name, windows: vec![h], pids: vec![pid] });
+            let (relaunch_exe, relaunch_name) = relaunch(h);
+            let registered = aumid.as_deref().is_some_and(|a| registered_name(a).is_some());
+            let name = app_name_with(names, &exe, aumid.as_deref(), relaunch_name.as_deref());
+            apps.push(RunningApp { key, exe, aumid, name, windows: vec![h], pids: vec![pid], relaunch_exe, registered });
         }
     }
     apps

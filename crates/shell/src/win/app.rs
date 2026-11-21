@@ -46,7 +46,7 @@ use super::icons::{self, IconWorker, Request};
 use super::surface::Surface;
 use super::system::{self, Network, Power, Screen, WM_APPBAR};
 use super::tracker::{self, RunningApp};
-use super::util::{known_folder, log};
+use super::util::{known_folder, log, trace};
 use super::winops;
 
 /// Not re-exported by WindowsAndMessaging in this crate version.
@@ -66,12 +66,23 @@ pub const WM_APP_NOTES: u32 = WM_APP + 13;
 
 #[path = "panels.rs"]
 mod panels;
+#[path = "report.rs"]
+mod report;
+
+/// Render time of one surface, for the diagnostic report.
+#[derive(Default)]
+struct Stat {
+    n: u64,
+    total: f64,
+    worst: f64,
+}
 
 const TIMER_CLOCK: usize = 1;
 const TIMER_STATUS: usize = 2;
 const TIMER_CARET: usize = 3;
 const TIMER_WINDOWS: usize = 4;
 const TIMER_BANNER: usize = 5;
+const TIMER_REPORT: usize = 6;
 const HOTKEY_SEARCH: i32 = 1;
 
 const TRASH: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}";
@@ -89,6 +100,7 @@ const T_SHUTDOWN: u32 = 7;
 const T_LOCK: u32 = 8;
 const T_LOGOUT: u32 = 9;
 const T_QUIT_SHELL: u32 = 10;
+const T_REPORT: u32 = 11;
 const T_CONFIRM: u32 = 20;
 const T_CANCEL: u32 = 21;
 const T_HIDE: u32 = 30;
@@ -185,6 +197,9 @@ pub struct App {
     /// Apps whose windows are gone but whose process still runs (Telegram,
     /// Discord, OBS closed to the tray). They keep their dock icon, as on a Mac.
     lingering: Vec<RunningApp>,
+    /// App keys in the order they first appeared: the dock keeps this order
+    /// instead of the z-order, which changes with every click.
+    order: Vec<String>,
     names: HashMap<String, String>,
     fg: Option<HWND>,
     fg_name: String,
@@ -214,6 +229,7 @@ pub struct App {
     own_pid: u32,
     /// Tray, Control Center, Notification Center, banners (panels.rs).
     x: panels::Extras,
+    stats: std::collections::BTreeMap<&'static str, Stat>,
 }
 
 fn win_events_install() {
@@ -382,7 +398,7 @@ fn default_pins(names: &mut HashMap<String, String>) -> Vec<Pin> {
 
 fn pin_matches(src: &Source, app: &RunningApp) -> bool {
     match src {
-        Source::Exe(p) => app.exe.eq_ignore_ascii_case(p),
+        Source::Exe(p) => app.exe.eq_ignore_ascii_case(p) || app.relaunch_exe.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(p)),
         Source::Aumid(a) => app.aumid.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(a)),
     }
 }
@@ -437,6 +453,7 @@ impl App {
             menu_windows: Vec::new(),
             running: Vec::new(),
             lingering: Vec::new(),
+            order: Vec::new(),
             names,
             fg: None,
             fg_name: String::new(),
@@ -463,6 +480,7 @@ impl App {
             taskbar_msg,
             own_pid: unsafe { GetCurrentProcessId() },
             x: extras,
+            stats: std::collections::BTreeMap::new(),
         };
 
         if app.settings.hide_taskbar {
@@ -484,6 +502,8 @@ impl App {
                 log("Alt+Space is taken by another program; open search from the menu bar");
             }
             SetTimer(Some(app.bar_s.hwnd), TIMER_STATUS, 1000, None);
+            // A fresh diagnostic report after every start, once things settle.
+            SetTimer(Some(app.bar_s.hwnd), TIMER_REPORT, 20_000, None);
         }
         app.schedule_clock();
         app
@@ -597,6 +617,17 @@ impl App {
         }
         lingering.retain(|a| !a.pids.is_empty());
         self.lingering = lingering;
+        let live: HashSet<&str> = self.running.iter().chain(&self.lingering).map(|a| a.key.as_str()).collect();
+        self.order.retain(|k| live.contains(k.as_str()));
+        for a in self.running.iter().chain(&self.lingering) {
+            if !self.order.contains(&a.key) {
+                self.order.push(a.key.clone());
+            }
+        }
+        let rank = |k: &str, order: &[String]| order.iter().position(|o| o == k).unwrap_or(usize::MAX);
+        let order = self.order.clone();
+        self.running.sort_by_key(|a| rank(&a.key, &order));
+        self.lingering.sort_by_key(|a| rank(&a.key, &order));
         KNOWN.with(|k| {
             let mut k = k.borrow_mut();
             k.clear();
@@ -647,9 +678,11 @@ impl App {
         let unpinned_lingering =
             self.lingering.clone().into_iter().zip(used_lingering).filter(|(_, u)| !u).map(|(a, _)| (a, false));
         for (a, has_windows) in unpinned.chain(unpinned_lingering) {
+            // An id that is not a registered app has no icon or name in
+            // shell:AppsFolder; the program the window names for relaunch does.
             let source = match &a.aumid {
-                Some(id) => Source::Aumid(id.clone()),
-                None => Source::Exe(a.exe.clone()),
+                Some(id) if a.registered => Source::Aumid(id.clone()),
+                _ => Source::Exe(a.relaunch_exe.clone().unwrap_or_else(|| a.exe.clone())),
             };
             let icon = self.dock_icon(&source.parse_name());
             entries.push(DockEntry {
@@ -727,6 +760,8 @@ impl App {
         if fg.is_invalid() || tracker::window_pid(fg) == self.own_pid {
             return;
         }
+        let (exe, _) = tracker::identify(fg);
+        trace(format!("foreground: {} class {}", exe.as_deref().map(report::file_name).unwrap_or_default(), tracker::class_name(fg)));
         let root = unsafe { GetAncestor(fg, GA_ROOTOWNER) };
         let root = if root.is_invalid() { fg } else { root };
         let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
@@ -766,6 +801,11 @@ impl App {
     }
 
     fn dock_click(&mut self, key: &str) {
+        let n = self.targets.get(key).and_then(|t| t.app.as_deref()).and_then(|k| self.app_by_key(k)).map(|a| {
+            let min = a.windows.iter().filter(|&&w| winops::is_minimized(w)).count();
+            format!("{} windows, {min} minimized", a.windows.len())
+        });
+        trace(format!("dock click {}: {}", report::file_name(key), n.unwrap_or_else(|| "not running".into())));
         let Some(t) = self.targets.get(key).cloned() else { return };
         match t.special {
             Special::Downloads(p) => system::open(&p),
@@ -893,6 +933,7 @@ impl App {
                 MenuEntry::item(s.lock, T_LOCK).shortcut("Win+L"),
                 MenuEntry::item(s.log_out, T_LOGOUT),
                 MenuEntry::sep(),
+                MenuEntry::item(s.report, T_REPORT),
                 MenuEntry::item(s.quit_shell, T_QUIT_SHELL),
             ],
             BarItem::App => vec![
@@ -998,6 +1039,7 @@ impl App {
             },
             T_CANCEL => {}
             T_QUIT_SHELL => self.quit(),
+            T_REPORT => self.write_report(true),
             T_HIDE => fg_windows.iter().for_each(|&w| winops::minimize(w)),
             T_HIDE_OTHERS => {
                 for a in &self.running {
@@ -1319,6 +1361,7 @@ impl App {
 
     fn pump_events(&mut self) {
         for e in std::mem::take(&mut self.bar.events) {
+            trace(format!("bar: {e:?}"));
             match e {
                 BarEvent::Open { item, x, bottom } => {
                     self.close_menu(false);
@@ -1333,6 +1376,10 @@ impl App {
             }
         }
         for e in std::mem::take(&mut self.dock.events) {
+            trace(format!("dock: {}", match &e {
+                DockEvent::Click(k) => format!("click {}", report::file_name(k)),
+                DockEvent::Menu { key, .. } => format!("menu {}", report::file_name(key)),
+            }));
             match e {
                 DockEvent::Click(key) => {
                     self.close_menu(true);
@@ -1409,23 +1456,37 @@ impl App {
         }
     }
 
+    fn stat(&mut self, name: &'static str, t: Instant) {
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let st = self.stats.entry(name).or_default();
+        st.n += 1;
+        st.total += ms;
+        st.worst = st.worst.max(ms);
+    }
+
     fn render(&mut self) {
         if !self.fullscreen {
             if self.bar_s.dirty {
+                let t = Instant::now();
                 self.bar_s.prepare(self.bar.window_rect());
                 self.bar.draw(&mut self.bar_s.pm, &self.ctx);
                 self.bar_s.present();
+                self.stat("menu bar", t);
             }
             if self.dock_s.dirty {
+                let t = Instant::now();
                 self.dock_s.prepare(self.dock.window_rect());
                 self.dock.draw(&mut self.dock_s.pm, &self.ctx);
                 self.dock_s.present();
+                self.stat("dock", t);
             }
         }
         if self.spot_s.dirty && self.spot.shown() {
+            let t = Instant::now();
             self.spot_s.prepare(self.spot.window_rect());
             self.spot.draw(&mut self.spot_s.pm, &self.ctx);
             self.spot_s.present();
+            self.stat("search", t);
         }
         if self.menu_s.dirty
             && let Some(m) = &self.menu
@@ -1433,6 +1494,7 @@ impl App {
             let r = self.menu_s.rect;
             self.menu_s.prepare(r);
             m.draw(&mut self.menu_s.pm, &self.ctx);
+            panels::clear_rows(&mut self.menu_s.pm, self.bar.height_px() - r.y);
             self.menu_s.present();
         }
         self.extras_render();
@@ -1653,6 +1715,12 @@ impl App {
                 }
                 TIMER_CARET => self.spot_s.dirty = self.spot.shown(),
                 TIMER_BANNER => self.banner_timer(),
+                TIMER_REPORT => {
+                    unsafe {
+                        let _ = KillTimer(Some(self.bar_s.hwnd), TIMER_REPORT);
+                    }
+                    self.write_report(false);
+                }
                 TIMER_WINDOWS => {
                     unsafe {
                         let _ = KillTimer(Some(self.bar_s.hwnd), TIMER_WINDOWS);
@@ -1688,7 +1756,10 @@ impl App {
             WM_APP_MEDIA => self.on_media(),
             WM_APP_NOTES => self.on_notes(),
             WM_APP_CATALOG => self.catalog_arrived(),
-            WM_APP_DISMISS => self.close_menu(true),
+            WM_APP_DISMISS => {
+                trace("outside click: close menus and panels");
+                self.close_menu(true);
+            }
             WM_APP_MENUKEY => {
                 let key = match VIRTUAL_KEY(wp.0 as u16) {
                     VK_UP => Key::Up,
