@@ -38,7 +38,8 @@
 ![Dock](docs/dock-magnification.png)
 
 - **Liquid Glass:** the Dock is a clear slab that bends the wallpaper along its rim and catches a specular highlight, as in macOS 26.
-- **Icon shapes:** icons that fill a square are cut to the macOS squircle; round logos and bare glyphs sit on a plate that follows the light or dark appearance.
+- **macOS icons:** for popular apps (Telegram, WhatsApp, Slack, Zoom, Teams, Word, Excel, PowerPoint, Outlook, OneNote, Firefox, Brave, OBS, VLC, qBittorrent) macRust downloads the app's own macOS icon on first use, from the Mac App Store or the app's source repository, and keeps it in `%LOCALAPPDATA%\macRust\icons`. Nothing is bundled with macRust.
+- **Icon shapes:** other Windows icons that fill a square are cut to the macOS squircle; round logos and bare glyphs stand free, without a plate, sized to the macOS icon grid.
 
   <img src="docs/icon-shapes.png" alt="Icon shapes" width="280">
 - **What it shows:** pinned apps and every running app, plus Downloads and the Recycle Bin. Apps are grouped like the taskbar groups them, by AppUserModelID or by executable, so Store apps work too. An app that closes to the tray (Telegram, Discord, OBS) keeps its icon and dot while it runs.
@@ -101,6 +102,7 @@ The settings live in `%APPDATA%\macRust`. Restart macRust after editing them.
 - `settings.txt`: `icon_size`, `magnified_size`, `magnification`, `hide_taskbar`, `reserve_dock_space`, `appearance` (`auto` | `light` | `dark`), `tray_icons`, `banners`
 - `dock.txt`: pinned apps, one per line as `Name|exe|C:\path\to.exe` or `Name|aumid|AppUserModelID`. Pinning from the Dock's context menu is easier.
 - `log.txt`: errors, because the shell has no console.
+- `icons\`: your own Dock icons as PNG, named after the program file in lower case (`chrome.png`, `telegram.png`) or, for Store apps, after the package family name. They are used as they are and win over every other icon.
 
 ## Build
 

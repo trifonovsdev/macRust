@@ -435,11 +435,38 @@ pub fn fill_from(pm: &mut Pixmap, path: &Path, src: &Pixmap) {
 // ---------------------------------------------------------------------------
 // macOS 26 icon shape
 
-/// Fits an app icon into the macOS 26 icon shape. Icons that already fill a
-/// square tile are cut to the squircle; any other shape (round logos, glyphs
-/// with transparency) is set at 78% on a light plate (dark for light logos).
-/// Returns a square pixmap of `src`'s larger side.
-pub fn mac_icon(src: &Pixmap) -> Option<Pixmap> {
+/// Downscales by halving (a box filter, sharp and alias-free), then one
+/// bicubic step, so the larger side is at most `max` px.
+pub fn shrink(src: &Pixmap, max: u32) -> Pixmap {
+    let mut cur = src.clone();
+    while cur.width().max(cur.height()) >= max * 2 {
+        cur = halve(&cur);
+    }
+    let side = cur.width().max(cur.height());
+    if side <= max {
+        return cur;
+    }
+    let k = max as f32 / side as f32;
+    let (w, h) = (((cur.width() as f32 * k).round() as u32).max(1), ((cur.height() as f32 * k).round() as u32).max(1));
+    let Some(mut out) = Pixmap::new(w, h) else { return cur };
+    let paint = PixmapPaint { quality: FilterQuality::Bicubic, ..PixmapPaint::default() };
+    out.draw_pixmap(0, 0, cur.as_ref(), &paint, Transform::from_scale(k, k), None);
+    out
+}
+
+pub struct MacIcon {
+    pub pixmap: Pixmap,
+    /// Cut from a full-bleed tile (draw with the dock's tile shadow); otherwise
+    /// free-standing art with its own shadow baked in.
+    pub tile: bool,
+}
+
+/// Fits an app icon into the macOS 26 icon grid, on a square canvas of
+/// `src`'s larger side. Icons that already fill a square tile are cut to the
+/// squircle; any other shape (round logos, glyphs with transparency) stands
+/// free, without a plate: its visible bounds fill the grid's 824/1024 content
+/// box, with a soft drop shadow under it.
+pub fn mac_icon(src: &Pixmap) -> Option<MacIcon> {
     let (w, h) = (src.width() as usize, src.height() as usize);
     let n = w.max(h) as f32;
     let data = src.data();
@@ -473,72 +500,52 @@ pub fn mac_icon(src: &Pixmap) -> Option<Pixmap> {
     // Apple's grid: the shape is 824/1024 of the canvas, corner radius 0.225 of it.
     let size = n * 0.805;
     let inset = (n - size) / 2.0;
-    let shape = squircle(inset, inset, size, size, size * 0.225)?;
     let mut out = Pixmap::new(n as u32, n as u32)?;
     let quality = PixmapPaint { quality: FilterQuality::Bicubic, ..PixmapPaint::default() };
-    if tile {
-        let mut mask = tiny_skia::Mask::new(n as u32, n as u32)?;
-        mask.fill_path(&shape, FillRule::Winding, true, Transform::identity());
-        // A hair larger than the shape, so the tile's own corners never show inside ours.
-        let k = size * 1.02 / bw.min(bh);
-        let o = inset - size * 0.01;
-        let t = Transform::from_row(k, 0.0, 0.0, k, o - x0 as f32 * k, o - y0 as f32 * k);
-        out.draw_pixmap(0, 0, src.as_ref(), &quality, t, Some(&mask));
-    } else {
-        // Tahoe's own grey plate for such icons marks them as legacy; on a
-        // Windows dock that is every icon, so they get the plate native
-        // logo icons use instead (Chrome, Notion, ChatGPT): near-white, or
-        // near-black when the logo itself is light.
-        let (top, bottom) = if light_art(src, (x0, y0, x1, y1)) {
-            (rgba(58, 58, 62, 1.0), rgba(28, 28, 30, 1.0))
-        } else {
-            (rgba(255, 255, 255, 1.0), rgba(232, 232, 237, 1.0))
-        };
-        if let Some(sh) = tiny_skia::LinearGradient::new(
-            tiny_skia::Point::from_xy(0.0, inset),
-            tiny_skia::Point::from_xy(0.0, inset + size),
-            vec![tiny_skia::GradientStop::new(0.0, top), tiny_skia::GradientStop::new(1.0, bottom)],
-            tiny_skia::SpreadMode::Pad,
-            Transform::identity(),
-        ) {
-            fill_shader(&mut out, &shape, sh);
-        }
-        let k = size * 0.78 / bw.max(bh);
+    if !tile {
+        let k = size / bw.max(bh);
         let t = Transform::from_row(k, 0.0, 0.0, k, n / 2.0 - (x0 as f32 + bw / 2.0) * k, n / 2.0 - (y0 as f32 + bh / 2.0) * k);
         out.draw_pixmap(0, 0, src.as_ref(), &quality, t, None);
+        // The Dock's shadow under free-standing art, in points of a 52 pt icon:
+        // 0.5 pt down, about 1.75 pt of blur, black at 25%.
+        let pt = n / 52.0;
+        return Some(MacIcon { pixmap: drop_shadow(&out, 0.5 * pt, 0.9 * pt, 0.25), tile: false });
     }
+    let shape = squircle(inset, inset, size, size, size * 0.225)?;
+    let mut mask = tiny_skia::Mask::new(n as u32, n as u32)?;
+    mask.fill_path(&shape, FillRule::Winding, true, Transform::identity());
+    // A hair larger than the shape, so the tile's own corners never show inside ours.
+    let k = size * 1.02 / bw.min(bh);
+    let o = inset - size * 0.01;
+    let t = Transform::from_row(k, 0.0, 0.0, k, o - x0 as f32 * k, o - y0 as f32 * k);
+    out.draw_pixmap(0, 0, src.as_ref(), &quality, t, Some(&mask));
     // The faint light edge of macOS 26 icons, kept inside the shape: about
     // one device pixel where the dock draws the canvas at 52-104 px.
     let ew = n / 100.0;
     if let Some(edge) = squircle(inset + ew / 2.0, inset + ew / 2.0, size - ew, size - ew, size * 0.225 - ew / 2.0) {
         stroke(&mut out, &edge, rgba(255, 255, 255, 0.22), ew);
     }
-    Some(out)
+    Some(MacIcon { pixmap: out, tile: true })
 }
 
-/// Whether the visible pixels of an icon are mostly light and colourless
-/// (a white logo), which would vanish on a white plate.
-fn light_art(src: &Pixmap, (x0, y0, x1, y1): (usize, usize, usize, usize)) -> bool {
-    let w = src.width() as usize;
-    let data = src.data();
-    let (mut light, mut total) = (0.0f32, 0.0f32);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let p = &data[(y * w + x) * 4..][..4];
-            let a = p[3] as f32 / 255.0;
-            if a < 0.5 {
-                continue;
-            }
-            let (r, g, b) = (p[0] as f32 / 255.0 / a, p[1] as f32 / 255.0 / a, p[2] as f32 / 255.0 / a);
-            let max = r.max(g).max(b);
-            let chroma = max - r.min(g).min(b);
-            total += 1.0;
-            if max > 0.86 && chroma < 0.12 {
-                light += 1.0;
-            }
+/// `art` over a blurred black copy of its alpha, moved `dy` px down.
+fn drop_shadow(art: &Pixmap, dy: f32, sigma: f32, opacity: f32) -> Pixmap {
+    let (w, h) = (art.width() as usize, art.height() as usize);
+    let dy = dy.round() as usize;
+    let mut a = vec![0u8; w * h];
+    for y in dy..h {
+        for x in 0..w {
+            a[y * w + x] = (art.data()[((y - dy) * w + x) * 4 + 3] as f32 * opacity) as u8;
         }
     }
-    total > 0.0 && light / total > 0.6
+    box_blur(&mut a, w, h, 1, box_radius_for_sigma(sigma), 3);
+    let mut out = art.clone();
+    for (px, &s) in out.data_mut().chunks_exact_mut(4).zip(&a) {
+        // Shadow under the art: dst-over of black at alpha s.
+        let inv = 255 - px[3] as u32;
+        px[3] = (px[3] as u32 + (s as u32 * inv + 127) / 255) as u8;
+    }
+    out
 }
 
 /// A menu-bar "template" version of a colour icon, as macOS draws menu extras:
@@ -602,29 +609,56 @@ pub fn template(src: &Pixmap, rgb: [u8; 3]) -> Option<Pixmap> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn logo_icon_sits_at_78_percent_on_a_light_plate() {
+    fn red_disc() -> Pixmap {
         let mut src = Pixmap::new(256, 256).unwrap();
-        if let Some(c) = circle(128.0, 128.0, 100.0) {
+        if let Some(c) = circle(128.0, 128.0, 60.0) {
             fill(&mut src, &c, rgba(255, 0, 0, 1.0));
         }
-        let out = mac_icon(&src).unwrap();
-        let px = |x: u32, y: u32| out.pixel(x, y).unwrap().demultiply();
-        // Plate gradient white -> (232,232,237), sampled away from the edge line.
-        let (top, bottom) = (px(128, 34), px(128, 222));
-        assert!(top.red() >= 250 && (bottom.red() as i32 - 232).abs() <= 4, "{top:?} {bottom:?}");
-        let red: Vec<u32> = (0..256).filter(|&y| px(128, y).red() > 200 && px(128, y).green() < 60).collect();
-        let span = (red.last().unwrap() - red[0] + 1) as f32 / (256.0 * 0.805);
-        assert!((span - 0.78).abs() < 0.02, "art span {span}");
+        src
     }
 
     #[test]
-    fn white_logo_gets_a_dark_plate() {
+    fn logo_icon_stands_free_filling_the_grid() {
+        let out = mac_icon(&red_disc()).unwrap();
+        assert!(!out.tile);
+        let px = |x: u32, y: u32| out.pixmap.pixel(x, y).unwrap();
+        // No plate: the canvas corners and the grid box corners stay empty.
+        assert_eq!(px(2, 2).alpha(), 0);
+        assert_eq!(px(30, 30).alpha(), 0);
+        let red: Vec<u32> = (0..256).filter(|&x| px(x, 128).demultiply().red() > 200 && px(x, 128).alpha() > 128).collect();
+        let span = (red.last().unwrap() - red[0] + 1) as f32 / 256.0;
+        assert!((span - 0.805).abs() < 0.015, "art span {span}");
+        let mid = (red.last().unwrap() + red[0]) as f32 / 2.0;
+        assert!((mid - 127.5).abs() <= 1.0, "centre {mid}");
+    }
+
+    #[test]
+    fn free_icon_has_a_soft_shadow_below() {
+        let out = mac_icon(&red_disc()).unwrap().pixmap;
+        // Just outside the disc: darker below than above, and faint.
+        let (top, bottom) = (out.pixel(128, 23).unwrap(), out.pixel(128, 233).unwrap());
+        assert!(bottom.alpha() > top.alpha(), "{top:?} {bottom:?}");
+        assert!(bottom.alpha() < 80 && bottom.red() == 0, "{bottom:?}");
+        assert_eq!(out.pixel(128, 250).unwrap().alpha(), 0);
+    }
+
+    #[test]
+    fn full_bleed_tile_is_cut_to_the_squircle() {
         let mut src = Pixmap::new(256, 256).unwrap();
-        if let Some(c) = circle(128.0, 128.0, 100.0) {
-            fill(&mut src, &c, rgba(250, 250, 250, 1.0));
-        }
+        src.fill(rgba(0, 120, 255, 1.0));
         let out = mac_icon(&src).unwrap();
-        assert!(out.pixel(128, 34).unwrap().demultiply().red() < 80);
+        assert!(out.tile);
+        assert_eq!(out.pixmap.pixel(26, 26).unwrap().alpha(), 0);
+        assert_eq!(out.pixmap.pixel(128, 128).unwrap().alpha(), 255);
+        assert_eq!(out.pixmap.pixel(128, 12).unwrap().alpha(), 0);
+    }
+
+    #[test]
+    fn shrink_limits_the_larger_side() {
+        let src = Pixmap::new(1024, 1000).unwrap();
+        let s = shrink(&src, 256);
+        assert_eq!((s.width(), s.height()), (256, 250));
+        assert_eq!(shrink(&Pixmap::new(100, 100).unwrap(), 256).width(), 100);
+        assert_eq!(shrink(&Pixmap::new(300, 300).unwrap(), 256).width(), 256);
     }
 }

@@ -9,7 +9,7 @@ pub const EXE_ASSET: &str = "macrust.exe";
 pub const SHA_ASSET: &str = "macrust.exe.sha256";
 
 /// Hosts a download may come from, including the hosts GitHub redirects to.
-const ALLOWED_HOSTS: [&str; 4] =
+pub const ALLOWED_HOSTS: [&str; 4] =
     ["api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"];
 
 // ---------------------------------------------------------------------------
@@ -89,55 +89,17 @@ pub fn parse_update_file_name(name: &str) -> Option<Version> {
 // ---------------------------------------------------------------------------
 // URLs
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Url {
-    pub host: String,
-    /// Path and query, starting with `/`.
-    pub path: String,
-}
+pub use crate::net_logic::Url;
 
-impl Url {
-    #[cfg(test)]
-    pub fn as_string(&self) -> String {
-        format!("https://{}{}", self.host, self.path)
-    }
-}
-
-/// Accepts only `https://<allowed host>[:443]/...` without credentials.
+/// [`crate::net_logic::allowed_url`] with the updater's hosts.
 pub fn allowed_url(url: &str) -> Option<Url> {
-    let url = url.trim();
-    if url.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\') {
-        return None;
-    }
-    let rest = url.get(..8).filter(|p| p.eq_ignore_ascii_case("https://")).map(|_| &url[8..])?;
-    let rest = rest.split('#').next().unwrap_or(rest);
-    let (authority, path) = match rest.find(['/', '?']) {
-        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_string()),
-        Some(i) => (&rest[..i], format!("/{}", &rest[i..])),
-        None => (rest, "/".to_string()),
-    };
-    if authority.contains('@') {
-        return None;
-    }
-    let host = match authority.split_once(':') {
-        Some((h, "443")) => h,
-        Some(_) => return None,
-        None => authority,
-    };
-    let host = host.to_ascii_lowercase();
-    ALLOWED_HOSTS.contains(&host.as_str()).then_some(Url { host, path })
+    crate::net_logic::allowed_url(url, &ALLOWED_HOSTS)
 }
 
 /// Resolves a `Location` header against the URL that returned it.
+#[cfg(test)]
 pub fn resolve_redirect(base: &Url, location: &str) -> Option<Url> {
-    let location = location.trim();
-    if location.starts_with("//") {
-        return None;
-    }
-    if location.starts_with('/') {
-        return allowed_url(&format!("https://{}{}", base.host, location));
-    }
-    allowed_url(location)
+    crate::net_logic::resolve_redirect(base, location, &ALLOWED_HOSTS)
 }
 
 // ---------------------------------------------------------------------------

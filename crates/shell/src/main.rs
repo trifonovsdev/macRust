@@ -1,5 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod icon_logic;
+mod net_logic;
 mod update_logic;
 #[cfg(windows)]
 mod win;

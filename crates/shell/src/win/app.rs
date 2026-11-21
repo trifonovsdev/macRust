@@ -17,6 +17,7 @@ use macrust_ui::spotlight::{Glyph, Row, SpotEvent, Spotlight};
 use macrust_ui::strings::Strings;
 use macrust_ui::text::Text;
 use macrust_ui::theme::Theme;
+use macrust_ui::tiny_skia::Pixmap;
 use macrust_ui::wallpaper::{self, Vibrancy};
 use macrust_ui::{Ctx, Key, Mods, WinRect};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -43,6 +44,7 @@ use windows::core::PCWSTR;
 use super::catalog::{self, Batch};
 use super::config::{self, Pin, Settings, Source};
 use super::icons::{self, IconWorker, Request};
+use super::macicons::{self, MacIcons};
 use super::surface::Surface;
 use super::system::{self, Network, Power, Screen, WM_APPBAR};
 use super::tracker::{self, RunningApp};
@@ -216,6 +218,10 @@ pub struct App {
     last_appbar_place: Option<Instant>,
     small_icons: HashMap<String, Option<Rc<Image>>>,
     icon_worker: IconWorker,
+    mac_icons: MacIcons,
+    /// Dock icons from macOS artwork or the user's folder; a Windows icon
+    /// arriving later must not replace them.
+    mac_keys: HashSet<String>,
     /// Request id -> (cache key, is a dock icon).
     icon_reqs: HashMap<u64, (String, bool)>,
     icon_pending: HashSet<String>,
@@ -335,11 +341,28 @@ fn image_from(rgba: icons::Rgba, shadow: bool) -> Option<Rc<Image>> {
     Some(Rc::new(if shadow { Image::with_shadow(pm) } else { Image::new(pm) }))
 }
 
-/// An app icon in the macOS 26 shape (squircle tile or plate).
+/// An app icon in the macOS 26 shape (squircle tile or free-standing art).
 fn app_image(rgba: &icons::Rgba, shadow: bool) -> Option<Rc<Image>> {
     let pm = system::pixmap_from_rgba(rgba.w, rgba.h, rgba.data.clone())?;
-    let pm = macrust_ui::gfx::mac_icon(&pm).unwrap_or(pm);
-    Some(Rc::new(if shadow { Image::with_shadow(pm) } else { Image::new(pm) }))
+    Some(shaped(pm, shadow))
+}
+
+fn shaped(pm: Pixmap, shadow: bool) -> Rc<Image> {
+    Rc::new(match macrust_ui::gfx::mac_icon(&pm) {
+        Some(m) if m.tile && shadow => Image::with_shadow(m.pixmap),
+        // Free-standing art carries its own shadow.
+        Some(m) => Image::new(m.pixmap),
+        None if shadow => Image::with_shadow(pm),
+        None => Image::new(pm),
+    })
+}
+
+/// macOS artwork already has the macOS shape and shadow; square art is cut.
+fn mac_image(art: macicons::Art) -> Rc<Image> {
+    match art {
+        macicons::Art::AsIs(pm) => Rc::new(Image::new(pm)),
+        macicons::Art::Square(pm) => shaped(pm, true),
+    }
 }
 
 fn load_fonts(text: &mut Text) {
@@ -429,6 +452,7 @@ impl App {
         NOTIFY.store(bar_s.hwnd.0 as isize, Ordering::Relaxed);
 
         let icon_worker = IconWorker::spawn(bar_s.hwnd, WM_APP_ICON);
+        let mac_icons = MacIcons::spawn(bar_s.hwnd, WM_APP_ICON);
         let extras = panels::Extras::new(bar_s.hwnd);
         let catalog = catalog::spawn(bar_s.hwnd, WM_APP_CATALOG, ru);
         let mut names = HashMap::new();
@@ -468,6 +492,8 @@ impl App {
             last_appbar_place: None,
             small_icons: HashMap::new(),
             icon_worker,
+            mac_icons,
+            mac_keys: HashSet::new(),
             icon_reqs: HashMap::new(),
             icon_pending: HashSet::new(),
             next_req: 1,
@@ -578,8 +604,9 @@ impl App {
     // -----------------------------------------------------------------------
     // Windows, apps and the dock
 
-    /// The cached dock icon; a missing one is requested from the icon thread and
-    /// the dock is rebuilt when it arrives. Failures are retried after a minute.
+    /// The cached dock icon; a missing one is requested (macOS artwork first,
+    /// then the Windows icon) and the dock is rebuilt when it arrives.
+    /// Failures are retried after a minute.
     fn dock_icon(&mut self, parse_name: &str) -> Option<Rc<Image>> {
         let key = parse_name.to_lowercase();
         if let Some(i) = self.dock_icons.get(&key) {
@@ -588,12 +615,32 @@ impl App {
         if self.dock_failed.get(&key).is_some_and(|t| t.elapsed().as_secs() < 60) || self.icon_pending.contains(&key) {
             return None;
         }
-        let id = self.next_req;
-        self.next_req += 1;
         self.icon_pending.insert(key.clone());
-        self.icon_reqs.insert(id, (key, true));
-        self.icon_worker.request(Request { id, parse_name: parse_name.to_string(), size: 256, thumbnail: false });
+        self.mac_icons.request(key, parse_name.to_string());
         None
+    }
+
+    fn mac_icons_arrived(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(r) = self.mac_icons.rx.try_recv() {
+            match r.art {
+                Some(art) => {
+                    self.icon_pending.remove(&r.key);
+                    self.dock_icons.insert(r.key.clone(), mac_image(art));
+                    self.mac_keys.insert(r.key);
+                    changed = true;
+                }
+                None if !r.fetched => {
+                    // Nothing on disk: the Windows icon now, macOS artwork if a download lands.
+                    let id = self.next_req;
+                    self.next_req += 1;
+                    self.icon_reqs.insert(id, (r.key, true));
+                    self.icon_worker.request(Request { id, parse_name: r.parse_name, size: 256, thumbnail: false });
+                }
+                None => {}
+            }
+        }
+        changed
     }
 
     fn refresh_windows(&mut self) {
@@ -1256,11 +1303,14 @@ impl App {
     }
 
     fn icons_arrived(&mut self) {
-        let mut dock_changed = false;
+        let mut dock_changed = self.mac_icons_arrived();
         let mut notes_changed = false;
         while let Ok((id, rgba)) = self.icon_worker.rx.try_recv() {
             let Some((key, dock)) = self.icon_reqs.remove(&id) else { continue };
             self.icon_pending.remove(&key);
+            if dock && self.mac_keys.contains(&key) {
+                continue;
+            }
             if dock {
                 // Folders and the recycle bin keep their own shape, as on a Mac.
                 let special = key.starts_with("::") || std::path::Path::new(&key).is_dir();
