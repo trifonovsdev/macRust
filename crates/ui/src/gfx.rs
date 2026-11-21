@@ -437,10 +437,8 @@ pub fn fill_from(pm: &mut Pixmap, path: &Path, src: &Pixmap) {
 
 /// Fits an app icon into the macOS 26 icon shape. Icons that already fill a
 /// square tile are cut to the squircle; any other shape (round logos, glyphs
-/// with transparency) is shrunk to 70% on an opaque gray plate, as macOS 26
-/// does with icons that do not follow its grid (the Default icon style's
-/// plate, which it keeps in both appearances). Returns a square pixmap of
-/// `src`'s larger side.
+/// with transparency) is set at 78% on a light plate (dark for light logos).
+/// Returns a square pixmap of `src`'s larger side.
 pub fn mac_icon(src: &Pixmap) -> Option<Pixmap> {
     let (w, h) = (src.width() as usize, src.height() as usize);
     let n = w.max(h) as f32;
@@ -487,16 +485,25 @@ pub fn mac_icon(src: &Pixmap) -> Option<Pixmap> {
         let t = Transform::from_row(k, 0.0, 0.0, k, o - x0 as f32 * k, o - y0 as f32 * k);
         out.draw_pixmap(0, 0, src.as_ref(), &quality, t, Some(&mask));
     } else {
+        // Tahoe's own grey plate for such icons marks them as legacy; on a
+        // Windows dock that is every icon, so they get the plate native
+        // logo icons use instead (Chrome, Notion, ChatGPT): near-white, or
+        // near-black when the logo itself is light.
+        let (top, bottom) = if light_art(src, (x0, y0, x1, y1)) {
+            (rgba(58, 58, 62, 1.0), rgba(28, 28, 30, 1.0))
+        } else {
+            (rgba(255, 255, 255, 1.0), rgba(232, 232, 237, 1.0))
+        };
         if let Some(sh) = tiny_skia::LinearGradient::new(
             tiny_skia::Point::from_xy(0.0, inset),
             tiny_skia::Point::from_xy(0.0, inset + size),
-            vec![tiny_skia::GradientStop::new(0.0, rgba(140, 141, 141, 1.0)), tiny_skia::GradientStop::new(1.0, rgba(128, 128, 129, 1.0))],
+            vec![tiny_skia::GradientStop::new(0.0, top), tiny_skia::GradientStop::new(1.0, bottom)],
             tiny_skia::SpreadMode::Pad,
             Transform::identity(),
         ) {
             fill_shader(&mut out, &shape, sh);
         }
-        let k = size * 0.70 / bw.max(bh);
+        let k = size * 0.78 / bw.max(bh);
         let t = Transform::from_row(k, 0.0, 0.0, k, n / 2.0 - (x0 as f32 + bw / 2.0) * k, n / 2.0 - (y0 as f32 + bh / 2.0) * k);
         out.draw_pixmap(0, 0, src.as_ref(), &quality, t, None);
     }
@@ -507,6 +514,31 @@ pub fn mac_icon(src: &Pixmap) -> Option<Pixmap> {
         stroke(&mut out, &edge, rgba(255, 255, 255, 0.22), ew);
     }
     Some(out)
+}
+
+/// Whether the visible pixels of an icon are mostly light and colourless
+/// (a white logo), which would vanish on a white plate.
+fn light_art(src: &Pixmap, (x0, y0, x1, y1): (usize, usize, usize, usize)) -> bool {
+    let w = src.width() as usize;
+    let data = src.data();
+    let (mut light, mut total) = (0.0f32, 0.0f32);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let p = &data[(y * w + x) * 4..][..4];
+            let a = p[3] as f32 / 255.0;
+            if a < 0.5 {
+                continue;
+            }
+            let (r, g, b) = (p[0] as f32 / 255.0 / a, p[1] as f32 / 255.0 / a, p[2] as f32 / 255.0 / a);
+            let max = r.max(g).max(b);
+            let chroma = max - r.min(g).min(b);
+            total += 1.0;
+            if max > 0.86 && chroma < 0.12 {
+                light += 1.0;
+            }
+        }
+    }
+    total > 0.0 && light / total > 0.6
 }
 
 /// A menu-bar "template" version of a colour icon, as macOS draws menu extras:
@@ -571,20 +603,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_icon_sits_at_70_percent_on_the_gray_plate() {
+    fn logo_icon_sits_at_78_percent_on_a_light_plate() {
         let mut src = Pixmap::new(256, 256).unwrap();
         if let Some(c) = circle(128.0, 128.0, 100.0) {
             fill(&mut src, &c, rgba(255, 0, 0, 1.0));
         }
         let out = mac_icon(&src).unwrap();
         let px = |x: u32, y: u32| out.pixel(x, y).unwrap().demultiply();
-        // Plate gradient #8C8D8D -> #808081, sampled away from the edge line.
-        let top = px(128, 34);
-        let bottom = px(128, 222);
-        assert!((top.red() as i32 - 140).abs() <= 3 && (bottom.red() as i32 - 128).abs() <= 3, "{top:?} {bottom:?}");
-        // The art spans 70% of the 0.805 shape: rows where the red disc shows.
+        // Plate gradient white -> (232,232,237), sampled away from the edge line.
+        let (top, bottom) = (px(128, 34), px(128, 222));
+        assert!(top.red() >= 250 && (bottom.red() as i32 - 232).abs() <= 4, "{top:?} {bottom:?}");
         let red: Vec<u32> = (0..256).filter(|&y| px(128, y).red() > 200 && px(128, y).green() < 60).collect();
         let span = (red.last().unwrap() - red[0] + 1) as f32 / (256.0 * 0.805);
-        assert!((span - 0.70).abs() < 0.02, "art span {span}");
+        assert!((span - 0.78).abs() < 0.02, "art span {span}");
+    }
+
+    #[test]
+    fn white_logo_gets_a_dark_plate() {
+        let mut src = Pixmap::new(256, 256).unwrap();
+        if let Some(c) = circle(128.0, 128.0, 100.0) {
+            fill(&mut src, &c, rgba(250, 250, 250, 1.0));
+        }
+        let out = mac_icon(&src).unwrap();
+        assert!(out.pixel(128, 34).unwrap().demultiply().red() < 80);
     }
 }
