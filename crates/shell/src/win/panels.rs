@@ -120,10 +120,9 @@ fn sample_hash(pm: &Pixmap) -> u64 {
 type Templates = (Rc<Image>, Rc<Image>);
 
 /// Menu-bar templates of a tray icon, as macOS shows menu extras.
-fn tray_images(r: &super::super::icons::Rgba) -> Option<Templates> {
+fn tray_images(r: &super::super::icons::Rgba, exe: &str, tip: &str) -> Option<Templates> {
     let pm = system::pixmap_from_rgba(r.w, r.h, r.data.clone())?;
-    let dark = macrust_ui::gfx::template(&pm, [0, 0, 0])?;
-    let light = macrust_ui::gfx::template(&pm, [255, 255, 255])?;
+    let (dark, light) = macrust_ui::extras::templates(&pm, exe, tip)?;
     Some((Rc::new(Image::new(dark)), Rc::new(Image::new(light))))
 }
 
@@ -272,10 +271,12 @@ impl App {
             if ic.icon.is_none() {
                 continue;
             }
-            let stamp = ic.icon.as_ref().map(|r| hash_of(&r.data)).unwrap_or(0);
+            // The tooltip picks the symbol of Explorer's icons, so it is part of the key.
+            let stamp = ic.icon.as_ref().map(|r| hash_of(&r.data)).unwrap_or(0) ^ hash_of(ic.tip.as_bytes()).rotate_left(1);
+            let exe = ic.owner_exe.as_deref().unwrap_or("");
             let images = match self.x.tray_images.get(&ic.id) {
                 Some((s, imgs)) if *s == stamp => Some(imgs.clone()),
-                _ => ic.icon.as_ref().and_then(tray_images),
+                _ => ic.icon.as_ref().and_then(|r| tray_images(r, exe, &ic.tip)),
             };
             if let Some(imgs) = &images {
                 self.x.tray_images.insert(ic.id, (stamp, imgs.clone()));
@@ -670,10 +671,17 @@ impl App {
         use std::fmt::Write as _;
         let _ = writeln!(info, "\n[tray] hosted {}", self.x.tray.is_some());
         if let Some(t) = &self.x.tray {
-            for ic in t.icons() {
+            for (n, ic) in t.icons().iter().enumerate() {
                 let size = ic.icon.as_ref().map(|r| format!("{}x{}", r.w, r.h)).unwrap_or_else(|| "no picture".into());
                 let owner = ic.owner_exe.as_deref().map(super::report::file_name).unwrap_or_else(|| "?".into());
-                let _ = writeln!(info, "{owner} | {size}");
+                // The source picture, to check the menu-bar conversion against
+                // real icons; the tooltip stays out (it can carry chat names).
+                let pm = ic.icon.as_ref().and_then(|r| system::pixmap_from_rgba(r.w, r.h, r.data.clone()));
+                let symbol = pm.as_ref().and_then(|pm| macrust_ui::extras::identify(&owner, &ic.tip, pm));
+                if let Some(pm) = &pm {
+                    let _ = pm.save_png(super::report::dir().join(format!("tray-{n}.png")));
+                }
+                let _ = writeln!(info, "{owner} | {size} | tray-{n}.png | symbol {symbol:?}");
             }
         }
         let m = &self.x.snap;

@@ -50,19 +50,35 @@ pub fn magnifier(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
     }
 }
 
-pub fn wifi(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color, connected: bool) {
-    let (cx, cy) = (x + s * 0.5, y + s * 0.8);
+/// SF `wifi` as the menu bar draws it: a wedge and two bands, 2.1 pt
+/// thick, ink exactly `w` wide and `0.74 w` tall from `x, y` (Tahoe: 16 x 11.9 pt).
+pub fn wifi(pm: &mut Pixmap, x: f32, y: f32, w: f32, c: Color, connected: bool) {
+    // Radii in units of the outer radius, measured top-down on NL: band 2.1 pt,
+    // gap 1.7, band 2.2, gap 1.3, wedge 4.0 of 11.9 pt.
+    let half = 42.5f32.to_radians();
+    let r = w / 2.0 / half.sin();
+    let (cx, cy) = (x + w / 2.0, y + r);
+    let round = r * 0.045;
     let dim = gfx::fade(c, 0.3);
-    for (i, r) in [0.25f32, 0.45, 0.65].iter().enumerate() {
+    for (i, (r0, r1)) in [(0.0f32, 0.36f32), (0.47, 0.655), (0.80, 1.0)].iter().enumerate() {
+        let (a0, a1) = (-FRAC_PI_2 - half, -FRAC_PI_2 + half);
+        // Inset by the corner rounding, which the round-joined stroke adds back.
+        let (ri, ro) = ((r * r0 + round).min(r * r1 - round), r * r1 - round);
+        let ang = round / ro;
         let mut pb = PathBuilder::new();
-        arc(&mut pb, cx, cy, s * r, -PI * 0.75, -PI * 0.25, true);
+        arc(&mut pb, cx, cy, ro, a0 + ang, a1 - ang, true);
+        if ri > round {
+            let ang = round / ri;
+            arc(&mut pb, cx, cy, ri, a1 - ang, a0 + ang, false);
+        } else {
+            pb.line_to(cx, cy - round * 1.6);
+        }
+        pb.close();
         if let Some(p) = pb.finish() {
             let col = if connected || i == 0 { c } else { dim };
-            gfx::stroke_round(pm, &p, col, line_w(s) * 1.15);
+            gfx::fill(pm, &p, col);
+            gfx::stroke_round(pm, &p, col, round * 2.0);
         }
-    }
-    if let Some(p) = gfx::circle(cx, cy - s * 0.02, s * 0.075) {
-        gfx::fill(pm, &p, c);
     }
 }
 
@@ -100,19 +116,37 @@ pub fn battery(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, c: Color, pct: u
     }
 }
 
-/// Two stacked switches: the control-center glyph.
-pub fn switches(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
-    let lw = line_w(s) * 0.9;
-    for (row, knob_left) in [(0.16f32, false), (0.56f32, true)] {
-        let (py, ph) = (y + s * row, s * 0.3);
-        if let Some(p) = gfx::squircle(x + s * 0.06, py, s * 0.88, ph, ph / 2.0) {
-            gfx::stroke(pm, &p, c, lw);
-        }
-        let kx = if knob_left { x + s * 0.06 + ph / 2.0 } else { x + s * 0.94 - ph / 2.0 };
-        if let Some(p) = gfx::circle(kx, py + ph / 2.0, ph * 0.36) {
-            gfx::fill(pm, &p, c);
-        }
+/// SF `switch.2`, the Control Center glyph: an outlined switch with its knob
+/// left over a filled one with a hollow knob right. Ink is `w` x `0.96 w`
+/// (Tahoe: 12.5 x 12 pt, pills 5.8 pt tall, 0.9 pt apart, 1.25 pt line).
+pub fn switches(pm: &mut Pixmap, x: f32, y: f32, w: f32, c: Color) {
+    let h = w * 0.465;
+    let lw = w * 0.1;
+    let y2 = y + w * 0.96 - h;
+    if let Some(p) = capsule(x + lw / 2.0, y + lw / 2.0, w - lw, h - lw) {
+        gfx::stroke(pm, &p, c, lw);
     }
+    if let Some(p) = gfx::circle(x + h / 2.0, y + h / 2.0, h * 0.3) {
+        gfx::fill(pm, &p, c);
+    }
+    let mut pb = PathBuilder::new();
+    if let Some(p) = capsule(x, y2, w, h) {
+        pb.push_path(&p);
+    }
+    pb.push_circle(x + w - h / 2.0, y2 + h / 2.0, h / 2.0 - lw * 0.9);
+    if let Some(p) = pb.finish() {
+        pm.fill_path(&p, &gfx::paint(c), FillRule::EvenOdd, Transform::identity(), None);
+    }
+}
+
+/// A stadium with circular ends (a squircle cannot round a capsule fully).
+fn capsule(x: f32, y: f32, w: f32, h: f32) -> Option<tiny_skia::Path> {
+    let r = h / 2.0;
+    let mut pb = PathBuilder::new();
+    arc(&mut pb, x + r, y + r, r, FRAC_PI_2, PI + FRAC_PI_2, true);
+    arc(&mut pb, x + w - r, y + r, r, -FRAC_PI_2, FRAC_PI_2, false);
+    pb.close();
+    pb.finish()
 }
 
 /// Our menu-bar mark: a gear (Rust's cog) with a round hole.
@@ -607,5 +641,122 @@ pub fn lock(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
     }
     if let Some(p) = gfx::squircle(x + s * 0.22, y + s * 0.44, s * 0.56, s * 0.44, s * 0.08) {
         gfx::fill(pm, &p, c);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Menu-bar extras standing in for Windows notification-area icons. Strokes are
+// `EXTRA_LINE` of the box, Tahoe's 1.4 pt in a 16 pt box.
+
+const EXTRA_LINE: f32 = 1.4 / 16.0;
+
+/// Telegram's paper plane, filled, with the fold cut in as a V.
+pub fn paper_plane(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    let p = |a: f32, b: f32| (x + s * a, y + s * b);
+    let pts = [p(0.04, 0.46), p(0.96, 0.08), p(0.80, 0.86), p(0.47, 0.66), p(0.50, 0.55), p(0.75, 0.27), p(0.36, 0.52), p(0.25, 0.56)];
+    if let Some(path) = poly(&pts, true) {
+        gfx::fill(pm, &path, c);
+        // Round the sharp tips the way a symbol's outline is.
+        gfx::stroke_round(pm, &path, c, s * 0.04);
+    }
+}
+
+/// A shield outline (SF `shield`) whose shape is `x0..x1` wide, `y0..y1` tall.
+fn shield_path(x0: f32, y0: f32, x1: f32, y1: f32) -> Option<tiny_skia::Path> {
+    let (w, h) = (x1 - x0, y1 - y0);
+    let p = |a: f32, b: f32| (x0 + w * a, y0 + h * b);
+    let mut pb = PathBuilder::new();
+    let m = p(0.5, 0.0);
+    pb.move_to(m.0, m.1);
+    let (c1, c2, e) = (p(0.66, 0.1), p(0.84, 0.13), p(1.0, 0.14));
+    pb.cubic_to(c1.0, c1.1, c2.0, c2.1, e.0, e.1);
+    let e = p(1.0, 0.5);
+    pb.line_to(e.0, e.1);
+    let (c1, c2, e) = (p(1.0, 0.76), p(0.78, 0.92), p(0.5, 1.0));
+    pb.cubic_to(c1.0, c1.1, c2.0, c2.1, e.0, e.1);
+    let (c1, c2, e) = (p(0.22, 0.92), p(0.0, 0.76), p(0.0, 0.5));
+    pb.cubic_to(c1.0, c1.1, c2.0, c2.1, e.0, e.1);
+    let e = p(0.0, 0.14);
+    pb.line_to(e.0, e.1);
+    let (c1, c2, e) = (p(0.16, 0.13), p(0.34, 0.1), p(0.5, 0.0));
+    pb.cubic_to(c1.0, c1.1, c2.0, c2.1, e.0, e.1);
+    pb.close();
+    pb.finish()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShieldMark {
+    Check,
+    Exclamation,
+    Cross,
+}
+
+/// SF `checkmark.shield` / `exclamationmark.shield` / `xmark.shield`.
+pub fn shield(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color, mark: ShieldMark) {
+    let lw = s * EXTRA_LINE;
+    let (x0, x1, y0, y1) = (x + s * 0.13, x + s * 0.87, y + s * 0.04, y + s * 0.96);
+    if let Some(p) = shield_path(x0 + lw / 2.0, y0 + lw / 2.0, x1 - lw / 2.0, y1 - lw / 2.0) {
+        gfx::stroke(pm, &p, c, lw);
+    }
+    let (cx, cy) = (x + s * 0.5, y + s * 0.47);
+    let k = s * 0.2;
+    let path = match mark {
+        ShieldMark::Check => poly(&[(cx - k * 0.95, cy + k * 0.05), (cx - k * 0.25, cy + k * 0.75), (cx + k * 0.95, cy - k * 0.7)], false),
+        ShieldMark::Exclamation => {
+            if let Some(d) = gfx::circle(cx, cy + k * 1.05, lw * 0.62) {
+                gfx::fill(pm, &d, c);
+            }
+            poly(&[(cx, cy - k * 1.15), (cx, cy + k * 0.35)], false)
+        }
+        ShieldMark::Cross => {
+            if let Some(p) = poly(&[(cx - k * 0.7, cy - k * 0.7), (cx + k * 0.7, cy + k * 0.7)], false) {
+                gfx::stroke_round(pm, &p, c, lw);
+            }
+            poly(&[(cx + k * 0.7, cy - k * 0.7), (cx - k * 0.7, cy + k * 0.7)], false)
+        }
+    };
+    if let Some(p) = path {
+        gfx::stroke_round(pm, &p, c, lw);
+    }
+}
+
+/// SF `eject.fill`: a triangle over a bar.
+pub fn eject(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    let p = |a: f32, b: f32| (x + s * a, y + s * b);
+    let r = s * 0.05;
+    if let Some(path) = poly(&[p(0.5, 0.14 + 0.05), p(0.89 - 0.05, 0.6 - 0.03), p(0.11 + 0.05, 0.6 - 0.03)], true) {
+        gfx::fill(pm, &path, c);
+        gfx::stroke_round(pm, &path, c, 2.0 * r);
+    }
+    if let Some(path) = gfx::squircle(x + s * 0.12, y + s * 0.71, s * 0.76, s * 0.13, s * 0.04) {
+        gfx::fill(pm, &path, c);
+    }
+}
+
+/// The Bluetooth rune at symbol weight (the Control Center one is lighter).
+pub fn bluetooth_rune(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    let p = |a: f32, b: f32| (x + s * a, y + s * b);
+    let pts = [p(0.27, 0.3), p(0.72, 0.68), p(0.5, 0.9), p(0.5, 0.1), p(0.72, 0.32), p(0.27, 0.7)];
+    if let Some(path) = poly(&pts, false) {
+        gfx::stroke_round(pm, &path, c, s * EXTRA_LINE);
+    }
+}
+
+/// SF `cpu`: a chip outline with three pins a side and a filled core.
+pub fn cpu(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    let lw = s * EXTRA_LINE;
+    let (b0, b1) = (0.17f32, 0.83f32);
+    if let Some(p) = gfx::squircle(x + s * b0 + lw / 2.0, y + s * b0 + lw / 2.0, s * (b1 - b0) - lw, s * (b1 - b0) - lw, s * 0.12) {
+        gfx::stroke(pm, &p, c, lw);
+    }
+    if let Some(p) = gfx::squircle(x + s * 0.36, y + s * 0.36, s * 0.28, s * 0.28, s * 0.05) {
+        gfx::fill(pm, &p, c);
+    }
+    for t in [0.33f32, 0.5, 0.67] {
+        for (a, b) in [((t, 0.04), (t, b0)), ((t, b1), (t, 0.96)), ((0.04, t), (b0, t)), ((b1, t), (0.96, t))] {
+            if let Some(p) = poly(&[(x + s * a.0, y + s * a.1), (x + s * b.0, y + s * b.1)], false) {
+                gfx::stroke_round(pm, &p, c, lw * 0.85);
+            }
+        }
     }
 }

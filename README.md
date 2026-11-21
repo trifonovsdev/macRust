@@ -28,7 +28,7 @@
 - **Logo menu:** About This PC, System Settings, Microsoft Store and Force Quit (Task Manager). Also Sleep, Restart and Shut Down, each with a confirmation, plus Lock and Log Out.
 - **Active app:** its name in bold, with a menu: Hide, Hide Others, Show All and Quit.
 - **Window menu:** Minimize, Zoom, move to the left or right half of the screen (aligned to the visible frame, not the invisible resize border), Center and Bring All to Front.
-- **Tray icons:** macRust hosts the notification area, so OBS's recording icon, Telegram's and Discord's unread badges and every other tray icon show up in the menu bar with their live state. Left and right clicks reach the app as they would on the taskbar.
+- **Tray icons:** macRust hosts the notification area, so every tray icon shows up in the menu bar with its live state, drawn the way macOS draws menu extras: a one-colour glyph at symbol weight. A coloured plate turns into its outline around the mark, and a status overlay (a warning triangle, an unread dot) stays a separate shape. Telegram, Windows Security, Bluetooth, Safely Remove Hardware and Task Manager get drawn symbols; Telegram keeps its red unread dot, as its macOS app does. Left and right clicks reach the app as they would on the taskbar.
 - **Status items:** keyboard layout (click to switch), battery, network, search, Control Center and a clock. Clicking the clock opens Notification Center.
 - **Privacy indicator:** an orange dot while an app records the microphone, green while one uses the camera.
 - **No background:** as in macOS 26, the wallpaper shows through. Text turns dark or light depending on how bright the wallpaper is.

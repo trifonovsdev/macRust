@@ -46,10 +46,11 @@ pub enum BarEvent {
 #[derive(Clone)]
 pub struct TrayItem {
     pub id: u64,
-    /// Template versions: dark glyph for light wallpapers, light glyph for dark ones.
+    /// Extras (`extras::templates`) in a 16 pt box: dark glyph for light
+    /// wallpapers, light glyph for dark ones.
     pub icon_dark: Option<Rc<Image>>,
     pub icon_light: Option<Rc<Image>>,
-    /// Changes whenever the icon picture changes.
+    /// Changes whenever the icon picture (or what it is drawn as) changes.
     pub stamp: u64,
 }
 
@@ -79,20 +80,25 @@ const CAPSULE_H: f32 = 19.5;
 /// Glyph-to-glyph gap of the status items and tray icons.
 const STATUS_GAP: f32 = 20.0;
 const CLOCK_RIGHT: f32 = 18.5;
-const DATE_TIME_GAP: f32 = 10.5;
+const DATE_TIME_GAP: f32 = 8.5;
 /// The recording dot sits right of the Control Center glyph.
 const DOT: f32 = 4.5;
 const DOT_GAP: f32 = 5.0;
 const DOT_CLOCK_GAP: f32 = 17.5;
+/// The box of a tray extra; its ink sets the slot width.
 const TRAY: f32 = 16.0;
+/// Status glyphs and the input badge sit this far below the text's cap
+/// centre (BB +1, MM +0.5-1, NL +0.4-0.6 pt).
+const GLYPH_DROP: f32 = 0.75;
 const BADGE_H: f32 = 15.5;
 const BADGE_PAD: f32 = 3.5;
 const BADGE_FONT: f32 = 11.0;
-// Glyph boxes and the share of the box their ink covers (left offset, width),
-// sized to Tahoe: search 12 pt wide, Wi-Fi 15.5 pt, Control Center 13 pt.
+// Search: glyph box and the share of it the ink covers (left offset, width),
+// 12 pt wide as in Tahoe. Wi-Fi and Control Center draw their ink exactly:
+// 16 and 12.5 pt wide (NL, BB).
 const SEARCH: (f32, f32, f32) = (14.0, 0.12, 0.78);
-const WIFI: (f32, f32, f32) = (15.0, 0.03, 0.94);
-const SWITCHES: (f32, f32, f32) = (13.5, 0.03, 0.94);
+const WIFI_W: f32 = 16.0;
+const SWITCHES_W: f32 = 12.5;
 
 /// One laid-out item: hit area `a..b` and the drawn content `c0..c1`, window px.
 #[derive(Clone, Copy, Debug)]
@@ -236,8 +242,7 @@ impl MenuBar {
             items.push(Slot { item, a: c0 - half, b, c0, c1: c0 + w });
             *r = c0 - STATUS_GAP * s;
         };
-        let cc = SWITCHES.0 * SWITCHES.2 * s;
-        push(BarItem::Control, cc, &mut items, &mut r);
+        push(BarItem::Control, SWITCHES_W * s, &mut items, &mut r);
         if self.status.mic || self.status.camera {
             // Control Center was pushed right after the clock; the dot widens it.
             let n = items.len();
@@ -248,7 +253,7 @@ impl MenuBar {
         }
         push(BarItem::Search, SEARCH.0 * SEARCH.2 * s, &mut items, &mut r);
         if self.status.wifi.is_some() {
-            push(BarItem::Wifi, WIFI.0 * WIFI.2 * s, &mut items, &mut r);
+            push(BarItem::Wifi, WIFI_W * s, &mut items, &mut r);
         }
         if !self.status.lang.is_empty() {
             let w = t.measure(badge_text(&self.status.lang), BADGE_FONT * s, Weight::Medium) + 2.0 * BADGE_PAD * s;
@@ -261,10 +266,12 @@ impl MenuBar {
         // Tray icons fill leftwards but never run into the app menus.
         let menus_end = items.iter().filter(|sl| sl.item.is_menu()).map(|sl| sl.b).fold(0.0, f32::max);
         for ti in &self.tray {
-            if r - TRAY * s < menus_end + 40.0 * s {
+            let (i0, i1) = ti.icon_light.as_deref().map_or((0.0, 1.0), ink_span);
+            let w = ((i1 - i0) * TRAY * s).round().max(1.0);
+            if r - w < menus_end + 40.0 * s {
                 break;
             }
-            push(BarItem::Tray(ti.id), (TRAY * s).round(), &mut items, &mut r);
+            push(BarItem::Tray(ti.id), w, &mut items, &mut r);
         }
         self.items = items;
     }
@@ -355,7 +362,7 @@ impl MenuBar {
         let lit_bg = if self.dark_text { rgba(0, 0, 0, 0.11) } else { rgba(255, 255, 255, 0.4) };
         let fs = FONT * s;
         let base = (h / 2.0 + ctx.text.cap_height(fs) / 2.0).round();
-        let mid = h / 2.0;
+        let mid = base - ctx.text.cap_height(fs) / 2.0 + GLYPH_DROP * s;
         for sl in &self.items {
             let (item, x0, x1) = (sl.item, sl.c0, sl.c1);
             let lit = self.open == Some(item) || (self.pressed == Some(item) && self.hover == Some(item));
@@ -375,7 +382,7 @@ impl MenuBar {
                 BarItem::Window => {
                     ctx.text.draw(pm, ctx.strings.window, x0, base, fs, Weight::Regular, fg, None);
                 }
-                BarItem::Lang => self.draw_badge(pm, ctx, x0, x1, fg),
+                BarItem::Lang => self.draw_badge(pm, ctx, x0, x1, mid, fg),
                 BarItem::Battery => {
                     if let Some((pct, charging)) = self.status.battery {
                         let tw = ctx.text.draw(pm, &format!("{pct}%"), x0, base, fs, Weight::Regular, fg, None);
@@ -384,17 +391,16 @@ impl MenuBar {
                     }
                 }
                 BarItem::Wifi => {
-                    let (gx, _, gs) = gl(WIFI);
-                    // The fan's ink sits low in its box; centre the ink, not the box.
-                    glyphs::wifi(pm, gx, (mid - gs * 0.47).round(), gs, fg, self.status.wifi.unwrap_or(false));
+                    let w = WIFI_W * s;
+                    glyphs::wifi(pm, x0, (mid - w * 0.37).round(), w, fg, self.status.wifi.unwrap_or(false));
                 }
                 BarItem::Search => {
                     let (gx, gy, gs) = gl(SEARCH);
                     glyphs::magnifier(pm, gx, gy, gs, fg);
                 }
                 BarItem::Control => {
-                    let (gx, gy, gs) = gl(SWITCHES);
-                    glyphs::switches(pm, gx, gy, gs, fg);
+                    let w = SWITCHES_W * s;
+                    glyphs::switches(pm, x0, (mid - w * 0.48).round(), w, fg);
                     if self.status.mic || self.status.camera {
                         // Orange: microphone; green: camera (it implies the microphone too).
                         let c = if self.status.camera { rgba(52, 199, 89, 1.0) } else { rgba(255, 149, 0, 1.0) };
@@ -408,8 +414,9 @@ impl MenuBar {
                     let item = self.tray.iter().find(|t| t.id == id);
                     let img = item.and_then(|t| if self.dark_text { t.icon_dark.as_ref() } else { t.icon_light.as_ref() });
                     if let Some(img) = img {
-                        let size = x1 - x0;
-                        img.draw(pm, x0, ((h - size) / 2.0).round(), size, fg.alpha(), false);
+                        let size = TRAY * s;
+                        let x = (x0 - ink_span(img).0 * size).round();
+                        img.draw(pm, x, (mid - size / 2.0).round(), size, fg.alpha(), false);
                     }
                 }
                 BarItem::Clock => {
@@ -425,7 +432,7 @@ impl MenuBar {
 
     /// The input source as Tahoe draws it: a rounded badge in the text
     /// colour with the letters cut out of it.
-    fn draw_badge(&self, pm: &mut Pixmap, ctx: &Ctx, x0: f32, x1: f32, fg: tiny_skia::Color) {
+    fn draw_badge(&self, pm: &mut Pixmap, ctx: &Ctx, x0: f32, x1: f32, mid: f32, fg: tiny_skia::Color) {
         let s = self.scale;
         let (bw, bh) = ((x1 - x0).round() as u32, (BADGE_H * s).round() as u32);
         let (Some(mut badge), Some(mut letters)) = (Pixmap::new(bw, bh), Pixmap::new(bw, bh)) else { return };
@@ -443,13 +450,25 @@ impl MenuBar {
                 *v = (*v as u32 * keep / 255) as u8;
             }
         }
-        let y = ((pm.height() - bh) / 2) as i32;
+        let y = (mid - bh as f32 / 2.0).round() as i32;
         pm.draw_pixmap(x0.round() as i32, y, badge.as_ref(), &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::identity(), None);
     }
 }
 
+/// Left and right ends of an image's ink, as fractions of its width.
+fn ink_span(img: &Image) -> (f32, f32) {
+    let pm = img.base();
+    let (w, h) = (pm.width() as usize, pm.height() as usize);
+    let d = pm.data();
+    let inked = |x: usize| (0..h).any(|y| d[(y * w + x) * 4 + 3] > 12);
+    match ((0..w).find(|&x| inked(x)), (0..w).rev().find(|&x| inked(x))) {
+        (Some(a), Some(b)) => (a as f32 / w as f32, (b + 1) as f32 / w as f32),
+        _ => (0.0, 1.0),
+    }
+}
+
 /// The clock string carries date and time separated by two spaces; Tahoe
-/// puts a wider, fixed 10.5 pt gap there.
+/// puts a fixed gap there: 10 pt of clear space from «.» to «1» (NL).
 fn split_clock(clock: &str) -> (&str, Option<&str>) {
     match clock.split_once("  ") {
         Some((d, t)) => (d, Some(t)),
@@ -517,35 +536,26 @@ mod tests {
         assert_eq!(bar.events, vec![BarEvent::Open { item: BarItem::App, x: app.c0 - CAPSULE_PAD, bottom: 24.0 }]);
     }
 
-    fn icon(f: impl Fn(u32, u32) -> [u8; 4]) -> Pixmap {
-        let mut pm = Pixmap::new(16, 16).unwrap();
-        for (i, px) in pm.data_mut().chunks_exact_mut(4).enumerate() {
-            let c = f(i as u32 % 16, i as u32 / 16);
-            let a = c[3] as u32;
-            px.copy_from_slice(&[(c[0] as u32 * a / 255) as u8, (c[1] as u32 * a / 255) as u8, (c[2] as u32 * a / 255) as u8, c[3]]);
-        }
-        pm
-    }
-
-    fn alpha_at(pm: &Pixmap, x: u32, y: u32) -> u8 {
-        pm.data()[((y * 16 + x) * 4 + 3) as usize]
-    }
-
     #[test]
-    fn templates_are_full_strength_silhouettes() {
-        let inside = |x: u32, y: u32| (4..12).contains(&x) && (2..14).contains(&y);
-        // A flat yellow glyph keeps its whole shape.
-        let flat = icon(|x, y| if inside(x, y) { [240, 190, 40, 255] } else { [0; 4] });
-        let t = gfx::template(&flat, [255, 255, 255]).unwrap();
-        assert_eq!(alpha_at(&t, 8, 8), 255);
-        // A faint grey glyph is brought up to full opacity.
-        let faint = icon(|x, y| if inside(x, y) { [200, 200, 200, 140] } else { [0; 4] });
-        let t = gfx::template(&faint, [255, 255, 255]).unwrap();
-        assert_eq!(alpha_at(&t, 8, 8), 255);
-        // A white mark on a blue disc becomes a hole.
-        let logo = icon(|x, y| if (6..10).contains(&x) && (6..10).contains(&y) { [255, 255, 255, 255] } else { [40, 160, 230, 255] });
-        let t = gfx::template(&logo, [255, 255, 255]).unwrap();
-        assert_eq!(alpha_at(&t, 7, 7), 0);
-        assert_eq!(alpha_at(&t, 1, 1), 255);
+    fn tray_slots_hug_the_ink_and_sit_on_the_glyph_line() {
+        let (mut bar, ctx) = bar(1.0);
+        // A 64 px template whose ink covers columns 16..40: 6 pt of a 16 pt box.
+        let mut pm = Pixmap::new(64, 64).unwrap();
+        gfx::fill_rect(&mut pm, 16.0, 8.0, 24.0, 48.0, rgba(255, 255, 255, 1.0));
+        let img = Rc::new(Image::new(pm));
+        bar.set_tray(vec![TrayItem { id: 7, icon_dark: Some(img.clone()), icon_light: Some(img), stamp: 1 }], &ctx);
+        let t = slot(&bar, BarItem::Tray(7));
+        assert_eq!(t.c1 - t.c0, 6.0);
+        let lang = slot(&bar, BarItem::Lang);
+        assert!(((lang.c0 - t.c1) - STATUS_GAP).abs() <= 1.0);
+        let mut pm = Pixmap::new(1920, 24).unwrap();
+        bar.draw(&mut pm, &ctx);
+        let inked = |x: u32, y: u32| pm.pixel(x, y).unwrap().alpha() > 128;
+        let x = (t.c0 + 3.0) as u32;
+        let rows: Vec<u32> = (0..24).filter(|&y| inked(x, y)).collect();
+        // 12 pt of ink centred 0.75 pt under the cap centre (12.3 at 1x).
+        let mid = (rows[0] + rows[rows.len() - 1] + 1) as f32 / 2.0;
+        assert!((mid - 13.0).abs() <= 0.5, "{rows:?}");
+        assert!(inked(t.c0 as u32, 12) && !inked(t.c0 as u32 - 1, 12));
     }
 }
