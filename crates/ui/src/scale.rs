@@ -120,6 +120,86 @@ pub fn crop(src: (i32, i32), frame: (i32, i32), borders: Option<(i32, i32, i32, 
     Crop { l, t, r: dx - l, b: dy - t, measured: false }
 }
 
+/// The same frame's insets in a source that changed size from `from` to
+/// `to` (DWM keeps a minimized window's picture at another size, e.g. with
+/// its shadow). The frame keeps its size, so the thumbnail's scale does not
+/// jump; each axis's change is split between its two insets in proportion
+/// to them (evenly when both are 0), which keeps a symmetric layout
+/// symmetric and a top-anchored one (top inset 0) anchored. Insets never go
+/// below 0: a source too small for the frame crops nothing on that side.
+pub fn remap(c: Crop, from: (i32, i32), to: (i32, i32)) -> Crop {
+    fn axis(a: i32, b: i32, d: i32) -> (i32, i32) {
+        let da = if a + b > 0 { (d as f64 * a as f64 / (a + b) as f64).round() as i32 } else { d / 2 };
+        let (mut a, mut b) = (a + da, b + d - da);
+        if a < 0 {
+            b += a;
+            a = 0;
+        }
+        if b < 0 {
+            a += b;
+            b = 0;
+        }
+        (a.max(0), b.max(0))
+    }
+    let (l, r) = axis(c.l, c.r, to.0 - from.0);
+    let (t, b) = axis(c.t, c.b, to.1 - from.1);
+    Crop { l, t, r, b, measured: false }
+}
+
+// ---------------------------------------------------------------------------
+// Frame pacing on the display's vblank grid. Times are performance-counter
+// ticks (DWM reports vblanks in them); the host converts to seconds.
+
+/// The first vblank strictly after `now`, on the grid through `vblank`
+/// (a past or a future vblank) with `period` ticks between vblanks.
+pub fn vblank_after(now: i64, vblank: i64, period: i64) -> i64 {
+    if period <= 0 {
+        return now;
+    }
+    vblank + ((now - vblank).div_euclid(period) + 1) * period
+}
+
+/// Frames a run of `DURATION_S` shows at `period_s` per refresh, the first
+/// (still) frame included.
+pub fn expected_frames(period_s: f32) -> u32 {
+    if period_s <= 0.0 { 0 } else { (DURATION_S / period_s).round() as u32 }
+}
+
+/// One run's clock: the time of each frame is the vblank it is shown at,
+/// not when it was computed, so a late wake-up skips a vblank (counted)
+/// instead of stretching or bunching the motion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pacing {
+    /// The vblank of the first (still) frame.
+    pub start: i64,
+    last: i64,
+    /// Frames placed, the first included (the caller counts them).
+    pub shown: u32,
+    /// Vblanks inside the run that got no new frame.
+    pub missed: u32,
+}
+
+impl Pacing {
+    pub fn new(start: i64) -> Pacing {
+        Pacing { start, last: start, shown: 1, missed: 0 }
+    }
+
+    /// Ticks since `start` for a frame shown at vblank `target`; None when
+    /// that vblank already has its frame.
+    pub fn frame(&mut self, target: i64, period: i64) -> Option<i64> {
+        if period <= 0 || target <= self.last {
+            return None;
+        }
+        let n = ((target - self.last) as f64 / period as f64).round() as u32;
+        if n == 0 {
+            return None;
+        }
+        self.missed += n - 1;
+        self.last = target;
+        Some(target - self.start)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +306,69 @@ mod tests {
         // A source smaller than the frame crops nothing.
         let c = crop((160, 28), (900, 600), None);
         assert_eq!((c.l, c.t, c.r, c.b), (0, 0, 0, 0));
+    }
+    #[test]
+    fn remap_keeps_the_frame_size() {
+        // Shown: measured 7,0,7,7 in a 914x607 window; kept 40 px larger each way.
+        let c = Crop { l: 7, t: 0, r: 7, b: 7, measured: true };
+        let m = remap(c, (914, 607), (954, 647));
+        assert_eq!((m.l, m.t, m.r, m.b), (27, 0, 27, 47));
+        assert_eq!((954 - m.l - m.r, 647 - m.t - m.b), (900, 600));
+        // Symmetric (maximized) stays symmetric.
+        let c = Crop { l: 8, t: 8, r: 8, b: 8, measured: true };
+        let m = remap(c, (1936, 1056), (1960, 1080));
+        assert_eq!((m.l, m.t, m.r, m.b), (20, 20, 20, 20));
+        // No insets: the change is split evenly.
+        let m = remap(Crop::default(), (900, 600), (911, 620));
+        assert_eq!((m.l, m.t, m.r, m.b), (5, 10, 6, 10));
+        // And back: the identity.
+        assert_eq!(remap(remap(c, (1936, 1056), (1960, 1080)), (1960, 1080), (1936, 1056)), Crop { measured: false, ..c });
+    }
+
+    #[test]
+    fn remap_never_goes_negative() {
+        let c = Crop { l: 7, t: 0, r: 7, b: 7, measured: true };
+        let m = remap(c, (914, 607), (160, 28));
+        assert_eq!((m.l, m.t, m.r, m.b), (0, 0, 0, 0));
+        // A small shrink is taken from the insets, the frame keeps its size.
+        let m = remap(c, (914, 607), (910, 605));
+        assert_eq!((910 - m.l - m.r, 605 - m.t - m.b), (900, 600));
+        assert!(m.l >= 0 && m.t >= 0 && m.r >= 0 && m.b >= 0);
+    }
+
+    #[test]
+    fn vblank_after_is_strictly_after_on_the_grid() {
+        let p = 1000;
+        assert_eq!(vblank_after(5_500, 5_000, p), 6_000);
+        // Exactly on a vblank: the next one.
+        assert_eq!(vblank_after(6_000, 5_000, p), 7_000);
+        // A stale reference several vblanks back.
+        assert_eq!(vblank_after(9_250, 5_000, p), 10_000);
+        // A reference in the future.
+        assert_eq!(vblank_after(5_500, 8_000, p), 6_000);
+        assert_eq!(vblank_after(5_500, 5_000, 0), 5_500);
+    }
+
+    #[test]
+    fn pacing_counts_frames_and_missed_vblanks() {
+        let p = 1000;
+        let mut c = Pacing::new(10_000);
+        assert_eq!(c.frame(11_000, p), Some(1_000));
+        // A second wake-up for the same vblank gets no frame.
+        assert_eq!(c.frame(11_000, p), None);
+        assert_eq!(c.frame(10_500, p), None);
+        // A late wake-up: two vblanks without a new frame, time stays on the grid.
+        assert_eq!(c.frame(14_000, p), Some(4_000));
+        assert_eq!(c.missed, 2);
+        // A grid that drifted by less than half a period still counts one.
+        assert_eq!(c.frame(15_040, p), Some(5_040));
+        assert_eq!(c.missed, 2);
+    }
+
+    #[test]
+    fn expected_frames_at_common_rates() {
+        assert_eq!(expected_frames(1.0 / 60.0), 12);
+        assert_eq!(expected_frames(1.0 / 144.0), 29);
+        assert_eq!(expected_frames(0.0), 0);
     }
 }
