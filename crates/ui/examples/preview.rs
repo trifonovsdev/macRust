@@ -474,7 +474,7 @@ fn flat_wall(w: u32, h: u32, c: [u8; 3]) -> Pixmap {
     pm
 }
 
-fn scene_on(wall: Pixmap, scale: f32, dark: bool) -> Scene {
+fn dock_scene(wall: Pixmap, scale: f32, dark: bool) -> Scene {
     let mut ctx = Ctx::new(Text::bundled(), Theme { dark }, &Strings::RU);
     ctx.vibrancy = Some(Vibrancy::new(&wall));
     let (w, h) = (wall.width() as f32, wall.height() as f32);
@@ -769,15 +769,15 @@ fn main() {
     }
 
     icon_sheet(&out);
-    dock_studies(&scene_on(stripes_wall(3840, 2160), 2.0, true), &out, "dock-dark-cyan");
-    dock_studies(&scene_on(flat_wall(1920, 1080, [0, 0, 0]), 1.0, true), &out, "dock-dark-black");
-    dock_studies(&scene_on(flat_wall(2560, 1440, [17, 83, 130]), 2.0, false), &out, "dock-light-blue");
+    dock_studies(&dock_scene(stripes_wall(3840, 2160), 2.0, true), &out, "dock-dark-cyan");
+    dock_studies(&dock_scene(flat_wall(1920, 1080, [0, 0, 0]), 1.0, true), &out, "dock-dark-black");
+    dock_studies(&dock_scene(flat_wall(2560, 1440, [17, 83, 130]), 2.0, false), &out, "dock-light-blue");
     // Real wallpapers, e.g. reference frames with their dock painted out.
     for (var, dark, name) in [("PREVIEW_DOCK_BACKDROP", true, "dock-ref-dark"), ("PREVIEW_DOCK_BACKDROP_LIGHT", false, "dock-ref-light")] {
         if let Ok(path) = std::env::var(var)
             && let Ok(wall) = Pixmap::load_png(&path)
         {
-            dock_studies(&scene_on(wall, 2.0, dark), &out, name);
+            dock_studies(&dock_scene(wall, 2.0, dark), &out, name);
         }
     }
     let retina_light = scene(2880, 1800, 2.0, false);
