@@ -1,0 +1,24 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build -p macrust --release
+      - name: Attach macrust.exe to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $hash = (Get-FileHash target/release/macrust.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  macrust.exe" | Out-File -Encoding ascii macrust.exe.sha256
+          gh release upload "${{ github.event.release.tag_name }}" target/release/macrust.exe macrust.exe.sha256 --clobber

@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ui:
+    name: UI core (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p macrust-ui
+      - run: cargo clippy -p macrust-ui --all-targets -- -D warnings
+      - name: Render previews
+        run: cargo run --release -p macrust-ui --example preview -- previews
+      - uses: actions/upload-artifact@v4
+        with:
+          name: previews
+          path: previews/*.png
+
+  windows:
+    name: Shell (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p macrust --release -- -D warnings
+      - run: cargo build -p macrust --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macrust-windows-x64
+          path: target/release/macrust.exe
