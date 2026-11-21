@@ -148,14 +148,51 @@ fn desktop(refdir: &str, out: &str) {
         dock_visible: true,
         scale: 1.0,
     };
+    // The Dock's glass sees the window as it passes behind the bar: what is
+    // behind the Dock window (the capture, here the wallpaper) with the Genie
+    // layer over it, rebuilt every frame as the shell does.
+    let (mut glass_ms, mut glass_worst, mut frames) = (0.0f64, 0.0f64, 0u32);
     for (dir, name) in [(Dir::Minimize, "min"), (Dir::Restore, "restore")] {
         let n = (genie::duration(dir) * 60.0).ceil() as u32;
         for i in 0..=n {
-            let mut f = render(&wall, &snap, &p, dir, i as f32 / 60.0);
-            f.draw_pixmap(dr.x, dr.y, dpm.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+            let t = i as f32 / 60.0;
+            let mut layer = vec![0u8; (w * h * 4) as usize];
+            let mut dst = Dst { px: &mut layer, w: w as usize, h: h as usize, x: 0, y: 0 };
+            genie::draw(&snap, &p, &genie::frame(&p, dir, t), &mut dst);
+            // As the shell's Genie::draw_under: the frame again, into a
+            // Dock-sized layer, with the rows behind the bar.
+            let t0 = Instant::now();
+            let mut live = behind.clone();
+            let (lw, lh) = (live.width() as usize, live.height() as usize);
+            let mut under = vec![0u8; lw * lh * 4];
+            let mut ul = Dst { px: &mut under, w: lw, h: lh, x: dr.x, y: dr.y };
+            let behind_bar = Path { clip: h as f32, ..p };
+            let b = genie::draw(&snap, &behind_bar, &genie::frame(&p, dir, t), &mut ul);
+            let b = genie::Bounds { x0: b.x0 + dr.x, y0: b.y0 + dr.y, x1: b.x1 + dr.x, y1: b.y1 + dr.y };
+            genie::composite(&ul, b, live.data_mut(), lw, lh, dr.x, dr.y, false);
+            dock.set_backdrop(&live);
+            let mut live_dock = Pixmap::new(dr.w as u32, dr.h as u32).unwrap();
+            dock.draw(&mut live_dock, &ctx);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            (glass_ms, glass_worst, frames) = (glass_ms + ms, glass_worst.max(ms), frames + 1);
+            let layer_pm = Pixmap::from_vec(layer, macrust_ui::tiny_skia::IntSize::from_wh(w, h).unwrap()).unwrap();
+            let mut f = wall.clone();
+            f.draw_pixmap(0, 0, layer_pm.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+            let mut stale = f.clone();
+            f.draw_pixmap(dr.x, dr.y, live_dock.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
             f.save_png(format!("{out}/desk_{name}_f{i:02}.png")).unwrap();
+            // Before: the glass built from the capture alone, without the window.
+            stale.draw_pixmap(dr.x, dr.y, dpm.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+            stale.save_png(format!("{out}/stale_{name}_f{i:02}.png")).unwrap();
         }
     }
+    println!(
+        "Dock glass {}x{} with the Genie under it: {frames} frames, mean {:.2} ms, worst {:.2} ms (composite + backdrop + Dock redraw)",
+        dr.w,
+        dr.h,
+        glass_ms / frames as f64,
+        glass_worst
+    );
 }
 
 /// Worst case on the owner's screen: a maximized 1920x1080 window.

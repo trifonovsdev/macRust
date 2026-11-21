@@ -8,6 +8,7 @@ mod genie;
 mod icons;
 mod macicons;
 mod media;
+mod minbutton;
 mod net;
 mod notifications;
 mod surface;

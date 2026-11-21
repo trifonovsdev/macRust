@@ -3,6 +3,19 @@
 //! minimize animation is kept off, and a click-through layered overlay just
 //! below the Dock plays the warp at display refresh.
 //!
+//! No blink means the overlay's first frame is composed while the window is
+//! still on screen, and the window is back on screen before the last frame
+//! goes. Minimizes we carry out (Dock, menu) wait for DWM to compose the
+//! first frame. A title-bar button press is seen by a low-level mouse hook
+//! (`minbutton.rs`): the first frame is staged on the press and shown on the
+//! release, before the app gets it (`arm`, `fire`). Windows also asks shell
+//! hook windows for the minimize rect before it hides a window, where it
+//! does so (`App::min_rect`). Every other minimize is seen only after
+//! Windows has hidden the window: that path still uncovers the desktop for
+//! the event's latency, and the trace says so. A restore keeps the last
+//! frame up until screen capture, which leaves our windows out, shows the
+//! real window under it.
+//!
 //! The Windows animation is one global setting (SPI_SETANIMATION,
 //! iMinAnimate). It stays off while the shell runs so that a minimize from a
 //! title bar plays the Genie too; a marker file puts it back after a crash
@@ -14,6 +27,7 @@ use std::time::Instant;
 
 use macrust_ui::WinRect;
 use macrust_ui::genie::{self, Bounds, Dir, Dst, Path, Snapshot};
+use macrust_ui::tiny_skia::Pixmap;
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::GetUpdateRect;
@@ -40,6 +54,14 @@ use super::winops;
 const CACHE_BYTES: usize = 128 << 20;
 /// More windows than this at once (Win+M) minimize without it.
 const MAX_RUNS: usize = 8;
+/// A first frame shown over a window waits this long for Windows to hide it.
+const WAIT_S: f32 = 0.4;
+/// Restore: samples per side compared between the screen and the snapshot.
+const GRID: usize = 12;
+/// Mean channel difference (0..255) below which the screen shows the window.
+const MATCH: f32 = 10.0;
+/// Restore: the last frame stays at most this long over a window not seen.
+const UNCOVER_MAX_S: f32 = 0.7;
 
 // ---------------------------------------------------------------------------
 // Windows' own minimize animation
@@ -112,7 +134,7 @@ struct Overlay {
     /// menu bar and the Dock for the length of every Genie.
     top: i32,
     shown: bool,
-    /// What the last presented frame covered.
+    /// What the last staged frame covered.
     drawn: Bounds,
 }
 
@@ -219,14 +241,26 @@ impl Overlay {
         unsafe { std::slice::from_raw_parts_mut(self.bits, (self.w * self.h * 4) as usize) }
     }
 
-    /// Shows `drawn` and erases what the previous frame left outside it.
-    fn present(&mut self, drawn: Bounds, below: HWND) {
+    /// Puts the frame covering `drawn` into the window, shown or not, and
+    /// erases what the previous frame left outside it.
+    fn stage(&mut self, drawn: Bounds) {
         let dirty = drawn.union(self.drawn);
         self.drawn = drawn;
-        if dirty.is_empty() {
-            return;
+        if !dirty.is_empty() {
+            self.upload(Some(dirty));
         }
-        self.upload(Some(dirty));
+    }
+
+    /// Shows `drawn` and erases what the previous frame left outside it.
+    fn present(&mut self, drawn: Bounds, below: HWND) {
+        self.stage(drawn);
+        if !self.drawn.is_empty() {
+            self.show(below);
+        }
+    }
+
+    /// Shows the staged frame.
+    fn show(&mut self, below: HWND) {
         if !self.shown {
             unsafe {
                 // Right below the Dock, so the window slides in behind the bar;
@@ -361,6 +395,40 @@ fn needs_paint(h: HWND) -> bool {
     unsafe { GetUpdateRect(h, None, false).as_bool() }
 }
 
+/// Restore: why the last frame can come off the window `e` s after it was
+/// shown under it, or None to keep it. With screen capture (which leaves
+/// our windows out) the window must be seen on screen: like its snapshot,
+/// or holding still for a few frames once it had time to draw (its content
+/// changed while minimized). An update region validated three frames in a
+/// row is the only sign without capture, and says nothing about windows
+/// drawn by DirectX (browsers, Electron, UWP).
+fn uncovered(r: &mut Run, cap: Option<&mut Capture>, e: f32) -> Option<String> {
+    let gdi = !winops::is_minimized(r.hwnd) && !needs_paint(r.hwnd);
+    let seen = cap.and_then(|c| c.sample(r.rect(), GRID));
+    let Some(seen) = seen.filter(|_| !r.expect.is_empty()) else {
+        r.painted = if gdi { r.painted + 1 } else { 0 };
+        return if r.painted >= 3 {
+            Some("painted (no screen capture)".into())
+        } else if e > 0.5 {
+            Some("not seen painted, gave up".into())
+        } else {
+            None
+        };
+    };
+    let diff = genie::sample_diff(&seen, &r.expect);
+    r.still = if genie::sample_diff(&seen, &r.seen) < 2.0 { r.still + 1 } else { 0 };
+    r.seen = seen;
+    if gdi && diff < MATCH {
+        Some(format!("on screen as in the snapshot (diff {diff:.1})"))
+    } else if gdi && r.still >= 4 && e > 0.2 {
+        Some(format!("on screen and still, unlike the snapshot (diff {diff:.1})"))
+    } else if e > UNCOVER_MAX_S {
+        Some(format!("not seen on screen (diff {diff:.1}), gave up"))
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runs
 
@@ -377,12 +445,50 @@ struct Run {
     path: Path,
     snap: Snapshot,
     start: Instant,
+    /// Minimize: the first frame is over the window, which Windows has not
+    /// hidden yet; the clock starts when it has.
+    waiting: Option<Instant>,
+    /// What started it, for the trace.
+    via: &'static str,
     /// Restore: bring this window to the front when it is back.
     activate: bool,
     /// Restore: when the real window was shown under the last frame.
     shown_at: Option<Instant>,
     /// Restore: frames in a row the real window looked painted.
     painted: u32,
+    /// Restore: the snapshot's grid samples, and the screen's last ones.
+    expect: Vec<[u8; 3]>,
+    seen: Vec<[u8; 3]>,
+    /// Restore: captured frames in a row the screen under the window held still.
+    still: u32,
+    /// The moment the overlay last showed (s into the run).
+    drawn_t: f32,
+}
+
+impl Run {
+    fn new(hwnd: HWND, dir: Dir, path: Path, snap: Snapshot, via: &'static str) -> Run {
+        Run {
+            hwnd,
+            dir,
+            path,
+            snap,
+            start: Instant::now(),
+            waiting: None,
+            via,
+            activate: false,
+            shown_at: None,
+            painted: 0,
+            expect: Vec::new(),
+            seen: Vec::new(),
+            still: 0,
+            drawn_t: 0.0,
+        }
+    }
+
+    fn rect(&self) -> WinRect {
+        let w = self.path.win;
+        WinRect { x: w.x as i32, y: w.y as i32, w: w.w as i32, h: w.h as i32 }
+    }
 }
 
 struct Cached {
@@ -408,6 +514,8 @@ pub struct Genie {
     dock: HWND,
     overlay: Option<Overlay>,
     runs: Vec<Run>,
+    /// A minimize staged in the hidden overlay, waiting for `fire`.
+    armed: Option<Run>,
     cache: HashMap<isize, Cached>,
     stamp: u64,
     /// Restores left to Windows' own animation, which is on until they finish.
@@ -415,6 +523,29 @@ pub struct Genie {
     /// Invisible resize borders of windows seen on screen.
     borders: HashMap<isize, (i32, i32, i32, i32)>,
     cost: (f64, f64, u32),
+    probed: bool,
+    /// Scratch for `draw_under`.
+    glass_buf: Vec<u8>,
+}
+
+/// Logs whether DWM lets this process set an attribute of another app's
+/// window: DWMWA_TRANSITIONS_FORCEDISABLED is set to its default (FALSE),
+/// which changes nothing. If it is allowed, a later version can leave
+/// Windows' minimize animation on (the shell hook then asks before every
+/// minimize) and switch it off per window instead.
+fn probe_transitions(h: HWND) {
+    use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
+    let off = windows::core::BOOL(0);
+    let r = unsafe {
+        DwmSetWindowAttribute(h, DWMWA_TRANSITIONS_FORCEDISABLED, &off as *const _ as *const _, size_of::<windows::core::BOOL>() as u32)
+    };
+    log(format!(
+        "genie: DWM transitions attribute on another app's window: {}",
+        match r {
+            Ok(()) => "allowed".to_string(),
+            Err(e) => format!("refused ({:#010x})", e.code().0),
+        }
+    ));
 }
 
 impl Genie {
@@ -442,11 +573,14 @@ impl Genie {
             dock,
             overlay: None,
             runs: Vec::new(),
+            armed: None,
             cache: HashMap::new(),
             stamp: 0,
             native: Vec::new(),
             borders: HashMap::new(),
             cost: (0.0, 0.0, 0),
+            probed: false,
+            glass_buf: Vec::new(),
             top: 0,
         }
     }
@@ -462,6 +596,7 @@ impl Genie {
     }
 
     pub fn shutdown(&mut self) {
+        self.armed = None;
         self.runs.clear();
         self.overlay = None;
         release_min_animate();
@@ -480,6 +615,10 @@ impl Genie {
     pub fn note_window(&mut self, h: HWND) {
         if !winops::is_minimized(h) {
             self.borders.insert(h.0 as isize, winops::borders(h));
+        }
+        if !self.probed {
+            self.probed = true;
+            probe_transitions(h);
         }
     }
 
@@ -509,22 +648,15 @@ impl Genie {
         if !self.session && !self.op_suppressed {
             self.op_suppressed = suppress();
         }
+        self.disarm();
         let now = Instant::now();
         let n = items.len();
         let first = items.first().map(|i| (i.snap.w, i.snap.h)).unwrap_or_default();
         let hwnds: Vec<HWND> = items.iter().map(|i| i.hwnd).collect();
+        let via = if already { "the minimize event" } else { "the Dock or the menu" };
         for it in items {
             self.runs.retain(|r| r.hwnd != it.hwnd);
-            self.runs.push(Run {
-                hwnd: it.hwnd,
-                dir: Dir::Minimize,
-                path: it.path,
-                snap: it.snap,
-                start: now,
-                activate: false,
-                shown_at: None,
-                painted: 0,
-            });
+            self.runs.push(Run::new(it.hwnd, Dir::Minimize, it.path, it.snap, via));
         }
         let ms = |t: Instant| t.duration_since(since).as_secs_f32() * 1000.0;
         trace(format!(
@@ -534,18 +666,30 @@ impl Genie {
             ms(now)
         ));
         // The overlay shows the window before the real one goes away.
-        self.step(screen);
-        trace(format!("genie first frame presented: {:.1} ms", ms(Instant::now())));
-        if !already {
+        self.step(screen, None);
+        if already {
+            // Windows hid the window before anything could be drawn: the
+            // desktop showed where it was from the event until this frame.
+            trace(format!("genie first frame presented: {:.1} ms, window already hidden (blink)", ms(Instant::now())));
+        } else {
+            trace(format!("genie first frame presented: {:.1} ms", ms(Instant::now())));
             // Wait for DWM to compose that frame, so no composition shows the
             // desktop where the window was.
             unsafe {
                 let _ = DwmFlush();
             }
-            for h in hwnds {
+            for &h in &hwnds {
                 winops::minimize(h);
             }
-            trace(format!("genie window minimize sent: {:.1} ms", ms(Instant::now())));
+            trace(format!("genie window minimize sent after the frame was composed: {:.1} ms", ms(Instant::now())));
+            // The app minimizes when it gets to it: hold the first frame
+            // until it has, so nothing of the window shows beside the warp.
+            let t = Instant::now();
+            for r in &mut self.runs {
+                if hwnds.contains(&r.hwnd) {
+                    r.waiting = Some(t);
+                }
+            }
         }
         // The squeezed levels are needed from the second frame on.
         for r in &mut self.runs {
@@ -568,22 +712,18 @@ impl Genie {
         if !self.session && !self.op_suppressed {
             self.op_suppressed = suppress();
         }
+        self.disarm();
         trace(format!("genie restore start: {}x{}", c.w, c.h));
+        let expect = genie::grid_samples(&c.px, c.w, c.h, GRID);
         let mut snap = Snapshot::new(c.px, c.w, c.h);
         // The restore starts squeezed: the levels are needed at once.
         snap.build_levels();
         self.runs.retain(|r| r.hwnd != h);
-        self.runs.push(Run {
-            hwnd: h,
-            dir: Dir::Restore,
-            path,
-            snap,
-            start: Instant::now(),
-            activate,
-            shown_at: None,
-            painted: 0,
-        });
-        self.step(screen);
+        let mut run = Run::new(h, Dir::Restore, path, snap, "dock");
+        run.activate = activate;
+        run.expect = expect;
+        self.runs.push(run);
+        self.step(screen, None);
     }
 
     fn restore_native(&mut self, h: HWND, activate: bool) {
@@ -596,6 +736,108 @@ impl Genie {
         } else {
             winops::restore(h);
         }
+    }
+
+    /// Draws the first frame of minimizing `it` into the hidden overlay, for
+    /// `fire` to show: the user has pressed a title-bar minimize button, and
+    /// the app minimizes on the release. Only while nothing else plays: the
+    /// frame takes the overlay's bitmap.
+    pub fn arm(&mut self, it: Item, screen: (i32, i32)) -> bool {
+        self.disarm();
+        if !self.runs.is_empty() || !self.ensure_overlay(screen) {
+            return false;
+        }
+        let Some(ov) = &mut self.overlay else { return false };
+        let (w, h) = (ov.w as usize, ov.h as usize);
+        let prev = ov.drawn;
+        let mut dst = Dst { px: ov.buf(), w, h, x: 0, y: 0 };
+        genie::clear(&mut dst, prev);
+        let drawn = genie::draw(&it.snap, &it.path, &genie::frame(&it.path, Dir::Minimize, 0.0), &mut dst);
+        ov.stage(drawn);
+        self.armed = Some(Run::new(it.hwnd, Dir::Minimize, it.path, it.snap, ""));
+        true
+    }
+
+    pub fn armed(&self) -> Option<HWND> {
+        self.armed.as_ref().map(|r| r.hwnd)
+    }
+
+    /// Drops a staged first frame that will not be needed.
+    pub fn disarm(&mut self) {
+        if self.armed.take().is_some()
+            && self.runs.is_empty()
+            && let Some(o) = &mut self.overlay
+        {
+            o.hide();
+        }
+    }
+
+    /// Shows the staged first frame of `h` over it and waits until DWM has
+    /// composed it; the Genie moves once Windows has hidden the window.
+    /// `since`: when the release or the event was handled.
+    pub fn fire(&mut self, h: HWND, via: &'static str, since: Instant) -> bool {
+        let Some(mut run) = self.armed.take_if(|r| r.hwnd == h) else { return false };
+        let Some(ov) = &mut self.overlay else { return false };
+        let hidden = winops::is_minimized(h);
+        ov.show(self.dock);
+        unsafe {
+            let _ = DwmFlush();
+        }
+        let ms = since.elapsed().as_secs_f32() * 1000.0;
+        trace(format!(
+            "genie first frame on screen from {via}: {ms:.1} ms, {}",
+            if hidden { "window already hidden (blink)" } else { "window still shown (no blink)" }
+        ));
+        run.via = via;
+        run.start = Instant::now();
+        if !hidden {
+            run.waiting = Some(run.start);
+        }
+        self.runs.push(run);
+        true
+    }
+
+    /// Whether the overlay is on screen.
+    pub fn overlay_shown(&self) -> bool {
+        self.overlay.as_ref().is_some_and(|o| o.shown)
+    }
+
+    /// Whether a running Genie reaches into `r` (screen coordinates),
+    /// counting the rows behind the Dock's bar.
+    pub fn overlaps(&self, r: WinRect) -> bool {
+        self.overlay_shown()
+            && self.runs.iter().any(|run| {
+                let w = run.path.win;
+                let f = genie::frame(&run.path, run.dir, run.drawn_t);
+                // From the top edge (and its shadow) down to the icon, across
+                // the window and the icon.
+                let (x0, x1) = (w.x.min(run.path.icon.x) - 40.0, (w.x + w.w).max(run.path.icon.x + run.path.icon.w) + 40.0);
+                let (y0, y1) = (f.top - 40.0, run.path.screen_h);
+                x0 < (r.x + r.w) as f32 && x1 > r.x as f32 && y0 < (r.y + r.h) as f32 && y1 > r.y as f32
+            })
+    }
+
+    /// Draws the running Genies over `pm`, the captured screen under `r`
+    /// (opaque RGBA), as glass there should see them: screen capture leaves
+    /// the overlay out. Unlike the overlay, the rows behind the Dock's bar
+    /// are drawn too, so the window shows through the glass as it goes in.
+    pub fn draw_under(&mut self, r: WinRect, pm: &mut Pixmap) -> bool {
+        if r.w <= 0 || r.h <= 0 || pm.width() as i32 != r.w || pm.height() as i32 != r.h {
+            return false;
+        }
+        let (w, h) = (r.w as usize, r.h as usize);
+        self.glass_buf.clear();
+        self.glass_buf.resize(w * h * 4, 0);
+        let mut layer = Dst { px: &mut self.glass_buf, w, h, x: r.x, y: r.y };
+        let mut drawn = Bounds::default();
+        for run in &self.runs {
+            let f = genie::frame(&run.path, run.dir, run.drawn_t);
+            let behind = Path { clip: run.path.screen_h, ..run.path };
+            drawn = drawn.union(genie::draw(&run.snap, &behind, &f, &mut layer));
+        }
+        // draw() returns buffer coordinates; composite() wants screen ones.
+        let b = Bounds { x0: drawn.x0 + r.x, y0: drawn.y0 + r.y, x1: drawn.x1 + r.x, y1: drawn.y1 + r.y };
+        !drawn.is_empty() && genie::composite(&layer, b, pm.data_mut(), w, h, r.x, r.y, true)
     }
 
     /// The window came back by other means (Alt+Tab, the app itself).
@@ -611,14 +853,25 @@ impl Genie {
                 // Recreated on the next frame instead, not under a running Genie.
                 return;
             }
+            self.armed = None;
             self.overlay = None;
             self.overlay = Overlay::new(screen.0, screen.1, self.top);
         }
     }
 
+    /// The overlay exists and fits the screen; false if it cannot be made.
+    fn ensure_overlay(&mut self, screen: (i32, i32)) -> bool {
+        if self.overlay.as_ref().is_none_or(|o| (o.w, o.h, o.top) != (screen.0, screen.1, self.top)) {
+            self.armed = None;
+            self.overlay = None;
+            self.overlay = Overlay::new(screen.0, screen.1, self.top);
+        }
+        self.overlay.is_some()
+    }
+
     /// One frame of every running Genie; call at display refresh while
-    /// `animating()`.
-    pub fn step(&mut self, screen: (i32, i32)) {
+    /// `animating()`. `cap` tells when a restored window is on screen.
+    pub fn step(&mut self, screen: (i32, i32), mut cap: Option<&mut Capture>) {
         let now = Instant::now();
         self.native.retain(|&(h, since)| {
             let e = since.elapsed().as_secs_f32();
@@ -631,11 +884,7 @@ impl Genie {
             self.finish_all();
             return;
         }
-        if self.overlay.as_ref().is_none_or(|o| (o.w, o.h, o.top) != (screen.0, screen.1, self.top)) {
-            self.overlay = None;
-            self.overlay = Overlay::new(screen.0, screen.1, self.top);
-        }
-        if self.overlay.is_none() {
+        if !self.ensure_overlay(screen) {
             // No overlay: finish without the effect.
             for r in std::mem::take(&mut self.runs) {
                 if r.dir == Dir::Restore {
@@ -645,15 +894,39 @@ impl Genie {
             return;
         }
         let t0 = Instant::now();
-        // Which runs are over: a minimized window gone behind the Dock; a
-        // restored window shown and painted under the last frame.
+        if self.runs.iter().any(|r| r.shown_at.is_some())
+            && let Some(c) = cap.as_deref_mut()
+        {
+            c.poll();
+        }
+        // Which runs are over: a minimized window gone into the Dock; a
+        // restored window on screen under the last frame. A first frame
+        // shown over a window that did not minimize after all goes.
         let mut done = Vec::new();
+        let mut dropped = Vec::new();
         for (i, r) in self.runs.iter_mut().enumerate() {
+            if let Some(w) = r.waiting {
+                let waited = w.elapsed().as_secs_f32();
+                if winops::is_minimized(r.hwnd) {
+                    r.waiting = None;
+                    r.start = now;
+                    trace(format!("genie: window hidden {:.0} ms after the first frame ({})", waited * 1000.0, r.via));
+                } else if waited > WAIT_S || winops::frame_rect(r.hwnd).is_none_or(|f| f != r.rect()) {
+                    trace(format!("genie: window not minimized after the first frame ({}), dropped", r.via));
+                    dropped.push(i);
+                }
+                continue;
+            }
+            if !r.snap.has_levels() {
+                r.snap.build_levels();
+            }
             let t = (now - r.start).as_secs_f32();
             let end = genie::duration(r.dir);
             match r.dir {
+                // Kept after it is gone behind the bar until the slide ends:
+                // the Dock's glass still shows it going in (draw_under).
                 Dir::Minimize => {
-                    if t >= end || !genie::visible(&r.path, &genie::frame(&r.path, r.dir, t)) {
+                    if t >= end {
                         done.push(i);
                     }
                 }
@@ -668,18 +941,9 @@ impl Genie {
                         trace(format!("genie restore: window shown at {} ms", r.start.elapsed().as_millis()));
                     }
                     Some(s) => {
-                        // Keep the last frame over it until the app has
-                        // drawn: restored, its update region validated, for
-                        // three frames in a row.
-                        let painted = !winops::is_minimized(r.hwnd) && !needs_paint(r.hwnd);
-                        r.painted = if painted { r.painted + 1 } else { 0 };
                         let e = s.elapsed().as_secs_f32();
-                        if r.painted >= 3 || e > 0.5 {
-                            trace(format!(
-                                "genie restore: window {} after {:.0} ms",
-                                if r.painted >= 3 { "painted" } else { "not seen painted, gave up" },
-                                e * 1000.0
-                            ));
+                        if let Some(why) = uncovered(r, cap.as_deref_mut(), e) {
+                            trace(format!("genie restore: last frame off after {:.0} ms, {why}", e * 1000.0));
                             done.push(i);
                         }
                     }
@@ -687,14 +951,19 @@ impl Genie {
                 Dir::Restore => {}
             }
         }
-        let all_done = done.len() == self.runs.len();
-        for i in done.into_iter().rev() {
+        let all_done = done.len() + dropped.len() == self.runs.len();
+        let mut gone: Vec<(usize, bool)> = done.into_iter().map(|i| (i, true)).chain(dropped.into_iter().map(|i| (i, false))).collect();
+        gone.sort_unstable();
+        for (i, finished) in gone.into_iter().rev() {
             let r = self.runs.remove(i);
+            if !finished {
+                continue;
+            }
             let ms = r.start.elapsed().as_millis();
             trace(format!("genie {} end: {ms} ms", if r.dir == Dir::Minimize { "minimize" } else { "restore" }));
             if r.dir == Dir::Minimize {
-                let w = r.path.win;
-                self.keep(r.hwnd, WinRect { x: w.x as i32, y: w.y as i32, w: w.w as i32, h: w.h as i32 }, r.snap);
+                let rect = r.rect();
+                self.keep(r.hwnd, rect, r.snap);
             }
         }
         if all_done {
@@ -709,8 +978,9 @@ impl Genie {
         let mut dst = Dst { px: ov.buf(), w, h, x: 0, y: 0 };
         genie::clear(&mut dst, prev);
         let mut drawn = Bounds::default();
-        for r in &self.runs {
-            let t = (now - r.start).as_secs_f32().min(genie::duration(r.dir));
+        for r in &mut self.runs {
+            let t = if r.waiting.is_some() { 0.0 } else { (now - r.start).as_secs_f32().min(genie::duration(r.dir)) };
+            r.drawn_t = t;
             drawn = drawn.union(genie::draw(&r.snap, &r.path, &genie::frame(&r.path, r.dir, t), &mut dst));
         }
         ov.present(drawn, self.dock);

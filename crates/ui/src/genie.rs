@@ -194,6 +194,11 @@ impl Snapshot {
         }
     }
 
+    /// The full-resolution pixels.
+    pub fn pixels(&self) -> &[u8] {
+        &self.levels[0].1
+    }
+
     /// The full-resolution pixels, for keeping the snapshot without its levels.
     pub fn into_pixels(mut self) -> Vec<u8> {
         self.levels.swap_remove(0).1
@@ -250,6 +255,71 @@ pub fn clear(dst: &mut Dst, b: Bounds) {
     for y in b.y0.clamp(0, dst.h as i32) as usize..b.y1.clamp(0, dst.h as i32) as usize {
         dst.px[(y * dst.w + x0) * 4..(y * dst.w + x1) * 4].fill(0);
     }
+}
+
+/// Draws the buffer's `b` part (premultiplied, screen coordinates from
+/// `layer.x, layer.y`) over `out`, an opaque premultiplied image whose
+/// top-left pixel is at screen `ox, oy`: what a glass surface sees through
+/// the Genie, which screen capture leaves out. `swap` exchanges the first
+/// and third channel (a BGRA layer over an RGBA image). True if any pixel
+/// of `out` was covered.
+#[allow(clippy::too_many_arguments)]
+pub fn composite(layer: &Dst, b: Bounds, out: &mut [u8], ow: usize, oh: usize, ox: i32, oy: i32, swap: bool) -> bool {
+    let x0 = b.x0.max(layer.x).max(ox);
+    let x1 = b.x1.min(layer.x + layer.w as i32).min(ox + ow as i32);
+    let y0 = b.y0.max(layer.y).max(oy);
+    let y1 = b.y1.min(layer.y + layer.h as i32).min(oy + oh as i32);
+    if x1 <= x0 || y1 <= y0 || out.len() < ow * oh * 4 {
+        return false;
+    }
+    let n = (x1 - x0) as usize;
+    for y in y0..y1 {
+        let s = ((y - layer.y) as usize * layer.w + (x0 - layer.x) as usize) * 4;
+        let d = ((y - oy) as usize * ow + (x0 - ox) as usize) * 4;
+        let (src, dst) = (&layer.px[s..s + n * 4], &mut out[d..d + n * 4]);
+        for (c, o) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+            let a = c[3] as u32;
+            if a == 0 {
+                continue;
+            }
+            let keep = 255 - a;
+            let c = if swap { [c[2], c[1], c[0], c[3]] } else { [c[0], c[1], c[2], c[3]] };
+            for k in 0..4 {
+                o[k] = (c[k] as u32 + (o[k] as u32 * keep + 127) / 255).min(255) as u8;
+            }
+        }
+    }
+    true
+}
+
+/// Colour samples of a `w` x `h` image of 4-byte pixels on an `n` x `n`
+/// grid inside a 10% margin (clear of rounded corners and the shadow).
+pub fn grid_samples(px: &[u8], w: usize, h: usize, n: usize) -> Vec<[u8; 3]> {
+    if w == 0 || h == 0 || px.len() < w * h * 4 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(n * n);
+    for j in 0..n {
+        for i in 0..n {
+            let o = (grid_at(j, h, n) * w + grid_at(i, w, n)) * 4;
+            out.push([px[o], px[o + 1], px[o + 2]]);
+        }
+    }
+    out
+}
+
+/// Coordinate of grid line `i` of `n` across `len` px, for `grid_samples`.
+pub fn grid_at(i: usize, len: usize, n: usize) -> usize {
+    (len / 10 + (len * 8 / 10) * (2 * i + 1) / (2 * n.max(1))).min(len.saturating_sub(1))
+}
+
+/// Mean absolute channel difference (0..255) of two sample sets.
+pub fn sample_diff(a: &[[u8; 3]], b: &[[u8; 3]]) -> f32 {
+    if a.is_empty() || a.len() != b.len() {
+        return 255.0;
+    }
+    let sum: u32 = a.iter().zip(b).map(|(p, q)| (0..3).map(|k| p[k].abs_diff(q[k]) as u32).sum::<u32>()).sum();
+    sum as f32 / (a.len() * 3) as f32
 }
 
 /// Shadow alpha (0..255) by distance from the edge in quarter px.
@@ -534,6 +604,43 @@ pub fn round_corners(px: &mut [u8], w: usize, h: usize, r: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composite_puts_the_layer_over_the_image_with_its_alpha() {
+        // A 4x2 BGRA layer at screen (10, 20): one opaque blue pixel, one
+        // half-transparent black (shadow) pixel, the rest empty.
+        let mut px = vec![0u8; 4 * 2 * 4];
+        px[0..4].copy_from_slice(&[255, 0, 0, 255]);
+        px[4..8].copy_from_slice(&[0, 0, 0, 128]);
+        let layer = Dst { px: &mut px, w: 4, h: 2, x: 10, y: 20 };
+        // A 3x3 white RGBA image at screen (10, 19).
+        let mut out = vec![255u8; 3 * 3 * 4];
+        let b = Bounds { x0: 10, y0: 20, x1: 14, y1: 22 };
+        assert!(composite(&layer, b, &mut out, 3, 3, 10, 19, true));
+        // Row 1 of the image is row 0 of the layer: blue in RGBA order...
+        assert_eq!(&out[12..16], &[0, 0, 255, 255]);
+        // ...then white half darkened...
+        assert_eq!(&out[16..20], &[127, 127, 127, 255]);
+        // ...then untouched; row 0 is above the layer.
+        assert_eq!(&out[20..24], &[255, 255, 255, 255]);
+        assert!(out[..12].iter().all(|&c| c == 255));
+        // Nothing to do when the bounds miss the image.
+        let far = Bounds { x0: 100, y0: 100, x1: 110, y1: 110 };
+        assert!(!composite(&layer, far, &mut out, 3, 3, 10, 19, true));
+    }
+
+    #[test]
+    fn grid_samples_tell_a_painted_window_from_a_blank_one() {
+        let (w, h) = (200usize, 100usize);
+        let img: Vec<u8> = (0..w * h).flat_map(|i| [(i % w) as u8, (i / w) as u8, 40, 255]).collect();
+        let blank = vec![255u8; w * h * 4];
+        let a = grid_samples(&img, w, h, 8);
+        assert_eq!(a.len(), 64);
+        assert_eq!(sample_diff(&a, &grid_samples(&img, w, h, 8)), 0.0);
+        assert!(sample_diff(&a, &grid_samples(&blank, w, h, 8)) > 100.0);
+        // The margin keeps the samples off the edges.
+        assert!(a.iter().all(|p| p[0] >= 20 && p[0] < 180 && p[1] >= 10 && p[1] < 90));
+    }
 
     fn path() -> Path {
         Path {
