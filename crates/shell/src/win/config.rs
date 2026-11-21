@@ -50,6 +50,8 @@ pub struct Settings {
     pub banners: bool,
     /// Install a downloaded update at the next start of the shell.
     pub auto_update: bool,
+    /// Bounce a Dock icon while its app opens ("Animate opening applications").
+    pub launch_bounce: bool,
 }
 
 impl Default for Settings {
@@ -57,14 +59,15 @@ impl Default for Settings {
         Self {
             icon_size: 52.0,
             magnified: 92.0,
-            // Off by default, as in macOS.
-            magnify: false,
+            // Off by default in macOS; the owner wants it on.
+            magnify: true,
             hide_taskbar: true,
             reserve_dock: true,
             appearance: "auto".into(),
             tray_icons: true,
             banners: true,
             auto_update: true,
+            launch_bounce: false,
         }
     }
 }
@@ -122,30 +125,33 @@ pub fn load_settings() -> Settings {
             "tray_icons" => s.tray_icons = b,
             "banners" => s.banners = b,
             "auto_update" => s.auto_update = b,
+            "animate_opening" => s.launch_bounce = b,
             _ => {}
         }
     }
-    // Version 1 files hold the old defaults: magnification was on, which
-    // macOS does not do. Move them to the new defaults once and add new keys.
-    if version < 2 {
-        s.magnify = false;
+    // Versions 2-3 turned magnification off; version 4 turns it back on for
+    // everyone (owner, 2026-11-21).
+    if version < 4 {
+        s.magnify = true;
     }
-    // Version 3 added `auto_update`; older files get it with its default.
+    // Version 3 added `auto_update`, version 4 `animate_opening`; older files
+    // get them with their defaults.
     if version < SETTINGS_VERSION {
         save_settings(&s);
     }
     s
 }
 
-const SETTINGS_VERSION: u32 = 3;
+const SETTINGS_VERSION: u32 = 4;
 
 pub fn save_settings(s: &Settings) {
     let text = format!(
         "# macRust settings. Restart macRust after editing.\nversion = {}\n\
          icon_size = {}\nmagnified_size = {}\nmagnification = {}\nhide_taskbar = {}\nreserve_dock_space = {}\n\
-         # auto | light | dark\nappearance = {}\ntray_icons = {}\nbanners = {}\nauto_update = {}\n",
+         # auto | light | dark\nappearance = {}\ntray_icons = {}\nbanners = {}\nauto_update = {}\n\
+         # bounce a Dock icon while its app opens\nanimate_opening = {}\n",
         SETTINGS_VERSION, s.icon_size, s.magnified, s.magnify, s.hide_taskbar, s.reserve_dock, s.appearance, s.tray_icons, s.banners,
-        s.auto_update
+        s.auto_update, s.launch_bounce
     );
     let _ = std::fs::write(settings_path(), text);
 }

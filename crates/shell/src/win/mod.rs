@@ -16,6 +16,7 @@ mod tray;
 mod update;
 mod util;
 mod winops;
+mod workarea;
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
@@ -100,9 +101,11 @@ pub fn run() {
 
     if let Some(pid) = args.iter().position(|a| a == "--watch").and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok()) {
         system::watch(pid);
+        workarea::release();
         return;
     }
     if has("--restore") {
+        workarea::release();
         system::restore_taskbar();
         return;
     }

@@ -106,11 +106,14 @@ const HOP: f32 = 0.355;
 const RADIUS: f32 = 0.276;
 const DOT_BELOW: f32 = 0.2;
 /// Measured at 60 fps: the gap for a new icon opens over 0.4 s (ease-out),
-/// a removed icon's gap closes over 0.27 s (ease-in-out), the label fades
-/// out over 0.09 s when the pointer leaves (it appears and moves at once).
+/// a removed icon's gap closes over 0.27 s (ease-in-out).
 const INSERT_S: f32 = 0.4;
 const REMOVE_S: f32 = 0.27;
-const LABEL_OUT_S: f32 = 0.09;
+/// Tahoe shows the label at once; the owner asked for a softer entrance, so it
+/// fades in and rises LABEL_RISE pt. Moving to a neighbour keeps it shown.
+const LABEL_IN_S: f32 = 0.16;
+const LABEL_OUT_S: f32 = 0.12;
+const LABEL_RISE: f32 = 4.0;
 /// Half-width of the magnification bell, in tiles.
 const RANGE: f32 = 2.7;
 const TIP_SPACE: f32 = 46.0;
@@ -403,7 +406,7 @@ impl Dock {
             && !self.menu_open
         {
             self.tip_slot = Some(h);
-            self.tip.snap(1.0);
+            self.tip.to(1.0, LABEL_IN_S, ease_out);
         } else {
             self.tip.to(0.0, LABEL_OUT_S, |u| u);
         }
@@ -573,7 +576,7 @@ impl Dock {
             let anchor = by.min(rest_top - v0 * (BAR - 1.0) / 2.0) - lift;
             let cx = ix + size / 2.0;
             let px = (cx - pw / 2.0).clamp(2.0, ww - pw - 2.0).round();
-            let py = (anchor - 9.0 * s - tip_h - ph).round();
+            let py = (anchor - 9.0 * s - tip_h - ph + (1.0 - a) * LABEL_RISE * s).round();
             if let Some(path) = glyphs::bubble(px, py, pw, ph, cx, tip_w, tip_h) {
                 // Dark glass: the blurred backdrop at about 0.45; light glass: about 67% white.
                 let tone = |c: [f32; 3]| {

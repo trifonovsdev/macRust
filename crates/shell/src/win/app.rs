@@ -49,6 +49,7 @@ use super::surface::Surface;
 use super::system::{self, Network, Power, Screen, WM_APPBAR};
 use super::tracker::{self, RunningApp};
 use super::update;
+use super::workarea;
 use super::util::{known_folder, log, trace};
 use super::winops;
 
@@ -88,6 +89,8 @@ const TIMER_WINDOWS: usize = 4;
 const TIMER_BANNER: usize = 5;
 const TIMER_REPORT: usize = 6;
 const TIMER_BACKDROP: usize = 7;
+/// One-shot: checks the work area once Explorer has applied the app bars.
+const TIMER_WORKAREA: usize = 8;
 /// Live glass refresh: 30 Hz is smooth enough for what moves behind glass.
 const BACKDROP_MS: u32 = 33;
 const HOTKEY_SEARCH: i32 = 1;
@@ -569,6 +572,23 @@ impl App {
         if self.settings.reserve_dock {
             system::appbar_place(self.dock_s.hwnd, false, &self.screen, self.dock.reserved_height());
         }
+        unsafe {
+            SetTimer(Some(self.bar_s.hwnd), TIMER_WORKAREA, 500, None);
+        }
+    }
+
+    /// Makes sure maximized windows end under the menu bar and above the Dock,
+    /// whether or not Explorer applied our app bars (see `workarea`).
+    fn check_work_area(&mut self, why: &str) {
+        if self.fullscreen {
+            return;
+        }
+        let bottom = if self.settings.reserve_dock { self.dock.reserved_height() } else { 0 };
+        let (wa, forced) = workarea::ensure(self.bar.height_px(), bottom);
+        let moved = workarea::fit_maximized(wa);
+        if forced || moved > 0 {
+            log(format!("work area ({why}): set by macRust {forced}, maximized windows refitted {moved}"));
+        }
     }
 
     fn schedule_clock(&self) {
@@ -590,10 +610,14 @@ impl App {
         if self.settings.reserve_dock {
             system::appbar_remove(self.dock_s.hwnd);
         }
+        workarea::release();
         if self.taskbar_hidden {
             system::restore_taskbar();
             self.taskbar_hidden = false;
         }
+        // Explorer re-reserves its taskbar asynchronously.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        workarea::fit_maximized(workarea::current());
     }
 
     fn quit(&mut self) {
@@ -841,7 +865,9 @@ impl App {
 
     fn launch(&mut self, key: &str, src: &Source) {
         system::open(&src.parse_name());
-        self.dock.bounce(key);
+        if self.settings.launch_bounce {
+            self.dock.bounce(key);
+        }
     }
 
     fn dock_click(&mut self, key: &str) {
@@ -1785,6 +1811,9 @@ impl App {
                     if self.taskbar_hidden {
                         system::keep_taskbar_hidden();
                     }
+                    if self.net_tick.is_multiple_of(5) {
+                        self.check_work_area("periodic");
+                    }
                     // A tray app that exits sends no window event.
                     if self.net_tick.is_multiple_of(3)
                         && self.lingering.iter().any(|a| !a.pids.iter().any(|&p| tracker::process_alive(p, &a.exe)))
@@ -1795,6 +1824,12 @@ impl App {
                 TIMER_CARET => self.spot_s.dirty = self.spot.shown(),
                 TIMER_BANNER => self.banner_timer(),
                 TIMER_BACKDROP => self.backdrop_tick(),
+                TIMER_WORKAREA => {
+                    unsafe {
+                        let _ = KillTimer(Some(self.bar_s.hwnd), TIMER_WORKAREA);
+                    }
+                    self.check_work_area("app bars placed");
+                }
                 TIMER_REPORT => {
                     unsafe {
                         let _ = KillTimer(Some(self.bar_s.hwnd), TIMER_REPORT);

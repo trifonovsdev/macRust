@@ -66,10 +66,21 @@ impl App {
         let st = &self.settings;
         let _ = writeln!(
             info,
-            "settings: icon {} magnified {} magnify {} hide_taskbar {} reserve_dock {} appearance {} tray_icons {} banners {} auto_update {}",
-            st.icon_size, st.magnified, st.magnify, st.hide_taskbar, st.reserve_dock, st.appearance, st.tray_icons, st.banners, st.auto_update
+            "settings: icon {} magnified {} magnify {} hide_taskbar {} reserve_dock {} appearance {} tray_icons {} banners {} auto_update {} animate_opening {}",
+            st.icon_size, st.magnified, st.magnify, st.hide_taskbar, st.reserve_dock, st.appearance, st.tray_icons, st.banners, st.auto_update, st.launch_bounce
         );
         let _ = writeln!(info, "taskbar hidden: {}", self.taskbar_hidden);
+        let wa = super::workarea::current();
+        let _ = writeln!(
+            info,
+            "work area: {},{} - {},{} (menu bar {} px, dock reserve {} px)",
+            wa.left,
+            wa.top,
+            wa.right,
+            wa.bottom,
+            self.bar.height_px(),
+            self.dock.reserved_height()
+        );
         let _ = writeln!(info, "wallpaper: {}", system::wallpaper_kind());
         let _ = writeln!(info, "live glass (desktop duplication): {}", self.x.capture.is_some());
 
