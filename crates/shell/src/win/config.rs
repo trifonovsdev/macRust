@@ -48,6 +48,8 @@ pub struct Settings {
     pub tray_icons: bool,
     /// Announce new Windows notifications with banners at the top right.
     pub banners: bool,
+    /// Install a downloaded update at the next start of the shell.
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -62,6 +64,7 @@ impl Default for Settings {
             appearance: "auto".into(),
             tray_icons: true,
             banners: true,
+            auto_update: true,
         }
     }
 }
@@ -118,26 +121,31 @@ pub fn load_settings() -> Settings {
             "appearance" => s.appearance = v.to_string(),
             "tray_icons" => s.tray_icons = b,
             "banners" => s.banners = b,
+            "auto_update" => s.auto_update = b,
             _ => {}
         }
     }
     // Version 1 files hold the old defaults: magnification was on, which
     // macOS does not do. Move them to the new defaults once and add new keys.
-    if version < SETTINGS_VERSION {
+    if version < 2 {
         s.magnify = false;
+    }
+    // Version 3 added `auto_update`; older files get it with its default.
+    if version < SETTINGS_VERSION {
         save_settings(&s);
     }
     s
 }
 
-const SETTINGS_VERSION: u32 = 2;
+const SETTINGS_VERSION: u32 = 3;
 
 pub fn save_settings(s: &Settings) {
     let text = format!(
         "# macRust settings. Restart macRust after editing.\nversion = {}\n\
          icon_size = {}\nmagnified_size = {}\nmagnification = {}\nhide_taskbar = {}\nreserve_dock_space = {}\n\
-         # auto | light | dark\nappearance = {}\ntray_icons = {}\nbanners = {}\n",
-        SETTINGS_VERSION, s.icon_size, s.magnified, s.magnify, s.hide_taskbar, s.reserve_dock, s.appearance, s.tray_icons, s.banners
+         # auto | light | dark\nappearance = {}\ntray_icons = {}\nbanners = {}\nauto_update = {}\n",
+        SETTINGS_VERSION, s.icon_size, s.magnified, s.magnify, s.hide_taskbar, s.reserve_dock, s.appearance, s.tray_icons, s.banners,
+        s.auto_update
     );
     let _ = std::fs::write(settings_path(), text);
 }

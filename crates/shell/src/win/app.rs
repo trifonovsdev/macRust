@@ -46,6 +46,7 @@ use super::icons::{self, IconWorker, Request};
 use super::surface::Surface;
 use super::system::{self, Network, Power, Screen, WM_APPBAR};
 use super::tracker::{self, RunningApp};
+use super::update;
 use super::util::{known_folder, log, trace};
 use super::winops;
 
@@ -63,6 +64,7 @@ pub const WM_APP_TASKBAR: u32 = WM_APP + 8;
 pub const WM_APP_TRAY: u32 = WM_APP + 11;
 pub const WM_APP_MEDIA: u32 = WM_APP + 12;
 pub const WM_APP_NOTES: u32 = WM_APP + 13;
+pub const WM_APP_UPDATE: u32 = WM_APP + 14;
 
 #[path = "panels.rs"]
 mod panels;
@@ -104,6 +106,8 @@ const T_LOCK: u32 = 8;
 const T_LOGOUT: u32 = 9;
 const T_QUIT_SHELL: u32 = 10;
 const T_REPORT: u32 = 11;
+const T_CHECK_UPDATES: u32 = 12;
+const T_INSTALL_UPDATE: u32 = 13;
 const T_CONFIRM: u32 = 20;
 const T_CANCEL: u32 = 21;
 const T_HIDE: u32 = 30;
@@ -492,6 +496,7 @@ impl App {
             system::spawn_watchdog();
         }
         app.extras_start();
+        update::start(app.bar_s.hwnd, WM_APP_UPDATE);
         system::appbar_register(app.bar_s.hwnd);
         if app.settings.reserve_dock {
             system::appbar_register(app.dock_s.hwnd);
@@ -944,6 +949,9 @@ impl App {
                 MenuEntry::item(s.lock, T_LOCK).shortcut("Win+L"),
                 MenuEntry::item(s.log_out, T_LOGOUT),
                 MenuEntry::sep(),
+                self.check_updates_entry(),
+                self.install_update_entry(),
+                MenuEntry::sep(),
                 MenuEntry::item(s.report, T_REPORT),
                 MenuEntry::item(s.quit_shell, T_QUIT_SHELL),
             ],
@@ -965,6 +973,24 @@ impl App {
                 MenuEntry::item(s.bring_all, T_BRING_ALL).enabled(has_fg),
             ],
         }
+    }
+
+    fn check_updates_entry(&self) -> MenuEntry {
+        let s = self.ctx.strings;
+        match update::status() {
+            update::Status::Checking => MenuEntry::item(s.checking_updates, T_CHECK_UPDATES).enabled(false),
+            update::Status::Downloading(v) => MenuEntry::item(s.update_label(s.downloading_update, &v), T_CHECK_UPDATES).enabled(false),
+            update::Status::UpToDate => MenuEntry::item(s.up_to_date, T_CHECK_UPDATES),
+            update::Status::Failed => MenuEntry::item(s.update_failed, T_CHECK_UPDATES),
+            update::Status::Idle => MenuEntry::item(s.check_updates, T_CHECK_UPDATES),
+        }
+    }
+
+    fn install_update_entry(&self) -> MenuEntry {
+        let s = self.ctx.strings;
+        let version = update::ready_version();
+        let label = s.update_label(s.install_update, version.as_deref().unwrap_or(""));
+        MenuEntry::item(label, T_INSTALL_UPDATE).enabled(version.is_some())
     }
 
     fn dock_menu(&mut self, key: &str) -> Vec<MenuEntry> {
@@ -1051,6 +1077,12 @@ impl App {
             T_CANCEL => {}
             T_QUIT_SHELL => self.quit(),
             T_REPORT => self.write_report(true),
+            T_CHECK_UPDATES => update::check_now(),
+            T_INSTALL_UPDATE => match update::install_ready() {
+                // The new exe is started by `finish` once the shell has shut down.
+                Ok(()) => self.quit(),
+                Err(e) => log(format!("update: install failed: {e}")),
+            },
             T_HIDE => fg_windows.iter().for_each(|&w| winops::minimize(w)),
             T_HIDE_OTHERS => {
                 for a in &self.running {
@@ -1777,6 +1809,7 @@ impl App {
             WM_APP_TRAY => self.on_tray(),
             WM_APP_MEDIA => self.on_media(),
             WM_APP_NOTES => self.on_notes(),
+            WM_APP_UPDATE => trace("update state changed"),
             WM_APP_CATALOG => self.catalog_arrived(),
             WM_APP_DISMISS => {
                 trace("outside click: close menus and panels");
