@@ -52,6 +52,8 @@ pub struct Settings {
     pub auto_update: bool,
     /// Bounce a Dock icon while its app opens ("Animate opening applications").
     pub launch_bounce: bool,
+    /// "scale" or "genie" ("Minimise windows using").
+    pub minimize_effect: String,
 }
 
 impl Default for Settings {
@@ -68,6 +70,7 @@ impl Default for Settings {
             banners: true,
             auto_update: true,
             launch_bounce: false,
+            minimize_effect: "scale".into(),
         }
     }
 }
@@ -126,6 +129,7 @@ pub fn load_settings() -> Settings {
             "banners" => s.banners = b,
             "auto_update" => s.auto_update = b,
             "animate_opening" => s.launch_bounce = b,
+            "minimize_effect" if matches!(v, "scale" | "genie") => s.minimize_effect = v.to_string(),
             _ => {}
         }
     }
@@ -138,6 +142,11 @@ pub fn load_settings() -> Settings {
     if version < 5 && s.magnified == 92.0 {
         s.magnified = 72.0;
     }
+    // Version 6: the Scale effect replaces the Genie as the default (owner,
+    // 2026-11-21: the Genie blinked on Windows 11).
+    if version < 6 {
+        s.minimize_effect = "scale".into();
+    }
     // Version 3 added `auto_update`, version 4 `animate_opening`; older files
     // get them with their defaults.
     if version < SETTINGS_VERSION {
@@ -146,16 +155,17 @@ pub fn load_settings() -> Settings {
     s
 }
 
-const SETTINGS_VERSION: u32 = 5;
+const SETTINGS_VERSION: u32 = 6;
 
 pub fn save_settings(s: &Settings) {
     let text = format!(
         "# macRust settings. Restart macRust after editing.\nversion = {}\n\
          icon_size = {}\nmagnified_size = {}\nmagnification = {}\nhide_taskbar = {}\nreserve_dock_space = {}\n\
          # auto | light | dark\nappearance = {}\ntray_icons = {}\nbanners = {}\nauto_update = {}\n\
-         # bounce a Dock icon while its app opens\nanimate_opening = {}\n",
+         # bounce a Dock icon while its app opens\nanimate_opening = {}\n\
+         # minimize windows using: scale | genie\nminimize_effect = {}\n",
         SETTINGS_VERSION, s.icon_size, s.magnified, s.magnify, s.hide_taskbar, s.reserve_dock, s.appearance, s.tray_icons, s.banners,
-        s.auto_update, s.launch_bounce
+        s.auto_update, s.launch_bounce, s.minimize_effect
     );
     let _ = std::fs::write(settings_path(), text);
 }

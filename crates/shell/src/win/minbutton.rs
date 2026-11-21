@@ -2,14 +2,14 @@
 //!
 //! Windows hides a window it minimizes at once, and every notice of it
 //! (WinEvents, the shell hook while the minimize animation is off) comes
-//! after the fact, so a Genie started from one shows the desktop for a frame
-//! or more where the window was. A low-level mouse hook, called in this
+//! after the fact, so a minimize effect started from one shows the desktop
+//! for a frame or more where the window was. A low-level mouse hook, called in this
 //! process (nothing is loaded into other apps), sees the left button go down
 //! and up before the window under it does. The shell checks on the press
-//! whether it hit a minimize button and stages the Genie's first frame
-//! (`WM_APP_PRESS`); on the release the hook waits until that frame is on
-//! screen (`WM_APP_RELEASE`), and only then lets the app have the release
-//! and minimize.
+//! whether it hit a minimize button and stages the effect's first frame (the
+//! Genie's warp, or the Scale effect's thumbnail) (`WM_APP_PRESS`); on the
+//! release the hook waits until that frame is on screen (`WM_APP_RELEASE`),
+//! and only then lets the app have the release and minimize.
 //!
 //! The hook runs on its own thread so a busy UI thread never delays the
 //! mouse; it waits for the UI thread only on a release while a frame is
@@ -43,7 +43,7 @@ pub fn start(notify: HWND) {
     NOTIFY.store(notify.0 as isize, Ordering::Relaxed);
     let spawned = std::thread::Builder::new().name("minbutton".into()).spawn(|| unsafe {
         let Ok(_hook) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook), None, 0) else {
-            log("genie: no mouse hook, title-bar minimizes start after Windows hides the window");
+            log("minimize effect: no mouse hook, title-bar minimizes start after Windows hides the window");
             return;
         };
         // The hook is called from this thread's message loop; it lives as
@@ -54,7 +54,7 @@ pub fn start(notify: HWND) {
         }
     });
     if spawned.is_err() {
-        log("genie: mouse hook thread failed to start");
+        log("minimize effect: mouse hook thread failed to start");
     }
 }
 

@@ -66,8 +66,8 @@ impl App {
         let st = &self.settings;
         let _ = writeln!(
             info,
-            "settings: icon {} magnified {} magnify {} hide_taskbar {} reserve_dock {} appearance {} tray_icons {} banners {} auto_update {} animate_opening {}",
-            st.icon_size, st.magnified, st.magnify, st.hide_taskbar, st.reserve_dock, st.appearance, st.tray_icons, st.banners, st.auto_update, st.launch_bounce
+            "settings: icon {} magnified {} magnify {} hide_taskbar {} reserve_dock {} appearance {} tray_icons {} banners {} auto_update {} animate_opening {} minimize_effect {}",
+            st.icon_size, st.magnified, st.magnify, st.hide_taskbar, st.reserve_dock, st.appearance, st.tray_icons, st.banners, st.auto_update, st.launch_bounce, st.minimize_effect
         );
         let _ = writeln!(info, "taskbar hidden: {}", self.taskbar_hidden);
         let wa = super::workarea::current();
@@ -83,6 +83,12 @@ impl App {
         );
         let _ = writeln!(info, "wallpaper: {}", system::wallpaper_kind());
         let _ = writeln!(info, "live glass (desktop duplication): {}", self.x.capture.is_some());
+        let effect = if self.use_scale {
+            self.scale.describe()
+        } else {
+            format!("genie (CPU warp), Windows animation preference on {}", self.genie.enabled)
+        };
+        let _ = writeln!(info, "minimize effect: {effect}");
 
         let _ = writeln!(info, "\n[dock]");
         for (key, t) in &self.targets {
