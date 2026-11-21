@@ -34,6 +34,7 @@ pub struct RunningApp {
     pub name: String,
     /// In z-order, topmost first.
     pub windows: Vec<HWND>,
+    pub pids: Vec<u32>,
 }
 
 pub fn class_name(h: HWND) -> String {
@@ -108,6 +109,11 @@ fn window_aumid(h: HWND) -> Option<String> {
         CoTaskMemFree(Some(p.0 as *const _));
         s.filter(|s| !s.is_empty())
     }
+}
+
+/// Whether a process still runs. Pids are reused, so the image path must match too.
+pub fn process_alive(pid: u32, exe: &str) -> bool {
+    process_info(pid).0.is_some_and(|e| e.eq_ignore_ascii_case(exe))
 }
 
 pub fn window_pid(h: HWND) -> u32 {
@@ -216,11 +222,15 @@ pub fn snapshot(names: &mut HashMap<String, String>) -> Vec<RunningApp> {
         let (exe, aumid) = identify(h);
         let Some(exe) = exe else { continue };
         let key = app_key(&exe, aumid.as_deref());
+        let pid = window_pid(h);
         if let Some(a) = apps.iter_mut().find(|a| a.key == key) {
             a.windows.push(h);
+            if !a.pids.contains(&pid) {
+                a.pids.push(pid);
+            }
         } else {
             let name = app_name(names, &exe, aumid.as_deref());
-            apps.push(RunningApp { key, exe, aumid, name, windows: vec![h] });
+            apps.push(RunningApp { key, exe, aumid, name, windows: vec![h], pids: vec![pid] });
         }
     }
     apps

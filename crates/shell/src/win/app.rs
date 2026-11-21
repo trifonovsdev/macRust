@@ -29,7 +29,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{FOLDERID_Downloads, SHEmptyRecycleBinW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_UNCLOAKED,
+    CallNextHookEx, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
     EVENT_SYSTEM_FOREGROUND, GA_PARENT, GA_ROOTOWNER, GetAncestor, GetDesktopWindow, GetForegroundWindow, HHOOK,
     KBDLLHOOKSTRUCT, KillTimer, MSLLHOOKSTRUCT, OBJID_WINDOW, PostMessageW, PostQuitMessage, SetForegroundWindow,
     SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
@@ -58,6 +58,7 @@ pub const WM_APP_CATALOG: u32 = WM_APP + 4;
 pub const WM_APP_DISMISS: u32 = WM_APP + 5;
 pub const WM_APP_MENUKEY: u32 = WM_APP + 6;
 pub const WM_APP_TRASH: u32 = WM_APP + 7;
+pub const WM_APP_TASKBAR: u32 = WM_APP + 8;
 
 const TIMER_CLOCK: usize = 1;
 const TIMER_STATUS: usize = 2;
@@ -148,6 +149,8 @@ struct DockTarget {
     pinned: bool,
     /// Key of the running app, when it has windows.
     app: Option<String>,
+    /// The process runs without windows (closed to the tray): reopen without a bounce.
+    alive: bool,
     special: Special,
     name: String,
 }
@@ -169,6 +172,9 @@ pub struct App {
     menu_owner: Option<MenuOwner>,
     menu_windows: Vec<HWND>,
     running: Vec<RunningApp>,
+    /// Apps whose windows are gone but whose process still runs (Telegram,
+    /// Discord, OBS closed to the tray). They keep their dock icon, as on a Mac.
+    lingering: Vec<RunningApp>,
     names: HashMap<String, String>,
     fg: Option<HWND>,
     fg_name: String,
@@ -221,6 +227,10 @@ unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id
         return;
     }
     if id_object != OBJID_WINDOW.0 || id_child != 0 || hwnd.is_invalid() {
+        return;
+    }
+    if event == EVENT_OBJECT_SHOW && system::is_taskbar(hwnd) {
+        notify(WM_APP_TASKBAR, 0);
         return;
     }
     // Only top-level windows change what the dock shows. A destroyed window has
@@ -403,6 +413,7 @@ impl App {
             menu_owner: None,
             menu_windows: Vec::new(),
             running: Vec::new(),
+            lingering: Vec::new(),
             names,
             fg: None,
             fg_name: String::new(),
@@ -530,7 +541,22 @@ impl App {
     }
 
     fn refresh_windows(&mut self) {
+        let previous = std::mem::take(&mut self.running);
         self.running = tracker::snapshot(&mut self.names);
+        let gone = previous.into_iter().filter(|a| !self.running.iter().any(|r| r.key == a.key));
+        let mut lingering: Vec<RunningApp> = std::mem::take(&mut self.lingering)
+            .into_iter()
+            .chain(gone)
+            .filter(|a| !self.running.iter().any(|r| r.key == a.key))
+            .collect();
+        lingering.dedup_by(|a, b| a.key == b.key);
+        for a in &mut lingering {
+            a.windows.clear();
+            let exe = a.exe.clone();
+            a.pids.retain(|&p| tracker::process_alive(p, &exe));
+        }
+        lingering.retain(|a| !a.pids.is_empty());
+        self.lingering = lingering;
         KNOWN.with(|k| {
             let mut k = k.borrow_mut();
             k.clear();
@@ -543,10 +569,15 @@ impl App {
         let mut entries = Vec::new();
         let mut targets = HashMap::new();
         let mut used = vec![false; self.running.len()];
+        let mut used_lingering = vec![false; self.lingering.len()];
         for pin in self.pins.clone() {
             let idx = self.running.iter().position(|a| pin_matches(&pin.source, a));
             if let Some(i) = idx {
                 used[i] = true;
+            }
+            let ling = self.lingering.iter().position(|a| pin_matches(&pin.source, a));
+            if let Some(i) = ling {
+                used_lingering[i] = true;
             }
             let key = pin.source.key();
             let icon = self.dock_icon(&pin.source.parse_name());
@@ -554,7 +585,7 @@ impl App {
                 key: key.clone(),
                 label: pin.name.clone(),
                 icon,
-                running: idx.is_some(),
+                running: idx.is_some() || ling.is_some(),
                 section: Section::Apps,
                 fallback: Fallback::App,
             });
@@ -563,13 +594,17 @@ impl App {
                 DockTarget {
                     source: Some(pin.source.clone()),
                     pinned: true,
+                    alive: ling.is_some(),
                     app: idx.map(|i| self.running[i].key.clone()),
                     special: Special::None,
                     name: pin.name.clone(),
                 },
             );
         }
-        for a in self.running.clone().into_iter().zip(used).filter(|(_, u)| !u).map(|(a, _)| a) {
+        let unpinned = self.running.clone().into_iter().zip(used).filter(|(_, u)| !u).map(|(a, _)| (a, true));
+        let unpinned_lingering =
+            self.lingering.clone().into_iter().zip(used_lingering).filter(|(_, u)| !u).map(|(a, _)| (a, false));
+        for (a, has_windows) in unpinned.chain(unpinned_lingering) {
             let source = match &a.aumid {
                 Some(id) => Source::Aumid(id.clone()),
                 None => Source::Exe(a.exe.clone()),
@@ -585,7 +620,14 @@ impl App {
             });
             targets.insert(
                 a.key.clone(),
-                DockTarget { source: Some(source), pinned: false, app: Some(a.key.clone()), special: Special::None, name: a.name },
+                DockTarget {
+                    source: Some(source),
+                    pinned: false,
+                    alive: !has_windows,
+                    app: has_windows.then(|| a.key.clone()),
+                    special: Special::None,
+                    name: a.name,
+                },
             );
         }
         if let Some(dl) = known_folder(&FOLDERID_Downloads) {
@@ -601,7 +643,14 @@ impl App {
             });
             targets.insert(
                 KEY_DOWNLOADS.into(),
-                DockTarget { source: None, pinned: true, app: None, special: Special::Downloads(path), name: String::new() },
+                DockTarget {
+                    source: None,
+                    pinned: true,
+                    alive: false,
+                    app: None,
+                    special: Special::Downloads(path),
+                    name: String::new(),
+                },
             );
         }
         let icon = self.dock_icon(TRASH);
@@ -615,7 +664,7 @@ impl App {
         });
         targets.insert(
             KEY_TRASH.into(),
-            DockTarget { source: None, pinned: true, app: None, special: Special::Trash, name: String::new() },
+            DockTarget { source: None, pinned: true, alive: false, app: None, special: Special::Trash, name: String::new() },
         );
         self.targets = targets;
         self.dock.set_entries(entries);
@@ -680,24 +729,22 @@ impl App {
             Special::None => {
                 let app = t.app.as_deref().and_then(|k| self.app_by_key(k)).cloned();
                 match (app, t.source) {
+                    // As on a Mac a click never hides the app: it brings its
+                    // windows forward, and restores one only when all are minimized.
                     (Some(app), _) => {
-                        // With the search panel up, the previous app only looks active.
-                        let active = !self.spot.is_visible() && self.fg.is_some_and(|f| app.windows.contains(&f));
-                        let all_min = app.windows.iter().all(|&w| winops::is_minimized(w));
-                        if active && !all_min {
-                            for &w in &app.windows {
-                                winops::minimize(w);
-                            }
+                        let shown: Vec<HWND> = app.windows.iter().copied().filter(|&w| !winops::is_minimized(w)).collect();
+                        if shown.is_empty() {
+                            winops::activate(app.windows[0]);
                         } else {
-                            for &w in app.windows.iter().rev() {
-                                if winops::is_minimized(w) {
-                                    winops::restore(w);
-                                }
+                            for &w in shown.iter().skip(1).rev() {
                                 winops::raise(w);
                             }
-                            winops::activate(app.windows[0]);
+                            winops::activate(shown[0]);
                         }
                     }
+                    // Running in the tray: a second launch makes single-instance
+                    // apps show their window, which is what the Dock does.
+                    (None, Some(src)) if t.alive => system::open(&src.parse_name()),
                     (None, Some(src)) => self.launch(key, &src),
                     _ => {}
                 }
@@ -1498,7 +1545,18 @@ impl App {
                     self.refresh_status();
                     self.schedule_clock();
                 }
-                TIMER_STATUS => self.refresh_status(),
+                TIMER_STATUS => {
+                    self.refresh_status();
+                    if self.taskbar_hidden {
+                        system::keep_taskbar_hidden();
+                    }
+                    // A tray app that exits sends no window event.
+                    if self.net_tick.is_multiple_of(3)
+                        && self.lingering.iter().any(|a| !a.pids.iter().any(|&p| tracker::process_alive(p, &a.exe)))
+                    {
+                        self.refresh_windows();
+                    }
+                }
                 TIMER_CARET => self.spot_s.dirty = self.spot.shown(),
                 TIMER_WINDOWS => {
                     unsafe {
@@ -1524,6 +1582,11 @@ impl App {
             WM_APP_TRASH => {
                 self.dock_icons.remove(&TRASH.to_lowercase());
                 self.rebuild_dock();
+            }
+            WM_APP_TASKBAR => {
+                if self.taskbar_hidden {
+                    system::keep_taskbar_hidden();
+                }
             }
             WM_APP_ICON => self.icons_arrived(),
             WM_APP_CATALOG => self.catalog_arrived(),

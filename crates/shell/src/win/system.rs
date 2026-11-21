@@ -42,7 +42,7 @@ use windows::Win32::UI::Shell::{
     APPBARDATA, SHAppBarMessage, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GetWindowThreadProcessId, SPI_GETDESKWALLPAPER,
+    FindWindowExW, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible, SPI_GETDESKWALLPAPER,
     SPI_SETDESKWALLPAPER, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE, SW_HIDE, SW_SHOWNA, SW_SHOWNORMAL,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, ShowWindow, SystemParametersInfoW,
 };
@@ -323,24 +323,54 @@ pub fn power(action: Power) {
 // ---------------------------------------------------------------------------
 // The stock taskbar
 
+/// Explorer's taskbars. Skips windows of this process: the tray host registers
+/// its own "Shell_TrayWnd" so apps send their tray icons here.
 fn taskbars() -> Vec<HWND> {
+    let own = std::process::id();
     let mut v = Vec::new();
-    unsafe {
-        if let Ok(h) = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null())
-            && !h.is_invalid()
-        {
-            v.push(h);
-        }
+    for class in [w!("Shell_TrayWnd"), w!("Shell_SecondaryTrayWnd")] {
         let mut prev: Option<HWND> = None;
-        while let Ok(h) = FindWindowExW(None, prev, w!("Shell_SecondaryTrayWnd"), PCWSTR::null()) {
-            if h.is_invalid() {
-                break;
+        unsafe {
+            while let Ok(h) = FindWindowExW(None, prev, class, PCWSTR::null()) {
+                if h.is_invalid() {
+                    break;
+                }
+                prev = Some(h);
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(h, Some(&mut pid));
+                if pid != own {
+                    v.push(h);
+                }
             }
-            v.push(h);
-            prev = Some(h);
         }
     }
     v
+}
+
+/// Auto-hide makes Explorer slide the taskbar back in when the pointer touches
+/// the screen edge (where the dock is) or on the Windows key; hide it again.
+pub fn keep_taskbar_hidden() -> bool {
+    let mut shown = false;
+    for h in taskbars() {
+        unsafe {
+            if IsWindowVisible(h).as_bool() {
+                let _ = ShowWindow(h, SW_HIDE);
+                shown = true;
+            }
+        }
+    }
+    shown
+}
+
+pub fn is_taskbar(h: HWND) -> bool {
+    let mut buf = [0u16; 32];
+    let n = unsafe { GetClassNameW(h, &mut buf) }.max(0) as usize;
+    let c = String::from_utf16_lossy(&buf[..n]);
+    (c == "Shell_TrayWnd" || c == "Shell_SecondaryTrayWnd") && {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+        pid != std::process::id()
+    }
 }
 
 fn taskbar_state_file() -> std::path::PathBuf {
