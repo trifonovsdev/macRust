@@ -10,13 +10,14 @@ mod surface;
 mod system;
 mod tracker;
 mod tray;
+mod update;
 mod util;
 mod winops;
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -111,9 +112,24 @@ pub fn run() {
         return;
     }
 
+    // A process started by the updater races the one it replaces for the
+    // single-instance mutex, which the old one gives up by exiting.
+    let updated_from = args.iter().position(|a| a == "--updated-from").and_then(|i| args.get(i + 1)).cloned();
     unsafe {
-        let _ = CreateMutexW(None, true, w!("Local\\macRust.shell"));
-        if GetLastError() == ERROR_ALREADY_EXISTS {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let handle = CreateMutexW(None, true, w!("Local\\macRust.shell"));
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                // The handle stays open for the life of the process.
+                break;
+            }
+            if let Ok(h) = handle {
+                let _ = CloseHandle(h);
+            }
+            if updated_from.is_some() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
             log("another instance is running");
             alert("macRust is already running.");
             return;
@@ -121,6 +137,16 @@ pub fn run() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
+
+    if let Some(from) = &updated_from {
+        log(format!("updated from {from} to {}", env!("CARGO_PKG_VERSION")));
+        // The old process's watchdog restores the taskbar when it sees that
+        // process end; let it finish before this one hides the taskbar again.
+        std::thread::sleep(Duration::from_millis(1500));
+    } else if config::load_settings().auto_update && !has("--no-update") && update::apply_at_startup() {
+        return;
+    }
+    update::cleanup_later();
 
     if has("--wallpaper") {
         let s = system::primary_screen();
@@ -197,4 +223,5 @@ fn alert(text: &str) {
 fn finish() {
     with_app(|a| a.shutdown());
     log("stopped");
+    update::relaunch_if_pending();
 }

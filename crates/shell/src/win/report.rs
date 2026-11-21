@@ -66,8 +66,8 @@ impl App {
         let st = &self.settings;
         let _ = writeln!(
             info,
-            "settings: icon {} magnified {} magnify {} hide_taskbar {} reserve_dock {} appearance {} tray_icons {} banners {}",
-            st.icon_size, st.magnified, st.magnify, st.hide_taskbar, st.reserve_dock, st.appearance, st.tray_icons, st.banners
+            "settings: icon {} magnified {} magnify {} hide_taskbar {} reserve_dock {} appearance {} tray_icons {} banners {} auto_update {}",
+            st.icon_size, st.magnified, st.magnify, st.hide_taskbar, st.reserve_dock, st.appearance, st.tray_icons, st.banners, st.auto_update
         );
         let _ = writeln!(info, "taskbar hidden: {}", self.taskbar_hidden);
 

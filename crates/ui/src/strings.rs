@@ -46,6 +46,12 @@ pub struct Strings {
     pub no_results: &'static str,
     pub quit_shell: &'static str,
     pub report: &'static str,
+    pub check_updates: &'static str,
+    pub checking_updates: &'static str,
+    pub downloading_update: &'static str,
+    pub up_to_date: &'static str,
+    pub update_failed: &'static str,
+    pub install_update: &'static str,
     pub calc_hint: &'static str,
     pub days: [&'static str; 7],
     pub months: [&'static str; 12],
@@ -118,6 +124,12 @@ impl Strings {
         no_results: "Нет результатов",
         quit_shell: "Завершить macRust",
         report: "Отчёт для разработчика",
+        check_updates: "Проверить обновления…",
+        checking_updates: "Проверка обновлений…",
+        downloading_update: "Загрузка обновления",
+        up_to_date: "Установлена последняя версия",
+        update_failed: "Не удалось проверить обновления",
+        install_update: "Установить обновление",
         calc_hint: "Enter — скопировать результат",
         days: ["Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"],
         months: ["янв.", "февр.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."],
@@ -189,6 +201,12 @@ impl Strings {
         no_results: "No results",
         quit_shell: "Quit macRust",
         report: "Diagnostic Report",
+        check_updates: "Check for Updates…",
+        checking_updates: "Checking for Updates…",
+        downloading_update: "Downloading Update",
+        up_to_date: "macRust Is Up to Date",
+        update_failed: "Update Check Failed",
+        install_update: "Install Update",
         calc_hint: "Press Enter to copy the result",
         days: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
         months: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
@@ -229,6 +247,11 @@ impl Strings {
     /// Menu-bar clock: «Пт 21 нояб. 14:32» / «Fri Nov 21 14:32».
     pub fn is_ru(&self) -> bool {
         self.days[0] == "Вс"
+    }
+
+    /// «Установить обновление 0.4.0…» / «Install Update 0.4.0…»; without a version just the label and «…».
+    pub fn update_label(&self, label: &str, version: &str) -> String {
+        if version.is_empty() { format!("{label}…") } else { format!("{label} {version}…") }
     }
 
     /// «Скрыть «Блокнот»» / «Hide Notepad».
