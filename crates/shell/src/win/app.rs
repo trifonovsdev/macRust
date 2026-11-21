@@ -48,6 +48,7 @@ use super::config::{self, Pin, Settings, Source};
 use super::genie::{self, Genie};
 use super::icons::{self, IconWorker, Request};
 use super::macicons::{self, MacIcons};
+use super::minbutton::{self, WM_APP_PRESS, WM_APP_RELEASE};
 use super::surface::Surface;
 use super::system::{self, Network, Power, Screen, WM_APPBAR};
 use super::tracker::{self, RunningApp};
@@ -251,6 +252,10 @@ pub struct App {
     x: panels::Extras,
     /// Minimize into and restore out of Dock icons (genie.rs).
     genie: Genie,
+    /// The Dock's glass was last built with the Genie drawn into it.
+    genie_glass: bool,
+    /// "SHELLHOOK": shell hook notices (HSHELL_GETMINRECT) to the menu bar window.
+    shell_msg: u32,
     stats: std::collections::BTreeMap<&'static str, Stat>,
 }
 
@@ -304,6 +309,17 @@ unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id
     if relevant && !WINDOWS_PENDING.swap(true, Ordering::Relaxed) && !notify(WM_APP_WINDOWS, 0) {
         WINDOWS_PENDING.store(false, Ordering::Relaxed);
     }
+}
+
+/// Whether `len` bytes at `p` are committed, writable memory of this process.
+fn writable(p: *const core::ffi::c_void, len: usize) -> bool {
+    use windows::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery};
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    if unsafe { VirtualQuery(Some(p), &mut mbi, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+        return false;
+    }
+    let end = mbi.BaseAddress as usize + mbi.RegionSize;
+    mbi.State == MEM_COMMIT && (mbi.Protect.0 & (PAGE_READWRITE.0 | PAGE_WRITECOPY.0)) != 0 && p as usize + len <= end
 }
 
 fn in_menu(p: POINT) -> bool {
@@ -532,6 +548,8 @@ impl App {
             own_pid: unsafe { GetCurrentProcessId() },
             x: extras,
             genie,
+            genie_glass: false,
+            shell_msg: 0,
             stats: std::collections::BTreeMap::new(),
         };
 
@@ -550,6 +568,7 @@ impl App {
         app.refresh_windows();
         app.refresh_foreground();
         win_events_install();
+        app.genie_hooks_install();
         unsafe {
             if RegisterHotKey(Some(app.bar_s.hwnd), HOTKEY_SEARCH, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32).is_err() {
                 log("Alt+Space is taken by another program; open search from the menu bar");
@@ -622,6 +641,11 @@ impl App {
 
     pub fn shutdown(&mut self) {
         self.genie.shutdown();
+        if self.shell_msg != 0 {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DeregisterShellHookWindow(self.bar_s.hwnd);
+            }
+        }
         // Apps fall back to Explorer's tray, which got every icon forwarded.
         self.x.tray = None;
         self.unhook_menu();
@@ -1012,11 +1036,139 @@ impl App {
         if self.genie.busy(h) || !self.genie.session() {
             return;
         }
+        let late = unsafe { windows::Win32::System::SystemInformation::GetTickCount() }.wrapping_sub(tick);
+        if self.genie.armed() == Some(h) {
+            // The release went by without the hook waiting (the frame was
+            // still being staged): the staged frame is the quickest cover.
+            trace(format!("genie event: minimize of the armed window, handled {late} ms after it"));
+            self.genie.fire(h, "the minimize event", Instant::now());
+            minbutton::set_armed(None);
+            return;
+        }
         if let Some(key) = self.dock_key_of(h) {
-            let late = unsafe { windows::Win32::System::SystemInformation::GetTickCount() }.wrapping_sub(tick);
-            trace(format!("genie event: minimize from the title bar, handled {late} ms after it"));
+            trace(format!("genie event: minimize seen only after Windows hid the window, handled {late} ms after it"));
             self.genie_minimize(&key, &[h], Some(tick), "title bar");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Genie: minimizes started outside the Dock, seen before the window hides
+
+    fn genie_hooks_install(&mut self) {
+        if !self.genie.session() {
+            return;
+        }
+        minbutton::start(self.bar_s.hwnd);
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{RegisterShellHookWindow, RegisterWindowMessageW};
+            if RegisterShellHookWindow(self.bar_s.hwnd).as_bool() {
+                self.shell_msg = RegisterWindowMessageW(windows::core::w!("SHELLHOOK"));
+            }
+        }
+        log(format!("genie: mouse hook started, shell hook {}", if self.shell_msg != 0 { "registered" } else { "refused" }));
+    }
+
+    /// The top-level window at screen `x, y` and what part of it is there
+    /// (WM_NCHITTEST), when it is a window in the Dock; 0 if it did not
+    /// answer within 30 ms.
+    fn hit_test(&self, x: i32, y: i32) -> Option<(HWND, u32)> {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GA_ROOT, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_NCHITTEST, WindowFromPoint,
+        };
+        let h = unsafe { GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT) };
+        if h.is_invalid() || tracker::window_pid(h) == self.own_pid || self.dock_key_of(h).is_none() {
+            return None;
+        }
+        let lp = LPARAM(((y as u16 as u32) << 16 | x as u16 as u32) as i32 as isize);
+        let mut hit = 0usize;
+        // Blocking: no other message of ours may run while the app answers.
+        let ok = unsafe {
+            SendMessageTimeoutW(h, WM_NCHITTEST, WPARAM(0), lp, SMTO_BLOCK | SMTO_ABORTIFHUNG, 30, Some(&mut hit))
+        };
+        Some((h, if ok.0 == 0 { 0 } else { hit as u32 }))
+    }
+
+    /// The left button went down at `x, y`: on a minimize button of a window
+    /// in the Dock, the Genie's first frame is staged for the release.
+    fn press(&mut self, x: i32, y: i32) {
+        use windows::Win32::UI::WindowsAndMessaging::HTMINBUTTON;
+        self.genie.disarm();
+        minbutton::set_armed(None);
+        if !self.genie.session() || self.genie.animating() || self.fullscreen {
+            return;
+        }
+        let Some((h, hit)) = self.hit_test(x, y) else { return };
+        if hit != HTMINBUTTON || winops::is_minimized(h) {
+            return;
+        }
+        let Some(key) = self.dock_key_of(h) else { return };
+        let since = Instant::now();
+        let Some(item) = self.genie_item(&key, h, None) else {
+            trace("genie: minimize button pressed, no snapshot");
+            return;
+        };
+        if self.genie.arm(item, (self.screen.w, self.screen.h)) {
+            minbutton::set_armed(Some(h));
+            trace(format!("genie armed: minimize button pressed, first frame staged in {:.1} ms", since.elapsed().as_secs_f32() * 1000.0));
+        }
+    }
+
+    /// The left button went up while a first frame is staged; the hook holds
+    /// the release until this returns. True if the frame went on screen.
+    fn release(&mut self, x: i32, y: i32) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::HTMINBUTTON;
+        let since = Instant::now();
+        minbutton::set_armed(None);
+        let Some(h) = self.genie.armed() else { return false };
+        // DefWindowProc minimizes only on a release over the button.
+        let on = self.hit_test(x, y).is_some_and(|(at, hit)| at == h && hit == HTMINBUTTON);
+        if on && self.genie.fire(h, "the minimize button", since) {
+            return true;
+        }
+        self.genie.disarm();
+        trace("genie disarmed: released off the minimize button");
+        false
+    }
+
+    /// HSHELL_GETMINRECT: Windows asks where a window minimizes to or
+    /// restores from. It asks before it hides the window, and waits for the
+    /// answer, so a minimize started here uncovers nothing. The answer, the
+    /// Dock icon, also aims Windows' own animation where it plays.
+    fn min_rect(&mut self, lp: LPARAM) -> LRESULT {
+        /// SHELLHOOKINFO as Windows passes it: the rect has 16-bit fields,
+        /// unlike the documented RECT (cairoshell/ManagedShell does the same).
+        #[repr(C)]
+        struct Info {
+            hwnd: HWND,
+            rc: [i16; 4],
+        }
+        let info = lp.0 as *mut Info;
+        // The pointer is only valid here when Windows sent the notice (and
+        // copied the struct into this process), never when it posted it.
+        let sent = unsafe { windows::Win32::UI::WindowsAndMessaging::InSendMessage() }.as_bool();
+        if info.is_null() || !sent || !writable(info as *const _, size_of::<Info>()) {
+            trace("genie: minimize-rect notice not sent synchronously, ignored");
+            return LRESULT(0);
+        }
+        let h = unsafe { (*info).hwnd };
+        let Some(key) = self.dock_key_of(h) else { return LRESULT(0) };
+        let iconic = winops::is_minimized(h);
+        trace(format!("genie: Windows asks for the minimize rect of a {} window", if iconic { "minimized" } else { "shown" }));
+        if !iconic && self.genie.session() && !self.genie.busy(h) && !self.fullscreen {
+            let since = Instant::now();
+            let armed = self.genie.armed() == Some(h)
+                || self.genie_item(&key, h, None).is_some_and(|it| self.genie.arm(it, (self.screen.w, self.screen.h)));
+            if armed {
+                self.genie.fire(h, "the shell hook", since);
+            }
+            minbutton::set_armed(None);
+        }
+        let Some((x, y, w, hh)) = self.dock.icon_rect(&key) else { return LRESULT(0) };
+        let c = |v: f32| v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        unsafe {
+            (*info).rc = [c(x), c(y), c(x + w), c(y + hh)];
+        }
+        LRESULT(1)
     }
 
     // -----------------------------------------------------------------------
@@ -1660,8 +1812,13 @@ impl App {
         self.extras_update(dt);
         if self.genie.animating() {
             let t = Instant::now();
-            self.genie.step((self.screen.w, self.screen.h));
+            self.genie.step((self.screen.w, self.screen.h), self.x.capture.as_mut());
             self.stat("genie", t);
+        }
+        if self.genie.overlay_shown() || self.genie_glass {
+            let t = Instant::now();
+            self.genie_glass_tick();
+            self.stat("genie glass", t);
         }
         self.pump_events();
         if self.menu.as_ref().is_some_and(|m| m.finished()) {
@@ -1749,6 +1906,10 @@ impl App {
             if self.panel_mouse(hwnd, msg, x, y).is_some() {
                 return Some(LRESULT(0));
             }
+        }
+        if msg == self.shell_msg && self.shell_msg != 0 {
+            const HSHELL_GETMINRECT: usize = 5;
+            return Some(if wp.0 == HSHELL_GETMINRECT { self.min_rect(lp) } else { LRESULT(0) });
         }
         // Our tray host broadcasts TaskbarCreated itself so apps re-add icons.
         let own_broadcast = super::tray::broadcast_time().is_some_and(|t| t.elapsed().as_secs() < 3);
@@ -1982,6 +2143,8 @@ impl App {
             WM_APP_MINIMIZE => {
                 self.minimize_event(HWND(wp.0 as *mut _), lp.0 & 1 != 0, (lp.0 >> 1) as u32);
             }
+            WM_APP_PRESS => self.press(wp.0 as isize as i32, lp.0 as i32),
+            WM_APP_RELEASE => return Some(LRESULT(self.release(wp.0 as isize as i32, lp.0 as i32) as isize)),
             WM_APP_TASKBAR => {
                 if self.taskbar_hidden {
                     system::keep_taskbar_hidden();

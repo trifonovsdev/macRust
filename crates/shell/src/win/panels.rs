@@ -227,7 +227,10 @@ impl App {
             let h = sample_hash(&pm);
             (hashes.insert(s.hwnd.0 as isize, h) != Some(h)).then_some(pm)
         };
-        if let Some(pm) = fresh(cap, &self.dock_s) {
+        // While the Genie is under the Dock, genie_glass_tick builds its glass.
+        if !self.genie_glass
+            && let Some(pm) = fresh(cap, &self.dock_s)
+        {
             self.dock.set_backdrop(&pm);
             self.dock_s.dirty = true;
         }
@@ -269,6 +272,27 @@ impl App {
         self.stat("backdrop", t);
         // At most about a quarter of one core while things move behind glass.
         self.x.backdrop_next = Instant::now() + t.elapsed() * 3;
+    }
+
+    /// Every frame the Genie is on screen: screen capture leaves the overlay
+    /// out, so the Dock's glass would show the desktop where the window
+    /// passes behind it until the window is back. The Genie is drawn over
+    /// the captured backdrop instead, and one plain rebuild follows once it
+    /// is out of the Dock's way.
+    pub(super) fn genie_glass_tick(&mut self) {
+        let r = self.dock_s.rect;
+        let under = self.dock_s.shown && self.genie.overlaps(r);
+        if !under && !self.genie_glass {
+            return;
+        }
+        let Some(cap) = &mut self.x.capture else { return };
+        cap.poll();
+        let Some(mut pm) = cap.region(r) else { return };
+        self.genie_glass = under && self.genie.draw_under(r, &mut pm);
+        self.dock.set_backdrop(&pm);
+        self.dock_s.dirty = true;
+        // The next backdrop_tick rebuilds it from the capture alone.
+        self.x.backdrop_hashes.remove(&(self.dock_s.hwnd.0 as isize));
     }
 
     // -------------------------------------------------------------------

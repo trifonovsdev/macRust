@@ -4,6 +4,7 @@
 //! behind it and never itself. Frames stay in memory and are never saved.
 
 use macrust_ui::WinRect;
+use macrust_ui::genie;
 use macrust_ui::tiny_skia::Pixmap;
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
@@ -170,6 +171,54 @@ impl Capture {
         let pick = [self.cur, 1 - self.cur].into_iter().find_map(|i| self.frames[i].as_ref().filter(|f| older(f.1)));
         let frame = pick?.0.clone();
         self.read(&frame, r, true)
+    }
+
+    /// `genie::grid_samples` of the newest frame under `r` (BGR order),
+    /// without reading the whole region back: what is on screen under our
+    /// own windows, which the capture leaves out.
+    pub fn sample(&mut self, r: WinRect, n: usize) -> Option<Vec<[u8; 3]>> {
+        let frame = self.frames[self.cur].as_ref()?.0.clone();
+        let mut d = D3D11_TEXTURE2D_DESC::default();
+        unsafe { frame.GetDesc(&mut d) };
+        let (x0, y0) = (r.x - self.origin.0, r.y - self.origin.1);
+        // Only a region inside the output: samples of black borders would
+        // never match the window.
+        if d.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+            || r.w < 8
+            || r.h < 8
+            || x0 < 0
+            || y0 < 0
+            || x0 + r.w > d.Width as i32
+            || y0 + r.h > d.Height as i32
+        {
+            return None;
+        }
+        let (w, h) = (r.w as usize, r.h as usize);
+        let staging = self.staging_for(r.w as u32, r.h as u32)?;
+        let bx = D3D11_BOX {
+            left: x0 as u32,
+            top: y0 as u32,
+            front: 0,
+            right: (x0 + r.w) as u32,
+            bottom: (y0 + r.h) as u32,
+            back: 1,
+        };
+        let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            self.ctx.CopySubresourceRegion(&staging, 0, 0, 0, 0, &frame, 0, Some(&bx));
+            self.ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut m)).ok()?;
+        }
+        let pitch = m.RowPitch as usize;
+        let src = unsafe { std::slice::from_raw_parts(m.pData as *const u8, pitch * h) };
+        let mut out = Vec::with_capacity(n * n);
+        for j in 0..n {
+            for i in 0..n {
+                let o = genie::grid_at(j, h, n) * pitch + genie::grid_at(i, w, n) * 4;
+                out.push([src[o], src[o + 1], src[o + 2]]);
+            }
+        }
+        unsafe { self.ctx.Unmap(&staging, 0) };
+        Some(out)
     }
 
     fn read(&mut self, frame: &ID3D11Texture2D, r: WinRect, bgra: bool) -> Option<Vec<u8>> {
