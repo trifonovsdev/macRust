@@ -21,6 +21,7 @@ use macrust_ui::tiny_skia::{
     Color, GradientStop, LinearGradient, Paint, Pixmap, PixmapPaint, Point, SpreadMode, Transform,
 };
 use macrust_ui::wallpaper::{self, Vibrancy};
+use macrust_ui::wifi::{Network, Radio, WifiMenu, WifiState};
 use macrust_ui::{Ctx, Key, Mods, WinRect};
 
 /// Stand-in app icon: a gradient tile with a simple white mark.
@@ -812,9 +813,78 @@ fn tahoe_set(out: &str) {
     tahoe_nc_on(&night, out, "tahoe-nc-sep2025-2x", false, Today { year: 2025, month: 8, day: 16, weekday: 2 });
 }
 
+/// The Wi-Fi menu hanging from its bar item, cropped around the menu.
+fn wifi_menu(sc: &Scene, out: &str, name: &str, st: WifiState, expanded: Option<bool>, hover: Option<u64>) {
+    let s = sc.scale;
+    let mut screen = sc.wall.clone();
+    let bar = bar_with(sc, "RU", false, Some(BarItem::Wifi), 16);
+    let br = bar.window_rect();
+    let mut bpm = pixmap_for(br);
+    bar.draw(&mut bpm, &sc.ctx);
+    blit(&mut screen, &bpm, br);
+    let mut m = WifiMenu::new(st, s);
+    if let Some(e) = expanded {
+        m.set_expanded(e);
+    }
+    if let Some((x, y)) = hover.and_then(|id| m.network_point(id)) {
+        m.mouse_move(x, y);
+    }
+    let anchor = bar.capsule_left(BarItem::Wifi).unwrap_or(0.0);
+    let r = m.window_rect(anchor, bar.height_px(), sc.w as i32);
+    m.set_backdrop(&crop(&screen, r.x, r.y, r.w as u32, r.h as u32));
+    let mut mpm = pixmap_for(r);
+    m.draw(&mut mpm, &sc.ctx);
+    blit(&mut screen, &mpm, r);
+    let body = m.body_rect(r);
+    let pad = (24.0 * s) as i32;
+    let x0 = (body.x - pad).max(0);
+    let x1 = (body.x + body.w + pad).min(sc.w as i32);
+    crop(&screen, x0, 0, (x1 - x0) as u32, (body.y + body.h + pad) as u32).save_png(format!("{out}/{name}.png")).unwrap();
+}
+
+fn wifi_net(id: u64, name: &str, signal: u8, secure: bool, known: bool, connected: bool) -> Network {
+    Network { id, name: name.into(), secure, signal, known, connected }
+}
+
+fn wifi_scenes(out: &str) {
+    let wall = std::env::var("PREVIEW_WIFI_WALL").ok().and_then(|p| Pixmap::load_png(&p).ok());
+    let light = |strings| match &wall {
+        Some(w) => scene_on(w.clone(), 2.0, false, strings),
+        None => scene_on(flat_wall(2880, 1800, [62, 118, 170]), 2.0, false, strings),
+    };
+    let dark = |strings| scene_on(flat_wall(2880, 1800, [18, 18, 20]), 2.0, true, strings);
+    let on = |nets: Vec<Network>, scanning| WifiState { radio: Radio::On, networks: nets, scanning, unavailable: false };
+    let others = vec![
+        wifi_net(10, "MGTS_GPON_5G", 72, true, false, false),
+        wifi_net(11, "TP-Link_3F20", 55, true, false, false),
+        wifi_net(12, "Beeline_Free", 40, false, false, false),
+        wifi_net(13, "DIRECT-6A-HP LaserJet", 30, true, false, false),
+        wifi_net(14, "Rostelecom_7781", 22, true, false, false),
+    ];
+    let mut home = vec![wifi_net(1, "Keenetic-5G", 88, true, true, true), wifi_net(2, "Keenetic", 50, true, true, false)];
+    // Side by side with MacPaw's Tahoe capture: one known network, connected.
+    wifi_menu(&light(&Strings::EN), out, "wifi-en-light-apple", on(vec![wifi_net(1, "Apple", 88, true, true, true)], false), None, None);
+    let ru_light = light(&Strings::RU);
+    let ru_dark = dark(&Strings::RU);
+    wifi_menu(&ru_light, out, "wifi-ru-light-connected", on(home.clone(), false), None, None);
+    wifi_menu(&ru_dark, out, "wifi-ru-dark-connected", on(home.clone(), false), None, None);
+    home.extend(others.clone());
+    wifi_menu(&ru_dark, out, "wifi-ru-dark-other", on(home.clone(), false), Some(true), Some(11));
+    wifi_menu(&ru_light, out, "wifi-ru-light-other", on(home, true), Some(true), Some(2));
+    wifi_menu(&ru_dark, out, "wifi-ru-dark-scanning", on(Vec::new(), true), None, None);
+    wifi_menu(&ru_dark, out, "wifi-ru-dark-unknown-only", on(others, false), None, None);
+    wifi_menu(&ru_dark, out, "wifi-ru-dark-off", WifiState { radio: Radio::Off, ..Default::default() }, None, None);
+    wifi_menu(&ru_light, out, "wifi-ru-light-off", WifiState { radio: Radio::Off, ..Default::default() }, None, None);
+    wifi_menu(&ru_dark, out, "wifi-ru-dark-no-adapter", WifiState::default(), None, None);
+}
+
 fn main() {
     let out = std::env::args().nth(1).unwrap_or_else(|| "out".into());
     std::fs::create_dir_all(&out).unwrap();
+    if std::env::args().nth(2).as_deref() == Some("wifi") {
+        wifi_scenes(&out);
+        return;
+    }
     // `preview <dir> tahoe` or `preview <dir> cc` renders only those scenes.
     let only = std::env::args().nth(2);
     if only.as_deref() != Some("cc") {

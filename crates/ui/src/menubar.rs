@@ -185,6 +185,12 @@ impl MenuBar {
         self.items.iter().find(|sl| sl.item == item).map(|sl| (sl.a, sl.b))
     }
 
+    /// Left end of an item's open-item capsule, window px: Tahoe hangs the
+    /// item's menu from there.
+    pub fn capsule_left(&self, item: BarItem) -> Option<f32> {
+        self.items.iter().find(|sl| sl.item == item).map(|sl| sl.c0 - CAPSULE_PAD * self.scale)
+    }
+
     pub fn status(&self) -> &Status {
         &self.status
     }

@@ -15,6 +15,7 @@ use macrust_ui::panel::MARGIN;
 use macrust_ui::theme::Theme;
 use macrust_ui::WinRect;
 use macrust_ui::tiny_skia::Pixmap;
+use macrust_ui::wifi::{Network, Radio, WifiEvent, WifiMenu, WifiState};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, WS_EX_NOACTIVATE};
 
@@ -24,8 +25,10 @@ use super::super::notifications::{self, Toast, Update, Watcher};
 use super::super::surface::Surface;
 use super::super::system;
 use super::super::util::trace;
+use super::super::wifi::{Cmd as WifiCmd, WifiList};
+use crate::wifi_logic;
 use super::super::tray::{Tray, TrayButton, TrayEvent};
-use super::{App, ESC_ONLY, MENU_FROM_BAR, MENU_RECT, TIMER_BANNER, WM_APP_MEDIA, WM_APP_NOTES, WM_APP_TRAY, image_from};
+use super::{App, ESC_ONLY, MENU_FROM_BAR, MENU_RECT, TIMER_BANNER, WM_APP_MEDIA, WM_APP_NOTES, WM_APP_TRAY, WM_APP_WIFI, image_from};
 
 /// Notifications kept for the Notification Center.
 const KEEP: usize = 100;
@@ -50,6 +53,12 @@ pub(super) struct Extras {
     nc_s: Surface,
     banner: Option<Banner>,
     banner_s: Surface,
+    /// The Wi-Fi status menu and the wlanapi worker behind its list.
+    wifi_list: WifiList,
+    wifi: Option<WifiMenu>,
+    wifi_s: Surface,
+    /// Left end of the bar item's capsule, where the menu hangs from.
+    wifi_anchor: f32,
     queue: VecDeque<Toast>,
     pub(super) privacy: (bool, bool),
     tick: u32,
@@ -80,6 +89,10 @@ impl Extras {
             nc_s: Surface::new(WS_EX_NOACTIVATE, "macRust Notification Center"),
             banner: None,
             banner_s: Surface::new(WS_EX_NOACTIVATE, "macRust notification"),
+            wifi_list: WifiList::start(notify, WM_APP_WIFI),
+            wifi: None,
+            wifi_s: Surface::new(WS_EX_NOACTIVATE, "macRust Wi-Fi"),
+            wifi_anchor: 0.0,
             queue: VecDeque::new(),
             privacy: (false, false),
             tick: 0,
@@ -90,21 +103,24 @@ impl Extras {
     }
 
     pub(super) fn panel_open(&self) -> bool {
-        self.cc.as_ref().is_some_and(|c| !c.closing()) || self.nc.as_ref().is_some_and(|n| !n.closing())
+        self.cc.as_ref().is_some_and(|c| !c.closing())
+            || self.nc.as_ref().is_some_and(|n| !n.closing())
+            || self.wifi.as_ref().is_some_and(|w| !w.closing())
     }
 
     pub(super) fn animating(&self) -> bool {
         self.cc.as_ref().is_some_and(|c| c.animating())
             || self.nc.as_ref().is_some_and(|n| n.animating())
             || self.banner.as_ref().is_some_and(|b| b.animating())
+            || self.wifi.as_ref().is_some_and(|w| w.animating())
     }
 
     pub(super) fn dirty(&self) -> bool {
-        self.cc_s.dirty || self.nc_s.dirty || self.banner_s.dirty
+        self.cc_s.dirty || self.nc_s.dirty || self.banner_s.dirty || self.wifi_s.dirty
     }
 
     pub(super) fn owns(&self, h: HWND) -> bool {
-        h == self.cc_s.hwnd || h == self.nc_s.hwnd || h == self.banner_s.hwnd
+        h == self.cc_s.hwnd || h == self.nc_s.hwnd || h == self.banner_s.hwnd || h == self.wifi_s.hwnd
     }
 }
 
@@ -161,6 +177,8 @@ impl App {
         }
         trace(format!("tray host started: {}", self.x.tray.is_some()));
         self.x.privacy = system::privacy_in_use();
+        // One list read (no scan) so the report knows the adapter.
+        self.x.wifi_list.send(WifiCmd::Refresh);
     }
 
     /// Once a second, from the status timer.
@@ -233,6 +251,13 @@ impl App {
         {
             n.set_backdrop(&pm);
             self.x.nc_s.dirty = true;
+        }
+        if let Some(w) = &mut self.x.wifi
+            && !w.closing()
+            && let Some(pm) = fresh(cap, &self.x.wifi_s)
+        {
+            w.set_backdrop(&pm);
+            self.x.wifi_s.dirty = true;
         }
         if let Some(b) = &mut self.x.banner
             && let Some(pm) = fresh(cap, &self.x.banner_s)
@@ -330,6 +355,7 @@ impl App {
     // Control Center
 
     pub(super) fn on_media(&mut self) {
+        let was_on = self.x.snap.wifi.as_ref().is_some_and(|w| w.on);
         self.x.snap = self.x.media.snapshot();
         if self.x.cc.is_some() {
             let st = self.control_state();
@@ -337,6 +363,113 @@ impl App {
                 cc.set_state(st);
             }
             self.x.cc_s.dirty = true;
+        }
+        if self.x.wifi.is_some() {
+            // The radio came on: Windows lists networks again after a scan.
+            if !was_on && self.x.snap.wifi.as_ref().is_some_and(|w| w.on) {
+                self.x.wifi_list.send(WifiCmd::Scan);
+            }
+            self.on_wifi();
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Wi-Fi menu
+
+    fn wifi_state(&self) -> WifiState {
+        let list = self.x.wifi_list.snapshot();
+        let radio = match &self.x.snap.wifi {
+            Some(w) if w.on => Radio::On,
+            Some(_) => Radio::Off,
+            // The radio API saw nothing, but wlanapi did (or has not answered yet).
+            None if list.interfaces > 0 || !list.ready => Radio::On,
+            None => Radio::Missing,
+        };
+        let networks = list
+            .networks
+            .iter()
+            .map(|n| Network {
+                id: wifi_logic::id_of(&n.ssid),
+                name: wifi_logic::name_of(&n.ssid),
+                secure: n.secure,
+                signal: n.signal,
+                known: n.profile.is_some(),
+                connected: n.connected,
+            })
+            .collect();
+        WifiState { radio, networks, scanning: list.scanning || !list.ready, unavailable: list.ready && !list.service }
+    }
+
+    pub(super) fn on_wifi(&mut self) {
+        if self.x.wifi.is_none() {
+            return;
+        }
+        let st = self.wifi_state();
+        if let Some(w) = &mut self.x.wifi {
+            w.set_state(st);
+        }
+        self.x.wifi_s.dirty = true;
+    }
+
+    pub(super) fn toggle_wifi(&mut self) {
+        if self.x.wifi.is_some() {
+            self.close_panels(true);
+            return;
+        }
+        self.close_menu(false);
+        self.x.media.send(Command::Refresh);
+        // macOS scans each time the menu opens; the cached list shows meanwhile.
+        self.x.wifi_list.send(WifiCmd::Active(true));
+        self.x.wifi_list.send(WifiCmd::Scan);
+        self.x.wifi_anchor = self.bar.capsule_left(BarItem::Wifi).unwrap_or(0.0);
+        let mut w = WifiMenu::new(self.wifi_state(), self.screen.scale);
+        let r = w.window_rect(self.x.wifi_anchor, self.bar.height_px(), self.screen.w);
+        if let Some(behind) = system::capture(r) {
+            w.set_backdrop(&behind);
+        }
+        let body = w.body_rect(r);
+        self.x.wifi = Some(w);
+        self.x.wifi_s.prepare(r);
+        self.x.wifi_s.dirty = true;
+        self.bar.set_open(Some(BarItem::Wifi));
+        self.bar_s.dirty = true;
+        self.arm_outside_body(body);
+        self.render();
+        self.x.wifi_s.raise();
+    }
+
+    fn wifi_events(&mut self) {
+        let Some(w) = &mut self.x.wifi else { return };
+        let events = std::mem::take(&mut w.events);
+        for e in events {
+            trace(format!("wifi menu: {}", match &e {
+                WifiEvent::Power(on) => format!("power {on}"),
+                WifiEvent::Join(_) => "join".into(),
+                WifiEvent::Disconnect(_) => "disconnect".into(),
+                WifiEvent::Scan => "scan".into(),
+                WifiEvent::Hidden => "hidden".into(),
+                WifiEvent::Settings => "settings".into(),
+            }));
+            match e {
+                WifiEvent::Power(on) => self.x.media.send(Command::SetWifi(on)),
+                WifiEvent::Scan => self.x.wifi_list.send(WifiCmd::Scan),
+                WifiEvent::Join(id) => {
+                    let list = self.x.wifi_list.snapshot();
+                    let net = list.networks.iter().find(|n| wifi_logic::id_of(&n.ssid) == id);
+                    match net {
+                        // A stored profile, or an open network: join directly.
+                        Some(n) if n.profile.is_some() || !n.secure => self.x.wifi_list.send(WifiCmd::Connect(id)),
+                        // No password field here: Windows' own sheet asks for it.
+                        _ => system::open("ms-availablenetworks:"),
+                    }
+                }
+                WifiEvent::Disconnect(_) => self.x.wifi_list.send(WifiCmd::Disconnect),
+                WifiEvent::Hidden => system::open("ms-availablenetworks:"),
+                WifiEvent::Settings => system::open("ms-settings:network-wifi"),
+            }
+        }
+        if self.x.wifi.as_ref().is_some_and(|w| w.closing()) {
+            self.close_panels(true);
         }
     }
 
@@ -695,6 +828,20 @@ impl App {
             m.brightness.is_some(),
             m.now_playing.as_ref().map(|p| (p.app.clone(), p.playing, p.art.is_some()))
         );
+        // Adapter and counts only: network names are personal data.
+        let wl = self.x.wifi_list.snapshot();
+        let _ = writeln!(
+            info,
+            "\n[wifi] listed {} service {} adapters {} networks {} known {} connected {} scanning {} menu open {}",
+            wl.ready,
+            wl.service,
+            wl.interfaces,
+            wl.networks.len(),
+            wl.networks.iter().filter(|n| n.profile.is_some()).count(),
+            wl.networks.iter().any(|n| n.connected),
+            wl.scanning,
+            self.x.wifi.is_some()
+        );
         let _ = writeln!(info, "\n[notifications] {} kept, {} dismissed here", self.x.toasts.len(), self.x.hidden.len());
         let mut apps: Vec<&str> = self.x.toasts.iter().map(|t| t.app_id.as_str()).collect();
         apps.sort_unstable();
@@ -789,7 +936,10 @@ impl App {
     // Panels: lifetime, input, frames
 
     pub(super) fn close_panels(&mut self, animated: bool) {
-        let was_open = self.x.cc.is_some() || self.x.nc.is_some();
+        let was_open = self.x.cc.is_some() || self.x.nc.is_some() || self.x.wifi.is_some();
+        if self.x.wifi.is_some() {
+            self.x.wifi_list.send(WifiCmd::Active(false));
+        }
         if was_open {
             trace(format!("panels close (animated {animated})"));
         }
@@ -800,6 +950,9 @@ impl App {
             if let Some(n) = &mut self.x.nc {
                 n.close();
             }
+            if let Some(w) = &mut self.x.wifi {
+                w.close();
+            }
         } else {
             if self.x.cc.take().is_some() {
                 self.x.cc_s.hide();
@@ -807,8 +960,11 @@ impl App {
             if self.x.nc.take().is_some() {
                 self.x.nc_s.hide();
             }
+            if self.x.wifi.take().is_some() {
+                self.x.wifi_s.hide();
+            }
         }
-        if was_open && matches!(self.bar.open_item(), Some(BarItem::Control | BarItem::Clock)) {
+        if was_open && matches!(self.bar.open_item(), Some(BarItem::Control | BarItem::Clock | BarItem::Wifi)) {
             self.bar.set_open(None);
             self.bar_s.dirty = true;
         }
@@ -870,6 +1026,27 @@ impl App {
             self.note_events();
             return Some(());
         }
+        if hwnd == self.x.wifi_s.hwnd {
+            let w = self.x.wifi.as_mut()?;
+            match msg {
+                WM_MOUSEMOVE => {
+                    self.x.wifi_s.track_leave();
+                    w.mouse_move(x, y);
+                }
+                WM_MOUSELEAVE => {
+                    self.x.wifi_s.left();
+                    w.mouse_leave();
+                }
+                WM_LBUTTONDOWN => {}
+                WM_LBUTTONUP => {
+                    w.mouse_up(x, y);
+                }
+                _ => return None,
+            }
+            self.x.wifi_s.dirty = true;
+            self.wifi_events();
+            return Some(());
+        }
         if hwnd == self.x.banner_s.hwnd {
             let b = self.x.banner.as_mut()?;
             match msg {
@@ -911,6 +1088,16 @@ impl App {
             b.update(dt);
             self.x.banner_s.dirty = true;
         }
+        if let Some(w) = &mut self.x.wifi
+            && w.animating()
+        {
+            w.update(dt);
+            self.x.wifi_s.dirty = true;
+        }
+        if self.x.wifi.as_ref().is_some_and(|w| w.finished()) {
+            self.x.wifi = None;
+            self.x.wifi_s.hide();
+        }
         if self.x.cc.as_ref().is_some_and(|c| c.finished()) {
             self.x.cc = None;
             self.x.cc_s.hide();
@@ -945,6 +1132,28 @@ impl App {
             nc.draw(&mut self.x.nc_s.pm, &self.ctx);
             clear_rows(&mut self.x.nc_s.pm, bar_h - r.y);
             self.x.nc_s.present();
+        }
+        if self.x.wifi_s.dirty
+            && let Some(w) = &mut self.x.wifi
+        {
+            let r = w.window_rect(self.x.wifi_anchor, bar_h, self.screen.w);
+            if (r.w, r.h) != (self.x.wifi_s.rect.w, self.x.wifi_s.rect.h) {
+                // Other Networks opened or closed: the glass needs what is
+                // behind the new size (our layered windows are not captured).
+                if let Some(behind) = system::capture(r) {
+                    w.set_backdrop(&behind);
+                }
+                let body = (!w.closing()).then(|| w.body_rect(r));
+                if let Some(b) = body {
+                    self.arm_outside_body(b);
+                }
+            }
+            if let Some(w) = &self.x.wifi {
+                self.x.wifi_s.prepare(r);
+                w.draw(&mut self.x.wifi_s.pm, &self.ctx);
+                clear_rows(&mut self.x.wifi_s.pm, bar_h - r.y);
+                self.x.wifi_s.present();
+            }
         }
         if self.x.banner_s.dirty
             && let Some(b) = &self.x.banner

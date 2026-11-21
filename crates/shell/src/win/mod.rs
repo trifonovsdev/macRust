@@ -16,6 +16,7 @@ mod tracker;
 mod tray;
 mod update;
 mod util;
+mod wifi;
 mod winops;
 mod workarea;
 

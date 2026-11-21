@@ -72,6 +72,7 @@ pub const WM_APP_TRAY: u32 = WM_APP + 11;
 pub const WM_APP_MEDIA: u32 = WM_APP + 12;
 pub const WM_APP_NOTES: u32 = WM_APP + 13;
 pub const WM_APP_UPDATE: u32 = WM_APP + 14;
+pub const WM_APP_WIFI: u32 = WM_APP + 15;
 
 #[path = "panels.rs"]
 mod panels;
@@ -1555,7 +1556,7 @@ impl App {
                 }
             }
             BarItem::Battery => system::open("ms-settings:batterysaver"),
-            BarItem::Wifi => system::open("ms-availablenetworks:"),
+            BarItem::Wifi => self.toggle_wifi(),
             BarItem::Clock => self.toggle_notes(),
             BarItem::Control | BarItem::Privacy => self.toggle_control(),
             BarItem::Tray(id) => self.tray_click(id, false),
@@ -1987,6 +1988,7 @@ impl App {
             WM_APP_TRAY => self.on_tray(),
             WM_APP_MEDIA => self.on_media(),
             WM_APP_NOTES => self.on_notes(),
+            WM_APP_WIFI => self.on_wifi(),
             WM_APP_UPDATE => trace("update state changed"),
             WM_APP_CATALOG => self.catalog_arrived(),
             WM_APP_DISMISS => {
