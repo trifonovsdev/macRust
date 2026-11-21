@@ -1,0 +1,3 @@
+# mingw-w64 headers default to Windows XP; the bundled SQLite needs Vista+ APIs.
+[env]
+CFLAGS_x86_64_pc_windows_gnu = "-D_WIN32_WINNT=0x0A00"
