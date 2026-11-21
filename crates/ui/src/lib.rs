@@ -5,6 +5,7 @@
 pub mod anim;
 pub mod dock;
 pub mod extras;
+pub mod files;
 pub mod genie;
 pub mod gfx;
 pub mod glass;
