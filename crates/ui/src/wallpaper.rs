@@ -217,6 +217,29 @@ impl Vibrancy {
         out
     }
 
+    /// Bilinear sample of the heavily blurred level ("frosted" glass): RGB 0..255.
+    #[inline]
+    pub fn sample_frost(&self, sx: f32, sy: f32) -> [f32; 3] {
+        let (w, h) = (self.low.width() as usize, self.low.height() as usize);
+        let fx = (sx / self.k - 0.5).clamp(0.0, (w - 1) as f32);
+        let fy = (sy / self.k - 0.5).clamp(0.0, (h - 1) as f32);
+        let (x0, y0) = (fx as usize, fy as usize);
+        let dx = if x0 + 1 < w { 4 } else { 0 };
+        let dy = if y0 + 1 < h { w * 4 } else { 0 };
+        let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+        let i = (y0 * w + x0) * 4;
+        let d = &self.low.data()[i..i + dy + dx + 3];
+        let mut out = [0.0; 3];
+        for (c, o) in out.iter_mut().enumerate() {
+            let (a, b) = (d[c] as f32, d[dx + c] as f32);
+            let (e, f) = (d[dy + c] as f32, d[dy + dx + c] as f32);
+            let top = a + (b - a) * tx;
+            let bot = e + (f - e) * tx;
+            *o = top + (bot - top) * ty;
+        }
+        out
+    }
+
     /// Mean luminance (0..1) of a screen rectangle of the blurred wallpaper.
     pub fn luma(&self, x: f32, y: f32, w: f32, h: f32) -> f32 {
         let (lw, lh) = (self.low.width() as i32, self.low.height() as i32);

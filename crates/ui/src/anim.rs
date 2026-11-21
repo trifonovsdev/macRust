@@ -75,17 +75,14 @@ impl Spring {
 pub const BOUNCE_PERIOD: f32 = 0.62;
 
 /// Height (0..1 of the peak) of the dock launch bounce at `t` seconds.
-/// Each hop is a parabola; later hops are a little lower.
+/// Every hop is the same ballistic parabola, as in macOS: no damping and no
+/// pause at the top or on the ground.
 pub fn launch_bounce(t: f32) -> f32 {
     if t < 0.0 {
         return 0.0;
     }
-    let hop = (t / BOUNCE_PERIOD).floor();
-    let phase = (t - hop * BOUNCE_PERIOD) / BOUNCE_PERIOD;
-    let damp = 0.86f32.powf(hop);
-    let y = 4.0 * phase * (1.0 - phase);
-    // The power < 1 makes the icon hang at the top of the hop like the original.
-    y.max(0.0).powf(0.85) * damp
+    let phase = (t / BOUNCE_PERIOD).fract();
+    (4.0 * phase * (1.0 - phase)).max(0.0)
 }
 
 #[cfg(test)]

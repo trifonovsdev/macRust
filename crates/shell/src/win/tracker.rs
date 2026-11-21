@@ -13,6 +13,9 @@ use windows::Win32::Storage::EnhancedStorage::{
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -157,6 +160,47 @@ fn relaunch(h: HWND) -> (Option<String>, Option<String>) {
     (exe, name)
 }
 
+/// The program that started a helper process (steam.exe for
+/// steamwebhelper.exe): helpers often carry no icon of their own, and the
+/// taskbar shows the parent app for them.
+fn helper_parent(pid: u32, exe: &str) -> Option<String> {
+    let stem = file_stem(exe);
+    if !stem.contains("helper") {
+        return None;
+    }
+    let parent = unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut e = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut found = None;
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                if e.th32ProcessID == pid {
+                    found = Some(e.th32ParentProcessID);
+                    break;
+                }
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        found?
+    };
+    let pexe = process_info(parent).0?;
+    let pstem = file_stem(&pexe);
+    // A helper started by the shell or a service is its own app; a helper
+    // started by another helper keeps climbing one level only, by design.
+    if pstem == stem || matches!(pstem.as_str(), "explorer" | "svchost" | "services" | "cmd" | "powershell" | "conhost") || pstem.contains("helper") {
+        return None;
+    }
+    Some(pexe)
+}
+
+fn file_stem(path: &str) -> String {
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase();
+    name.strip_suffix(".exe").map(str::to_string).unwrap_or(name)
+}
+
 /// Whether a process still runs. Pids are reused, so the image path must match too.
 pub fn process_alive(pid: u32, exe: &str) -> bool {
     process_info(pid).0.is_some_and(|e| e.eq_ignore_ascii_case(exe))
@@ -297,7 +341,15 @@ pub fn snapshot(names: &mut HashMap<String, String>) -> Vec<RunningApp> {
                 a.pids.push(pid);
             }
         } else {
-            let (relaunch_exe, relaunch_name) = relaunch(h);
+            let (mut relaunch_exe, mut relaunch_name) = relaunch(h);
+            if relaunch_exe.is_none()
+                && let Some(parent) = helper_parent(pid, &exe)
+            {
+                if relaunch_name.is_none() {
+                    relaunch_name = file_description(&parent);
+                }
+                relaunch_exe = Some(parent);
+            }
             let registered = aumid.as_deref().is_some_and(|a| registered_name(a).is_some());
             let name = app_name_with(names, &exe, aumid.as_deref(), relaunch_name.as_deref());
             apps.push(RunningApp { key, exe, aumid, name, windows: vec![h], pids: vec![pid], relaunch_exe, registered });

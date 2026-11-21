@@ -7,6 +7,7 @@ use tiny_skia::Pixmap;
 
 use crate::anim::Spring;
 use crate::gfx::{self, Image, rgba};
+use crate::glass::{Backdrop, GlassStyle, Shape};
 use crate::panel::{self, MARGIN, Reveal, inside};
 use crate::text::Weight;
 use crate::{Ctx, glyphs};
@@ -64,21 +65,31 @@ fn card_h(ctx: &Ctx, n: &NoteView, s: f32) -> f32 {
 }
 
 /// One notification card; `close` draws the dismiss button on its corner.
+/// A card's material: glass over the captured backdrop, or the plain panel
+/// colour when there is none.
 #[allow(clippy::too_many_arguments)]
-fn draw_card(pm: &mut Pixmap, ctx: &Ctx, n: &NoteView, x: f32, y: f32, s: f32, close: bool, pressed: bool) -> f32 {
+fn plate(pm: &mut Pixmap, ctx: &Ctx, bd: Option<&Backdrop>, x: f32, y: f32, w: f32, h: f32, r: f32, s: f32) {
+    let th = ctx.theme;
+    match bd {
+        Some(b) => b.draw(pm, Shape { x, y, w, h, r }, &GlassStyle::card(th.dark, s)),
+        None => {
+            ctx.shadow(r, 10.0 * s).draw(pm, x, y + 4.0 * s, w, h, if th.dark { rgba(0, 0, 0, 0.4) } else { rgba(0, 0, 0, 0.14) });
+            if let Some(p) = gfx::squircle(x, y, w, h, r) {
+                gfx::fill(pm, &p, th.panel());
+                gfx::stroke(pm, &p, th.panel_border(), 1.0);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_card(pm: &mut Pixmap, ctx: &Ctx, bd: Option<&Backdrop>, n: &NoteView, x: f32, y: f32, s: f32, close: bool, pressed: bool) -> f32 {
     let th = ctx.theme;
     let w = WIDTH * s;
     let h = card_h(ctx, n, s);
-    ctx.shadow(CARD_R * s, 10.0 * s).draw(pm, x, y + 4.0 * s, w, h, if th.dark { rgba(0, 0, 0, 0.4) } else { rgba(0, 0, 0, 0.14) });
-    if let Some(p) = gfx::squircle(x, y, w, h, CARD_R * s) {
-        gfx::fill(pm, &p, th.panel());
-        if pressed {
-            gfx::fill(pm, &p, th.separator());
-        }
-        gfx::stroke(pm, &p, th.panel_border(), 1.0);
-    }
-    if let Some(p) = gfx::squircle(x + 1.0, y + 1.0, w - 2.0, h - 2.0, CARD_R * s - 1.0) {
-        gfx::stroke(pm, &p, th.panel_rim(), 1.0);
+    plate(pm, ctx, bd, x, y, w, h, CARD_R * s, s);
+    if pressed && let Some(p) = gfx::squircle(x, y, w, h, CARD_R * s) {
+        gfx::fill(pm, &p, th.separator());
     }
     let (ix, iy, isz) = (x + CARD_PAD * s, y + CARD_PAD * s, ICON * s);
     match (&n.image, &n.icon) {
@@ -129,14 +140,11 @@ fn days_in(year: i32, month: usize) -> u32 {
     }
 }
 
-fn draw_calendar(pm: &mut Pixmap, ctx: &Ctx, t: Today, x: f32, y: f32, s: f32) {
+#[allow(clippy::too_many_arguments)]
+fn draw_calendar(pm: &mut Pixmap, ctx: &Ctx, bd: Option<&Backdrop>, t: Today, x: f32, y: f32, s: f32) {
     let th = ctx.theme;
     let (w, h) = (WIDTH * s, CAL_H * s);
-    ctx.shadow(CARD_R * s, 10.0 * s).draw(pm, x, y + 4.0 * s, w, h, if th.dark { rgba(0, 0, 0, 0.4) } else { rgba(0, 0, 0, 0.14) });
-    if let Some(p) = gfx::squircle(x, y, w, h, 22.0 * s) {
-        gfx::fill(pm, &p, th.panel());
-        gfx::stroke(pm, &p, th.panel_border(), 1.0);
-    }
+    plate(pm, ctx, bd, x, y, w, h, 22.0 * s, s);
     let red = rgba(255, 59, 48, 1.0);
     let st = ctx.strings;
     // Left: weekday and the big date.
@@ -184,6 +192,7 @@ pub struct NotificationCenter {
     today: Today,
     max_h: f32,
     reveal: Reveal,
+    backdrop: Option<Backdrop>,
     hover: Option<Hit>,
     pressed: Option<Hit>,
     pub events: Vec<NoteEvent>,
@@ -192,7 +201,12 @@ pub struct NotificationCenter {
 impl NotificationCenter {
     /// `max_h`: tallest window allowed, px.
     pub fn new(notes: Vec<NoteView>, today: Today, scale: f32, max_h: f32) -> Self {
-        Self { scale, notes, today, max_h, reveal: Reveal::new(), hover: None, pressed: None, events: Vec::new() }
+        Self { scale, notes, today, max_h, reveal: Reveal::new(), backdrop: None, hover: None, pressed: None, events: Vec::new() }
+    }
+
+    /// What is behind the window, window-sized; the cards are glass over it.
+    pub fn set_backdrop(&mut self, behind: &Pixmap) {
+        self.backdrop = Some(Backdrop::new(behind));
     }
 
     pub fn set_notes(&mut self, notes: Vec<NoteView>, today: Today) {
@@ -315,12 +329,11 @@ impl NotificationCenter {
         gfx::put_rect(pm, x, MARGIN * s, WIDTH * s, cal_y + CAL_H * s - MARGIN * s, [0, 0, 0, 1]);
         if !self.notes.is_empty() {
             let r = self.clear_rect(ctx);
-            if let Some(p) = gfx::squircle(r.0, r.1, r.2, r.3, r.3 / 2.0) {
-                gfx::fill(pm, &p, th.panel());
-                if self.pressed == Some(Hit::Clear) {
-                    gfx::fill(pm, &p, th.separator());
-                }
-                gfx::stroke(pm, &p, th.panel_border(), 1.0);
+            plate(pm, ctx, self.backdrop.as_ref(), r.0, r.1, r.2, r.3, r.3 / 2.0, s);
+            if self.pressed == Some(Hit::Clear)
+                && let Some(p) = gfx::squircle(r.0, r.1, r.2, r.3, r.3 / 2.0)
+            {
+                gfx::fill(pm, &p, th.separator());
             }
             let fs = 12.0 * s;
             ctx.text.draw(pm, ctx.strings.clear_all, r.0 + 10.0 * s, r.1 + r.3 / 2.0 + ctx.text.cap_height(fs) / 2.0, fs, Weight::Medium, th.label(), None);
@@ -328,9 +341,9 @@ impl NotificationCenter {
         for &(i, cy, _) in &cards {
             let hovered = matches!(self.hover, Some(Hit::Card(k) | Hit::Close(k)) if k == i);
             let pressed = self.pressed == Some(Hit::Card(i));
-            draw_card(pm, ctx, &self.notes[i], x, cy, s, hovered, pressed);
+            draw_card(pm, ctx, self.backdrop.as_ref(), &self.notes[i], x, cy, s, hovered, pressed);
         }
-        draw_calendar(pm, ctx, self.today, x, cal_y, s);
+        draw_calendar(pm, ctx, self.backdrop.as_ref(), self.today, x, cal_y, s);
         panel::fade_all(pm, self.reveal.alpha());
     }
 }
@@ -340,6 +353,7 @@ pub struct Banner {
     scale: f32,
     pub note: NoteView,
     slide: Spring,
+    backdrop: Option<Backdrop>,
     hover: bool,
     close_hover: bool,
     pressed: bool,
@@ -351,7 +365,7 @@ impl Banner {
     pub fn new(note: NoteView, scale: f32) -> Self {
         let mut slide = Spring::new(0.0, 0.42, 0.82).epsilon(0.002);
         slide.to(1.0);
-        Self { scale, note, slide, hover: false, close_hover: false, pressed: false, closing: false, events: Vec::new() }
+        Self { scale, note, slide, backdrop: None, hover: false, close_hover: false, pressed: false, closing: false, events: Vec::new() }
     }
 
     pub fn window_size(&self, ctx: &Ctx) -> (i32, i32) {
@@ -369,6 +383,10 @@ impl Banner {
     pub fn finished(&self) -> bool {
         self.closing && self.slide.settled()
     }
+    pub fn set_backdrop(&mut self, behind: &Pixmap) {
+        self.backdrop = Some(Backdrop::new(behind));
+    }
+
     /// The host times the banner out; the pointer on it keeps it up.
     pub fn hovered(&self) -> bool {
         self.hover
@@ -410,7 +428,7 @@ impl Banner {
     pub fn draw(&self, pm: &mut Pixmap, ctx: &Ctx) {
         pm.fill(tiny_skia::Color::TRANSPARENT);
         let (ox, oy) = self.origin();
-        draw_card(pm, ctx, &self.note, ox, oy, self.scale, self.hover, self.pressed && !self.close_hover);
+        draw_card(pm, ctx, self.backdrop.as_ref(), &self.note, ox, oy, self.scale, self.hover, self.pressed && !self.close_hover);
     }
 }
 

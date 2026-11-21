@@ -224,8 +224,11 @@ fn desktop(sc: &Scene, out: &str, name: &str, with_menu: bool, with_spot: bool, 
         }
         let (mw, mh) = menu.window_size();
         let (ox, oy) = menu.body_offset();
-        menu.mouse_move(ox as f32 + 40.0, oy as f32 + (5.0 + 22.0 * 2.0 + 11.0 + 8.0) * sc.scale);
+        menu.mouse_move(ox as f32 + 40.0, oy as f32 + (6.0 + 24.0 * 2.0 + 11.0 + 8.0) * sc.scale);
         let r = WinRect { x: (6.0 * sc.scale) as i32 - ox, y: bar.height_px() + (2.0 * sc.scale) as i32 - oy, w: mw, h: mh };
+        let mut behind = Pixmap::new(mw as u32, mh as u32).unwrap();
+        behind.draw_pixmap(-r.x, -r.y, screen.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        menu.set_backdrop(&behind);
         let mut mpm = pixmap_for(r);
         menu.draw(&mut mpm, &sc.ctx);
         blit(&mut screen, &mpm, r);
@@ -337,6 +340,12 @@ fn panels(sc: &Scene, out: &str, name: &str) {
     let (cw, ch) = cc.window_size();
     let m = (macrust_ui::panel::MARGIN * s) as i32;
     let r = WinRect { x: sc.w as i32 - cw + m - (8.0 * s) as i32, y: br.h + (4.0 * s) as i32 - m, w: cw, h: ch };
+    let crop = |r: WinRect| {
+        let mut behind = Pixmap::new(r.w as u32, r.h as u32).unwrap();
+        behind.draw_pixmap(-r.x, -r.y, sc.wall.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        behind
+    };
+    cc.set_backdrop(&crop(r));
     let mut cpm = pixmap_for(r);
     cc.draw(&mut cpm, &sc.ctx);
     blit(&mut screen, &cpm, r);
@@ -353,6 +362,7 @@ fn panels(sc: &Scene, out: &str, name: &str) {
     }
     let (nw, nh) = nc.window_size(&sc.ctx);
     let r = WinRect { x: sc.w as i32 - nw + m - (8.0 * s) as i32, y: br.h + (4.0 * s) as i32 - m, w: nw, h: nh };
+    nc.set_backdrop(&crop(r));
     nc.mouse_move(&sc.ctx, (m + 100) as f32, (m as f32 + 40.0 * s) + 20.0 * s);
     let mut npm = pixmap_for(r);
     nc.draw(&mut npm, &sc.ctx);
@@ -367,6 +377,7 @@ fn panels(sc: &Scene, out: &str, name: &str) {
     }
     let (bw, bh) = banner.window_size(&sc.ctx);
     let r = WinRect { x: sc.w as i32 - bw + m - (8.0 * s) as i32, y: br.h + (4.0 * s) as i32 - m, w: bw, h: bh };
+    banner.set_backdrop(&crop(r));
     let mut bnp = pixmap_for(r);
     banner.draw(&mut bnp, &sc.ctx);
     blit(&mut screen, &bnp, r);
@@ -440,7 +451,7 @@ fn main() {
 
     // Magnification sweep and a launch bounce, cropped to the dock window.
     let sc = &retina_light;
-    let mut dock = Dock::new(DockConfig::default());
+    let mut dock = Dock::new(DockConfig { magnify: true, ..DockConfig::default() });
     dock.set_screen(sc.w, sc.h, sc.scale);
     dock.set_entries(entries());
     let dr = dock.window_rect();

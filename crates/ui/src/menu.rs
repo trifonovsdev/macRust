@@ -4,6 +4,7 @@ use tiny_skia::Pixmap;
 
 use crate::anim::Spring;
 use crate::gfx::{self, rgba};
+use crate::glass::{Backdrop, GlassStyle, Shape};
 use crate::text::Weight;
 use crate::{Ctx, Key, glyphs};
 
@@ -44,13 +45,13 @@ pub enum MenuEvent {
 }
 
 // Points.
-const ITEM_H: f32 = 22.0;
+const ITEM_H: f32 = 24.0;
 const SEP_H: f32 = 11.0;
-const VPAD: f32 = 5.0;
+const VPAD: f32 = 6.0;
 const LEFT: f32 = 22.0;
 const RIGHT: f32 = 16.0;
 const FONT: f32 = 13.0;
-const RADIUS: f32 = 8.0;
+const RADIUS: f32 = 12.0;
 /// Room for the shadow around the body.
 pub const MARGIN_X: f32 = 24.0;
 pub const MARGIN_TOP: f32 = 12.0;
@@ -66,6 +67,7 @@ pub struct PopupMenu {
     flash: Option<(usize, f32)>,
     body_w: f32,
     body_h: f32,
+    backdrop: Option<Backdrop>,
     /// Opaque id of the owner, so the host knows which menu this is.
     pub owner: u32,
     pub events: Vec<MenuEvent>,
@@ -92,7 +94,12 @@ impl PopupMenu {
         let body_w = (LEFT * s + text_w + gap + short_w + RIGHT * s).max(170.0 * s).ceil();
         let mut alpha = Spring::new(0.0, 0.14, 1.0).epsilon(0.002);
         alpha.to(1.0);
-        Self { entries, scale, hover: None, alpha, closing: false, flash: None, body_w, body_h: h.ceil(), owner, events: Vec::new() }
+        Self { entries, scale, hover: None, alpha, closing: false, flash: None, body_w, body_h: h.ceil(), backdrop: None, owner, events: Vec::new() }
+    }
+
+    /// What is behind the window, window-sized; the menu is glass over it.
+    pub fn set_backdrop(&mut self, behind: &Pixmap) {
+        self.backdrop = Some(Backdrop::new(behind));
     }
 
     /// Window size including the shadow margins.
@@ -233,38 +240,37 @@ impl PopupMenu {
         let (ox, oy) = self.body_offset();
         let (bx, by, bw, bh) = (ox as f32, oy as f32, self.body_w, self.body_h);
         let r = RADIUS * s;
-        ctx.shadow(r, 14.0 * s).draw(pm, bx, by + 8.0 * s, bw, bh, gfx::fade(th.shadow(), a * 0.9));
-        ctx.shadow(r, 1.5 * s).draw(pm, bx, by, bw, bh, gfx::fade(rgba(0, 0, 0, 0.12), a));
-        if let Some(p) = gfx::squircle(bx, by, bw, bh, r) {
-            gfx::fill(pm, &p, gfx::fade(th.panel(), a));
-            gfx::stroke(pm, &p, gfx::fade(th.panel_border(), a), 1.0);
-        }
-        if th.dark
-            && let Some(p) = gfx::squircle(bx + 1.0, by + 1.0, bw - 2.0, bh - 2.0, r - 1.0)
-        {
-            gfx::stroke(pm, &p, gfx::fade(th.panel_rim(), a), 1.0);
+        ctx.shadow(r, 14.0 * s).draw(pm, bx, by + 8.0 * s, bw, bh, gfx::fade(th.shadow(), 0.7));
+        match &self.backdrop {
+            Some(b) => b.draw(pm, Shape { x: bx, y: by, w: bw, h: bh, r }, &GlassStyle::menu(th.dark, s)),
+            None => {
+                if let Some(p) = gfx::squircle(bx, by, bw, bh, r) {
+                    gfx::fill(pm, &p, th.panel());
+                    gfx::stroke(pm, &p, th.panel_border(), 1.0);
+                }
+            }
         }
         let fs = FONT * s;
         let mut cy = by + VPAD * s;
         for (i, e) in self.entries.iter().enumerate() {
             if e.separator {
                 let ly = (cy + SEP_H * s / 2.0).floor();
-                gfx::fill_rect(pm, bx + 10.0 * s, ly, bw - 20.0 * s, s.max(1.0).round(), gfx::fade(th.separator(), a));
+                gfx::fill_rect(pm, bx + 12.0 * s, ly, bw - 24.0 * s, s.max(1.0).round(), th.separator());
                 cy += SEP_H * s;
                 continue;
             }
             let h = ITEM_H * s;
             let flash_off = matches!(self.flash, Some((fi, t)) if fi == i && t < FLASH / 2.0);
             let lit = self.hover == Some(i) && e.enabled && !flash_off;
-            if lit && let Some(p) = gfx::squircle(bx + 5.0 * s, cy, bw - 10.0 * s, h, 4.0 * s) {
-                gfx::fill(pm, &p, gfx::fade(th.accent(), a));
+            if lit && let Some(p) = gfx::squircle(bx + 6.0 * s, cy, bw - 12.0 * s, h, 7.0 * s) {
+                gfx::fill(pm, &p, th.accent());
             }
             let color = if lit {
-                rgba(255, 255, 255, a)
+                rgba(255, 255, 255, 1.0)
             } else if e.enabled {
-                gfx::fade(th.label(), a)
+                th.label()
             } else {
-                gfx::fade(th.tertiary(), a)
+                th.tertiary()
             };
             let base = (cy + h / 2.0 + ctx.text.cap_height(fs) / 2.0).round();
             if e.checked {
@@ -275,10 +281,12 @@ impl PopupMenu {
             ctx.text.draw(pm, &label, bx + LEFT * s, base, fs, Weight::Regular, color, None);
             if !e.shortcut.is_empty() {
                 let sw = ctx.text.measure(&e.shortcut, fs, Weight::Regular);
-                let sc = if lit { rgba(255, 255, 255, 0.85 * a) } else { gfx::fade(th.secondary(), a) };
+                let sc = if lit { rgba(255, 255, 255, 0.85) } else { th.secondary() };
                 ctx.text.draw(pm, &e.shortcut, bx + bw - RIGHT * s - sw, base, fs, Weight::Regular, sc, None);
             }
             cy += h;
         }
+        // The glass cannot be drawn translucent, so the finished menu fades as a whole.
+        crate::panel::fade_all(pm, a);
     }
 }

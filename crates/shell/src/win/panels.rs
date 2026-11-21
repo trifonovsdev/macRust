@@ -298,8 +298,12 @@ impl App {
         self.close_menu(false);
         self.x.media.send(Command::Refresh);
         let st = self.control_state();
-        let cc = ControlCenter::new(st, self.screen.scale);
+        let mut cc = ControlCenter::new(st, self.screen.scale);
         let r = self.panel_rect(cc.window_size());
+        // The glass blurs what is under the panel; taken once, before it shows.
+        if let Some(behind) = system::capture(r) {
+            cc.set_backdrop(&behind);
+        }
         self.x.cc = Some(cc);
         self.x.cc_s.prepare(r);
         self.x.cc_s.dirty = true;
@@ -338,12 +342,21 @@ impl App {
                     self.close_panels(true);
                     system::open("ms-screenclip:");
                 }
+                ControlEvent::Calculator => {
+                    self.close_panels(true);
+                    system::open("calc.exe");
+                }
+                ControlEvent::Lock => {
+                    self.close_panels(false);
+                    system::power(system::Power::Lock);
+                }
                 ControlEvent::Settings(page) => {
                     self.close_panels(true);
                     system::open(match page {
                         "wifi" => "ms-settings:network-wifi",
                         "bluetooth" => "ms-settings:bluetooth",
                         "display" => "ms-settings:display",
+                        "" => "ms-settings:",
                         _ => "ms-settings:sound",
                     });
                 }
@@ -438,8 +451,11 @@ impl App {
         }
         let Some(t) = self.x.queue.pop_front() else { return };
         let v = self.note_view(&t);
-        let b = Banner::new(v, self.screen.scale);
+        let mut b = Banner::new(v, self.screen.scale);
         let r = self.panel_rect(b.window_size(&self.ctx));
+        if let Some(behind) = system::capture(r) {
+            b.set_backdrop(&behind);
+        }
         self.x.banner = Some(b);
         self.x.banner_s.prepare(r);
         self.x.banner_s.dirty = true;
@@ -481,8 +497,11 @@ impl App {
         self.x.queue.clear();
         let notes: Vec<NoteView> = self.visible_toasts().iter().map(|t| self.note_view(t)).collect();
         let max_h = (self.screen.h - self.bar.height_px()) as f32 - self.dock.reserved_height() as f32;
-        let nc = NotificationCenter::new(notes, self.today(), self.screen.scale, max_h);
+        let mut nc = NotificationCenter::new(notes, self.today(), self.screen.scale, max_h);
         let r = self.panel_rect(nc.window_size(&self.ctx));
+        if let Some(behind) = system::capture(r) {
+            nc.set_backdrop(&behind);
+        }
         self.x.nc = Some(nc);
         self.x.nc_s.prepare(r);
         self.x.nc_s.dirty = true;
@@ -588,7 +607,15 @@ impl App {
         for _ in 0..240 {
             cc.update(1.0 / 60.0);
         }
+        let crop = |r: WinRect| {
+            let mut behind = Pixmap::new(r.w.max(1) as u32, r.h.max(1) as u32)?;
+            behind.draw_pixmap(-r.x, -r.y, wall.as_ref(), &macrust_ui::tiny_skia::PixmapPaint::default(), macrust_ui::tiny_skia::Transform::identity(), None);
+            Some(behind)
+        };
         let r = self.panel_rect(cc.window_size());
+        if let Some(behind) = crop(r) {
+            cc.set_backdrop(&behind);
+        }
         if let Some(mut pm) = Pixmap::new(r.w as u32, r.h as u32) {
             cc.draw(&mut pm, &self.ctx);
             if let Some(out) = super::report::over_wallpaper(wall, &pm, r) {
@@ -607,6 +634,9 @@ impl App {
             nc.update(1.0 / 60.0);
         }
         let r = self.panel_rect(nc.window_size(&self.ctx));
+        if let Some(behind) = crop(r) {
+            nc.set_backdrop(&behind);
+        }
         if let Some(mut pm) = Pixmap::new(r.w as u32, r.h as u32) {
             nc.draw(&mut pm, &self.ctx);
             if let Some(out) = super::report::over_wallpaper(wall, &pm, r) {

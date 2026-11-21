@@ -707,3 +707,55 @@ pub fn set_wallpaper(pm: &Pixmap) -> bool {
 pub fn pixmap_from_rgba(w: u32, h: u32, data: Vec<u8>) -> Option<Pixmap> {
     Pixmap::from_vec(data, IntSize::from_wh(w, h)?)
 }
+
+/// What is on screen in `r` right now, as an opaque pixmap. Layered windows
+/// (ours) are not in it. Used as the backdrop that panels' glass blurs; it
+/// stays in memory.
+pub fn capture(r: macrust_ui::WinRect) -> Option<Pixmap> {
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC,
+        DeleteObject, GetDC, ReleaseDC, SRCCOPY, SelectObject,
+    };
+    let (w, h) = (r.w.max(1), r.h.max(1));
+    unsafe {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return None;
+        }
+        let mem = CreateCompatibleDC(Some(screen));
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let out = match CreateDIBSection(Some(mem), &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(bmp) if !bits.is_null() => {
+                let old = SelectObject(mem, bmp.into());
+                let ok = BitBlt(mem, 0, 0, w, h, Some(screen), r.x, r.y, SRCCOPY).is_ok();
+                let px = ok.then(|| {
+                    let src = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
+                    let mut data = Vec::with_capacity(src.len());
+                    for p in src.chunks_exact(4) {
+                        data.extend_from_slice(&[p[2], p[1], p[0], 255]);
+                    }
+                    data
+                });
+                SelectObject(mem, old);
+                let _ = DeleteObject(bmp.into());
+                px
+            }
+            _ => None,
+        };
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+        Pixmap::from_vec(out?, IntSize::from_wh(w as u32, h as u32)?)
+    }
+}

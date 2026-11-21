@@ -55,7 +55,8 @@ impl Default for Settings {
         Self {
             icon_size: 52.0,
             magnified: 92.0,
-            magnify: true,
+            // Off by default, as in macOS.
+            magnify: false,
             hide_taskbar: true,
             reserve_dock: true,
             appearance: "auto".into(),
@@ -94,6 +95,7 @@ fn dock_path() -> PathBuf {
 
 pub fn load_settings() -> Settings {
     let mut s = Settings::default();
+    let mut version = 1;
     let text = match read_text(&settings_path()) {
         Some(Ok(t)) => t,
         Some(Err(())) => return s,
@@ -110,6 +112,7 @@ pub fn load_settings() -> Settings {
             "icon_size" => s.icon_size = v.parse().unwrap_or(s.icon_size).clamp(24.0, 128.0),
             "magnified_size" => s.magnified = v.parse().unwrap_or(s.magnified).clamp(24.0, 160.0),
             "magnification" => s.magnify = b,
+            "version" => version = v.parse().unwrap_or(1),
             "hide_taskbar" => s.hide_taskbar = b,
             "reserve_dock_space" => s.reserve_dock = b,
             "appearance" => s.appearance = v.to_string(),
@@ -118,15 +121,23 @@ pub fn load_settings() -> Settings {
             _ => {}
         }
     }
+    // Version 1 files hold the old defaults: magnification was on, which
+    // macOS does not do. Move them to the new defaults once and add new keys.
+    if version < SETTINGS_VERSION {
+        s.magnify = false;
+        save_settings(&s);
+    }
     s
 }
 
+const SETTINGS_VERSION: u32 = 2;
+
 pub fn save_settings(s: &Settings) {
     let text = format!(
-        "# macRust settings. Restart macRust after editing.\n\
+        "# macRust settings. Restart macRust after editing.\nversion = {}\n\
          icon_size = {}\nmagnified_size = {}\nmagnification = {}\nhide_taskbar = {}\nreserve_dock_space = {}\n\
          # auto | light | dark\nappearance = {}\ntray_icons = {}\nbanners = {}\n",
-        s.icon_size, s.magnified, s.magnify, s.hide_taskbar, s.reserve_dock, s.appearance, s.tray_icons, s.banners
+        SETTINGS_VERSION, s.icon_size, s.magnified, s.magnify, s.hide_taskbar, s.reserve_dock, s.appearance, s.tray_icons, s.banners
     );
     let _ = std::fs::write(settings_path(), text);
 }

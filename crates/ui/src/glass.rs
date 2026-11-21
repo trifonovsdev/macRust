@@ -23,6 +23,9 @@ pub struct GlassStyle {
     pub specular: f32,
     /// Brightening of the bevel itself (light catching the curved edge), 0..1.
     pub glow: f32,
+    /// Strongly blurred backdrop (controls over app windows) instead of the
+    /// nearly clear one (the dock over the wallpaper).
+    pub frost: bool,
 }
 
 impl GlassStyle {
@@ -37,20 +40,56 @@ impl GlassStyle {
             refraction: 11.0 * scale,
             specular: if dark { 0.55 } else { 0.85 },
             glow: if dark { 0.05 } else { 0.10 },
+            frost: false,
         }
     }
 
+    /// Notification cards, banners, widgets and menus: denser frosted glass
+    /// that carries theme-coloured text.
+    pub fn card(dark: bool, scale: f32) -> Self {
+        Self {
+            tint: if dark {
+                Color::from_rgba8(36, 36, 40, 175)
+            } else {
+                Color::from_rgba8(250, 250, 252, 165)
+            },
+            bevel: 8.0 * scale,
+            refraction: 5.0 * scale,
+            specular: if dark { 0.45 } else { 0.7 },
+            glow: 0.05,
+            frost: true,
+        }
+    }
+
+    /// Menus: the densest frosted glass, close to a solid sheet.
+    pub fn menu(dark: bool, scale: f32) -> Self {
+        Self {
+            tint: if dark {
+                Color::from_rgba8(40, 40, 44, 205)
+            } else {
+                Color::from_rgba8(246, 247, 250, 200)
+            },
+            bevel: 6.0 * scale,
+            refraction: 3.0 * scale,
+            specular: if dark { 0.4 } else { 0.6 },
+            glow: 0.04,
+            frost: true,
+        }
+    }
+
+    /// Control Center modules: frosted glass tinted by what is behind.
     pub fn panel(dark: bool, scale: f32) -> Self {
         Self {
             tint: if dark {
-                Color::from_rgba8(24, 24, 28, 150)
+                Color::from_rgba8(30, 30, 34, 120)
             } else {
-                Color::from_rgba8(250, 250, 252, 120)
+                Color::from_rgba8(255, 255, 255, 70)
             },
-            bevel: 10.0 * scale,
-            refraction: 7.0 * scale,
-            specular: if dark { 0.45 } else { 0.7 },
+            bevel: 9.0 * scale,
+            refraction: 6.0 * scale,
+            specular: if dark { 0.5 } else { 0.8 },
             glow: 0.06,
+            frost: true,
         }
     }
 }
@@ -103,12 +142,17 @@ impl Shape {
 
 /// Backdrop + tint for a whole window, sampled once per wallpaper/theme/position.
 pub fn material(v: &Vibrancy, ox: f32, oy: f32, w: u32, h: u32, tint: Color) -> Option<Pixmap> {
+    material_with(v, ox, oy, w, h, tint, false)
+}
+
+fn material_with(v: &Vibrancy, ox: f32, oy: f32, w: u32, h: u32, tint: Color, frost: bool) -> Option<Pixmap> {
     let mut pm = Pixmap::new(w.max(1), h.max(1))?;
     let t = premul(tint);
     let data = pm.data_mut();
     for y in 0..h as usize {
         for x in 0..w as usize {
-            let c = v.sample_clear(ox + x as f32 + 0.5, oy + y as f32 + 0.5);
+            let (sx, sy) = (ox + x as f32 + 0.5, oy + y as f32 + 0.5);
+            let c = if frost { v.sample_frost(sx, sy) } else { v.sample_clear(sx, sy) };
             let o = (y * w as usize + x) * 4;
             for k in 0..3 {
                 data[o + k] = (t[k] * 255.0 + c[k] * (1.0 - t[3]) + 0.5).min(255.0) as u8;
@@ -171,7 +215,8 @@ pub fn draw(pm: &mut Pixmap, v: &Vibrancy, mat: &Pixmap, ox: f32, oy: f32, shape
             let mut rgb = if bend < 0.5 {
                 [src[o] as f32, src[o + 1] as f32, src[o + 2] as f32]
             } else {
-                let c = v.sample_clear(ox + fx + nx * bend, oy + fy + ny * bend);
+                let (sx, sy) = (ox + fx + nx * bend, oy + fy + ny * bend);
+                let c = if st.frost { v.sample_frost(sx, sy) } else { v.sample_clear(sx, sy) };
                 [
                     tint[0] * 255.0 + c[0] * (1.0 - tint[3]),
                     tint[1] * 255.0 + c[1] * (1.0 - tint[3]),
@@ -195,6 +240,40 @@ pub fn draw(pm: &mut Pixmap, v: &Vibrancy, mat: &Pixmap, ox: f32, oy: f32, shape
             }
             dst[o + 3] = (255.0 * cov + dst[o + 3] as f32 * inv + 0.5).min(255.0) as u8;
         }
+    }
+}
+
+/// What lies behind a floating panel (a capture of the screen under it, or
+/// the wallpaper), with a material cache per tint. Window coordinates.
+pub struct Backdrop {
+    pub vib: Vibrancy,
+    /// Mean luminance 0..1: light backdrops get dark text.
+    pub luma: f32,
+    mats: std::cell::RefCell<Vec<([u8; 4], bool, Pixmap)>>,
+}
+
+impl Backdrop {
+    pub fn new(behind: &Pixmap) -> Self {
+        let vib = Vibrancy::new(behind);
+        let luma = vib.luma(0.0, 0.0, behind.width() as f32, behind.height() as f32);
+        Self { vib, luma, mats: std::cell::RefCell::new(Vec::new()) }
+    }
+
+    /// Draws a glass shape; `pm` must be the window the backdrop was taken for.
+    pub fn draw(&self, pm: &mut Pixmap, shape: Shape, st: &GlassStyle) {
+        let key = st.tint.to_color_u8();
+        let key = [key.red(), key.green(), key.blue(), key.alpha()];
+        let mut mats = self.mats.borrow_mut();
+        let hit = mats.iter().position(|(k, f, m)| *k == key && *f == st.frost && m.width() == pm.width() && m.height() == pm.height());
+        let i = match hit {
+            Some(i) => i,
+            None => {
+                let Some(m) = material_with(&self.vib, 0.0, 0.0, pm.width(), pm.height(), st.tint, st.frost) else { return };
+                mats.push((key, st.frost, m));
+                mats.len() - 1
+            }
+        };
+        draw(pm, &self.vib, &mats[i].2, 0.0, 0.0, shape, st);
     }
 }
 

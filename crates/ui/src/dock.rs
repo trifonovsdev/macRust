@@ -56,7 +56,7 @@ pub struct DockConfig {
 
 impl Default for DockConfig {
     fn default() -> Self {
-        Self { icon: 52.0, magnified: 92.0, magnify: true }
+        Self { icon: 52.0, magnified: 92.0, magnify: false }
     }
 }
 
@@ -86,10 +86,15 @@ struct Geo {
 type MaterialKey = (u64, bool, WinRect);
 
 // Geometry in points.
+// Proportions measured from macOS 26 screenshots. Icons carry Apple's
+// canvas margin (the visible tile is ART of the icon box), so the gaps
+// between visible tiles come out at 0.31 of a tile, as in Tahoe.
 const GAP_BOTTOM: f32 = 4.0;
-const PAD: f32 = 5.0;
-const SIDE: f32 = 5.0;
-const TILE: f32 = 1.13;
+const PAD: f32 = 8.5;
+const SIDE: f32 = 3.0;
+const TILE: f32 = 1.056;
+/// Visible part of an icon in its box (Apple's 824/1024 grid).
+const ART: f32 = 0.805;
 const SEP_W: f32 = 16.0;
 /// Half-width of the magnification bell, in tiles.
 const RANGE: f32 = 2.7;
@@ -332,7 +337,7 @@ impl Dock {
         let tile0 = g.icon0 * TILE * a;
         let factor = if tile0 > 0.0 { w / tile0 } else { 1.0 };
         let size = g.icon0 * factor * a;
-        let lift = sl.bounce.map(launch_bounce).unwrap_or(0.0) * g.icon0 * 0.62;
+        let lift = sl.bounce.map(launch_bounce).unwrap_or(0.0) * g.icon0 * 0.5;
         (x + (w - size) / 2.0, g.icon_bottom - size - lift, size)
     }
 
@@ -435,7 +440,7 @@ impl Dock {
         }
         gfx::put_rect(pm, bx, top, bw + 1.0, wh - top.floor(), [0, 0, 0, 1]);
 
-        let radius = bh * 0.4;
+        let radius = bh * 0.26;
         ctx.shadow(radius, 9.0 * s).draw(pm, bx, by + 3.0 * s, bw, bh, if th.dark { rgba(0, 0, 0, 0.30) } else { rgba(0, 0, 0, 0.10) });
         match &ctx.vibrancy {
             Some(v) => {
@@ -482,8 +487,10 @@ impl Dock {
                     }
                     if sl.e.running && alpha > 0.5 {
                         let cx = ix + size / 2.0;
-                        let cy = g.icon_bottom + PAD * s * 0.55;
-                        if let Some(p) = gfx::circle(cx, cy, 1.9 * s) {
+                        // Just under the visible tile, not under the icon's canvas margin.
+                        let art_bottom = iy + size - size * (1.0 - ART) / 2.0;
+                        let cy = art_bottom.max(g.icon_bottom - g.icon0 * (1.0 - ART) / 2.0) + g.icon0 * ART * 0.1;
+                        if let Some(p) = gfx::circle(cx, cy, 1.8 * s) {
                             gfx::fill(pm, &p, gfx::fade(th.indicator(), alpha));
                         }
                     }
@@ -554,7 +561,7 @@ mod tests {
 
     #[test]
     fn magnified_icon_stays_under_the_cursor() {
-        let mut d = Dock::new(DockConfig::default());
+        let mut d = Dock::new(DockConfig { magnify: true, ..DockConfig::default() });
         d.set_entries((0..8).map(|i| entry(&i.to_string())).collect());
         let wr = d.window_rect();
         let g0 = d.geo(wr.w as f32, wr.h as f32);

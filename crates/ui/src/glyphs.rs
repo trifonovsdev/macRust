@@ -334,16 +334,18 @@ pub fn bluetooth(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
     }
 }
 
-/// Crescent moon (dark mode).
+/// Crescent moon (dark mode): a disc with an offset disc cut out of it.
 pub fn moon(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
-    let mut pb = PathBuilder::new();
-    let (cx, cy, r) = (x + s * 0.5, y + s * 0.5, s * 0.38);
-    arc(&mut pb, cx, cy, r, -PI * 0.3, PI * 1.5, true);
-    arc(&mut pb, cx + s * 0.16, cy - s * 0.14, r * 0.8, PI * 1.3, PI * 0.1, false);
-    pb.close();
-    if let Some(p) = pb.finish() {
-        gfx::fill(pm, &p, c);
+    let n = s.ceil().max(1.0) as u32 + 2;
+    let Some(mut tmp) = Pixmap::new(n, n) else { return };
+    if let Some(p) = gfx::circle(1.0 + s * 0.5, 1.0 + s * 0.5, s * 0.4) {
+        gfx::fill(&mut tmp, &p, c);
     }
+    if let Some(p) = gfx::circle(1.0 + s * 0.7, 1.0 + s * 0.33, s * 0.32) {
+        let paint = tiny_skia::Paint { blend_mode: tiny_skia::BlendMode::Clear, anti_alias: true, ..Default::default() };
+        tmp.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+    pm.draw_pixmap((x - 1.0).round() as i32, (y - 1.0).round() as i32, tmp.as_ref(), &tiny_skia::PixmapPaint::default(), Transform::identity(), None);
 }
 
 pub fn sun(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
@@ -434,5 +436,64 @@ pub fn close_x(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
         if let Some(path) = poly(&[(x + s * a.0, y + s * a.1), (x + s * b.0, y + s * b.1)], false) {
             gfx::stroke_round(pm, &path, c, line_w(s) * 1.2);
         }
+    }
+}
+
+/// Outline calculator: body with a display and a 3x3 keypad.
+pub fn calculator_glyph(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    if let Some(p) = gfx::squircle(x + s * 0.2, y + s * 0.08, s * 0.6, s * 0.84, s * 0.1) {
+        gfx::stroke(pm, &p, c, line_w(s));
+    }
+    gfx::fill_rect(pm, x + s * 0.3, y + s * 0.18, s * 0.4, s * 0.14, c);
+    for row in 0..3 {
+        for col in 0..3 {
+            if let Some(p) = gfx::circle(x + s * (0.34 + col as f32 * 0.16), y + s * (0.46 + row as f32 * 0.14), s * 0.045) {
+                gfx::fill(pm, &p, c);
+            }
+        }
+    }
+}
+
+/// Plain gear outline (settings).
+pub fn gear(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    let (cx, cy) = (x + s * 0.5, y + s * 0.5);
+    let mut pb = PathBuilder::new();
+    let teeth = 8;
+    for i in 0..teeth * 2 {
+        let a0 = i as f32 * PI / teeth as f32;
+        let r = if i % 2 == 0 { s * 0.42 } else { s * 0.32 };
+        let (a, b) = (a0 - PI / teeth as f32 * 0.42, a0 + PI / teeth as f32 * 0.42);
+        if i == 0 {
+            pb.move_to(cx + r * a.cos(), cy + r * a.sin());
+        } else {
+            pb.line_to(cx + r * a.cos(), cy + r * a.sin());
+        }
+        pb.line_to(cx + r * b.cos(), cy + r * b.sin());
+    }
+    pb.close();
+    if let Some(p) = pb.finish() {
+        gfx::stroke(pm, &p, c, line_w(s));
+    }
+    if let Some(p) = gfx::circle(cx, cy, s * 0.12) {
+        gfx::stroke(pm, &p, c, line_w(s));
+    }
+}
+
+/// Padlock.
+pub fn lock(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    let mut pb = PathBuilder::new();
+    arc(&mut pb, x + s * 0.5, y + s * 0.4, s * 0.2, PI, TAU, true);
+    pb.line_to(x + s * 0.7, y + s * 0.46);
+    if let Some(p) = pb.finish() {
+        gfx::stroke(pm, &p, c, line_w(s) * 1.1);
+    }
+    let mut pb2 = PathBuilder::new();
+    pb2.move_to(x + s * 0.3, y + s * 0.46);
+    pb2.line_to(x + s * 0.3, y + s * 0.4);
+    if let Some(p) = pb2.finish() {
+        gfx::stroke(pm, &p, c, line_w(s) * 1.1);
+    }
+    if let Some(p) = gfx::squircle(x + s * 0.22, y + s * 0.44, s * 0.56, s * 0.44, s * 0.08) {
+        gfx::fill(pm, &p, c);
     }
 }

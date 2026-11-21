@@ -863,7 +863,7 @@ impl App {
 
     fn open_menu(&mut self, entries: Vec<MenuEntry>, owner: MenuOwner, anchor: Anchor) {
         let s = self.screen.scale;
-        let m = PopupMenu::new(entries, 0, s, &self.ctx);
+        let mut m = PopupMenu::new(entries, 0, s, &self.ctx);
         let (w, h) = m.window_size();
         let (ox, oy) = m.body_offset();
         let (bw, bh) = m.body_size();
@@ -873,7 +873,11 @@ impl App {
         };
         let bx = bx.clamp(4.0 * s, self.screen.w as f32 - bw - 4.0 * s).round() as i32;
         let by = by.max(0.0).round() as i32;
-        self.menu_s.prepare(WinRect { x: bx - ox, y: by - oy, w, h });
+        let r = WinRect { x: bx - ox, y: by - oy, w, h };
+        if let Some(behind) = system::capture(r) {
+            m.set_backdrop(&behind);
+        }
+        self.menu_s.prepare(r);
         for (a, v) in MENU_RECT.iter().zip([bx, by, bx + bw as i32, by + bh as i32]) {
             a.store(v, Ordering::Relaxed);
         }
