@@ -149,29 +149,49 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// `px`: `w * h` premultiplied 4-byte pixels.
+    /// `px`: `w * h` premultiplied 4-byte pixels. Only the full resolution
+    /// exists until `build_levels`, so the first, unsqueezed frame can go on
+    /// screen without waiting for the rest.
     pub fn new(px: Vec<u8>, w: usize, h: usize) -> Snapshot {
         assert_eq!(px.len(), w * h * 4, "snapshot size");
         let opaque = px.chunks_exact(w.max(1) * 4).map(|r| r.chunks_exact(4).all(|p| p[3] == 255)).collect();
-        let mut levels = vec![(w, px)];
-        while let Some((pw, prev)) = levels.last()
+        Snapshot { w, h, levels: vec![(w, px)], opaque }
+    }
+
+    pub fn has_levels(&self) -> bool {
+        self.levels.len() > 1 || self.w < 16
+    }
+
+    /// Builds the half-width levels (rows in bands on up to four threads).
+    /// Until then a squeezed row samples the full resolution and aliases.
+    pub fn build_levels(&mut self) {
+        let h = self.h;
+        while let Some((pw, prev)) = self.levels.last()
             && *pw >= 16
         {
             let (pw, nw) = (*pw, pw.div_ceil(2));
             let mut next = vec![0u8; nw * h * 4];
-            for y in 0..h {
-                let (s, d) = (&prev[y * pw * 4..(y + 1) * pw * 4], &mut next[y * nw * 4..(y + 1) * nw * 4]);
-                let px = |i: usize| u32::from_le_bytes([s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3]]);
-                for (x, o) in d.chunks_exact_mut(4).enumerate() {
-                    let (a, b) = (px(2 * x), px((2 * x + 1).min(pw - 1)));
-                    // Per-byte average without carries between channels.
-                    let m = (a & b) + (((a ^ b) & 0xfefe_fefe) >> 1);
-                    o.copy_from_slice(&m.to_le_bytes());
+            let band = h.div_ceil(workers()).max(1);
+            std::thread::scope(|sc| {
+                for (i, chunk) in next.chunks_mut(band * nw * 4).enumerate() {
+                    let prev = &prev[i * band * pw * 4..];
+                    sc.spawn(move || {
+                        for (y, d) in chunk.chunks_exact_mut(nw * 4).enumerate() {
+                            let s = &prev[y * pw * 4..(y + 1) * pw * 4];
+                            let px =
+                                |i: usize| u32::from_le_bytes([s[i * 4], s[i * 4 + 1], s[i * 4 + 2], s[i * 4 + 3]]);
+                            for (x, o) in d.chunks_exact_mut(4).enumerate() {
+                                let (a, b) = (px(2 * x), px((2 * x + 1).min(pw - 1)));
+                                // Per-byte average without carries between channels.
+                                let m = (a & b) + (((a ^ b) & 0xfefe_fefe) >> 1);
+                                o.copy_from_slice(&m.to_le_bytes());
+                            }
+                        }
+                    });
                 }
-            }
-            levels.push((nw, next));
+            });
+            self.levels.push((nw, next));
         }
-        Snapshot { w, h, levels, opaque }
     }
 
     /// The full-resolution pixels, for keeping the snapshot without its levels.
@@ -631,6 +651,19 @@ mod tests {
     }
 
     #[test]
+    fn levels_halve_the_width_and_average_pairs() {
+        let px: Vec<u8> =
+            (0..40 * 3).flat_map(|i| if i % 2 == 0 { [200, 100, 0, 255] } else { [100, 50, 0, 255] }).collect();
+        let mut s = Snapshot::new(px, 40, 3);
+        assert!(!s.has_levels());
+        s.build_levels();
+        assert!(s.has_levels());
+        assert_eq!(s.levels.iter().map(|l| l.0).collect::<Vec<_>>(), vec![40, 20, 10]);
+        assert_eq!(&s.levels[1].1[..4], &[150, 75, 0, 255]);
+        assert_eq!(s.levels[2].1.len(), 10 * 3 * 4);
+    }
+
+    #[test]
     fn corners_are_cut_and_edges_kept() {
         let mut px = vec![255u8; 40 * 30 * 4];
         round_corners(&mut px, 40, 30, 8.0);
@@ -644,7 +677,8 @@ mod tests {
     fn squeezed_rows_keep_the_average_colour() {
         let line: Vec<u8> =
             (0..1000).flat_map(|i| if i % 2 == 0 { [255, 255, 255, 255] } else { [0, 0, 0, 255] }).collect();
-        let snap = Snapshot::new(line, 1000, 1);
+        let mut snap = Snapshot::new(line, 1000, 1);
+        snap.build_levels();
         let mut row = vec![0u8; 100 * 4];
         resample_row(&snap, 0, 10.0, 60.0, &mut row, 10, 60);
         for x in 10..60 {
