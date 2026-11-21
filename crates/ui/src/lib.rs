@@ -19,6 +19,7 @@ pub mod spotlight;
 pub mod strings;
 pub mod text;
 pub mod theme;
+pub mod wifi;
 pub mod wallpaper;
 
 use std::cell::RefCell;

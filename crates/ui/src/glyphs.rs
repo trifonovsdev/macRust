@@ -53,6 +53,12 @@ pub fn magnifier(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
 /// SF `wifi` as the menu bar draws it: a wedge and two bands, 2.1 pt
 /// thick, ink exactly `w` wide and `0.74 w` tall from `x, y` (Tahoe: 16 x 11.9 pt).
 pub fn wifi(pm: &mut Pixmap, x: f32, y: f32, w: f32, c: Color, connected: bool) {
+    wifi_bars(pm, x, y, w, c, if connected { 3 } else { 1 });
+}
+
+/// `wifi` showing signal strength: the wedge and the next `bars - 1` bands
+/// in `c`, the rest at 30% (Sequoia's weak-network disc: 0.32).
+pub fn wifi_bars(pm: &mut Pixmap, x: f32, y: f32, w: f32, c: Color, bars: u8) {
     // Radii in units of the outer radius, measured top-down on NL: band 2.1 pt,
     // gap 1.7, band 2.2, gap 1.3, wedge 4.0 of 11.9 pt.
     let half = 42.5f32.to_radians();
@@ -75,7 +81,7 @@ pub fn wifi(pm: &mut Pixmap, x: f32, y: f32, w: f32, c: Color, connected: bool) 
         }
         pb.close();
         if let Some(p) = pb.finish() {
-            let col = if connected || i == 0 { c } else { dim };
+            let col = if i < bars.max(1) as usize { c } else { dim };
             gfx::fill(pm, &p, col);
             gfx::stroke_round(pm, &p, col, round * 2.0);
         }

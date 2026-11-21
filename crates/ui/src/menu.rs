@@ -73,20 +73,39 @@ fn selection(dark: bool) -> Color {
     if dark { rgba(20, 80, 178, 1.0) } else { rgba(0, 122, 255, 1.0) }
 }
 
-fn text_color(dark: bool) -> Color {
+pub(crate) fn text_color(dark: bool) -> Color {
     if dark { rgba(242, 242, 242, 1.0) } else { rgba(0, 0, 0, 0.85) }
 }
 
-fn secondary(dark: bool) -> Color {
+pub(crate) fn secondary(dark: bool) -> Color {
     if dark { rgba(255, 255, 255, 0.5) } else { rgba(0, 0, 0, 0.45) }
 }
 
-fn disabled(dark: bool) -> Color {
+pub(crate) fn disabled(dark: bool) -> Color {
     if dark { rgba(255, 255, 255, 0.25) } else { rgba(0, 0, 0, 0.25) }
 }
 
-fn separator(dark: bool) -> Color {
+pub(crate) fn separator(dark: bool) -> Color {
     if dark { rgba(255, 255, 255, 0.14) } else { rgba(0, 0, 0, 0.1) }
+}
+
+/// The menu sheet: shadow, near-opaque glass over `backdrop` (a flat fill
+/// without one), a dark 1 px ring outside and a 0.5 pt light hairline inside.
+pub(crate) fn sheet(pm: &mut Pixmap, ctx: &Ctx, backdrop: Option<&Backdrop>, shape: Shape, s: f32) {
+    let dark = ctx.theme.dark;
+    let Shape { x, y, w, h, r } = shape;
+    ctx.shadow(r, 14.0 * s).draw(pm, x, y + 8.0 * s, w, h, gfx::fade(ctx.theme.shadow(), 0.7));
+    match backdrop {
+        Some(b) => b.draw(pm, shape, &GlassStyle::menu(dark, s)),
+        None => {
+            let fill = if dark { rgba(22, 22, 22, 1.0) } else { rgba(240, 240, 242, 1.0) };
+            glass::hairline(pm, shape, 0.0, 1e4, fill, fill);
+        }
+    }
+    let ring = if dark { rgba(0, 0, 0, 0.6) } else { rgba(0, 0, 0, 0.14) };
+    glass::hairline(pm, shape, -1.0, 0.0, ring, ring);
+    let rim = if dark { rgba(255, 255, 255, 0.4) } else { rgba(255, 255, 255, 0.7) };
+    glass::hairline(pm, shape, 0.0, 0.5 * s, rim, rim);
 }
 
 pub struct PopupMenu {
@@ -274,21 +293,8 @@ impl PopupMenu {
         }
         let (ox, oy) = self.body_offset();
         let (bx, by, bw, bh) = (ox as f32, oy as f32, self.body_w, self.body_h);
-        let r = RADIUS * s;
-        let shape = Shape { x: bx, y: by, w: bw, h: bh, r };
-        ctx.shadow(r, 14.0 * s).draw(pm, bx, by + 8.0 * s, bw, bh, gfx::fade(ctx.theme.shadow(), 0.7));
-        match &self.backdrop {
-            Some(b) => b.draw(pm, shape, &GlassStyle::menu(dark, s)),
-            None => {
-                let fill = if dark { rgba(22, 22, 22, 1.0) } else { rgba(240, 240, 242, 1.0) };
-                glass::hairline(pm, shape, 0.0, 1e4, fill, fill);
-            }
-        }
-        // A dark 1 px ring outside, a 0.5 pt light hairline inside.
-        let ring = if dark { rgba(0, 0, 0, 0.6) } else { rgba(0, 0, 0, 0.14) };
-        glass::hairline(pm, shape, -1.0, 0.0, ring, ring);
-        let rim = if dark { rgba(255, 255, 255, 0.4) } else { rgba(255, 255, 255, 0.7) };
-        glass::hairline(pm, shape, 0.0, 0.5 * s, rim, rim);
+        let shape = Shape { x: bx, y: by, w: bw, h: bh, r: RADIUS * s };
+        sheet(pm, ctx, self.backdrop.as_ref(), shape, s);
 
         let fs = FONT * s;
         let left = self.left * s;

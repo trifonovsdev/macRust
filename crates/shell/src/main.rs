@@ -2,6 +2,7 @@
 
 mod icon_logic;
 mod net_logic;
+mod wifi_logic;
 mod update_logic;
 #[cfg(windows)]
 mod win;
