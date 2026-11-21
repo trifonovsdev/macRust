@@ -33,6 +33,10 @@ pub fn is_minimized(h: HWND) -> bool {
     unsafe { IsIconic(h).as_bool() }
 }
 
+pub fn is_maximized(h: HWND) -> bool {
+    unsafe { IsZoomed(h).as_bool() }
+}
+
 pub fn minimize(h: HWND) {
     unsafe {
         let _ = ShowWindowAsync(h, SW_MINIMIZE);
@@ -73,7 +77,7 @@ fn work_area(h: HWND) -> RECT {
 }
 
 /// Invisible resize borders: window rect minus the visible frame, per side.
-fn borders(h: HWND) -> (i32, i32, i32, i32) {
+pub fn borders(h: HWND) -> (i32, i32, i32, i32) {
     unsafe {
         let mut wr = RECT::default();
         let mut fr = RECT::default();
@@ -127,4 +131,56 @@ pub fn center(h: HWND) {
         let y = (wa.top + wa.bottom - ht) / 2;
         let _ = SetWindowPos(h, None, x, y.max(wa.top), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
+}
+
+/// The visible frame of `h` on screen (DWM extended frame bounds).
+pub fn frame_rect(h: HWND) -> Option<macrust_ui::WinRect> {
+    let mut fr = RECT::default();
+    unsafe {
+        DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &mut fr as *mut RECT as *mut _, size_of::<RECT>() as u32).ok()?;
+    }
+    let r = macrust_ui::WinRect { x: fr.left, y: fr.top, w: fr.right - fr.left, h: fr.bottom - fr.top };
+    (r.w > 0 && r.h > 0).then_some(r)
+}
+
+/// Where the visible frame of a minimized window was, which is also where a
+/// restore puts it back, and whether it was maximized. `borders` are the
+/// window's invisible resize borders when known.
+pub fn restore_frame(h: HWND, borders: Option<(i32, i32, i32, i32)>) -> Option<(macrust_ui::WinRect, bool)> {
+    use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, GetWindowPlacement, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, WINDOWPLACEMENT,
+        WPF_RESTORETOMAXIMIZED, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    };
+    let mut wp = WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+    unsafe { GetWindowPlacement(h, &mut wp).ok()? };
+    let mon = unsafe {
+        let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        // For a minimized window this is the monitor it was on before.
+        let _ = GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi);
+        mi
+    };
+    let rect = |r: RECT| macrust_ui::WinRect { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top };
+    if (wp.flags & WPF_RESTORETOMAXIMIZED).0 != 0 {
+        // A maximized frame fills the work area exactly.
+        return Some((rect(mon.rcWork), true));
+    }
+    let mut r = wp.rcNormalPosition;
+    let ex = unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) };
+    if ex & WS_EX_TOOLWINDOW.0 as isize == 0 {
+        // Workspace coordinates: relative to the work area, not the monitor.
+        let (dx, dy) = (mon.rcWork.left - mon.rcMonitor.left, mon.rcWork.top - mon.rcMonitor.top);
+        r = RECT { left: r.left + dx, top: r.top + dy, right: r.right + dx, bottom: r.bottom + dy };
+    }
+    let (l, t, rr, b) = borders.unwrap_or_else(|| unsafe {
+        if GetWindowLongPtrW(h, GWL_STYLE) & WS_THICKFRAME.0 as isize == 0 {
+            return (0, 0, 0, 0);
+        }
+        // The resize frame minus the 1 px border DWM draws visibly.
+        let dpi = GetDpiForWindow(h).max(96);
+        let f = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi) - 1;
+        (f, 0, f, f)
+    });
+    let r = RECT { left: r.left + l, top: r.top + t, right: r.right - rr, bottom: r.bottom - b };
+    (r.right > r.left && r.bottom > r.top).then(|| (rect(r), false))
 }
