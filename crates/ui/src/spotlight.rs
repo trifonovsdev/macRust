@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use tiny_skia::{FillRule, FilterQuality, Mask, Paint, Pattern, PathBuilder, Pixmap, Rect, SpreadMode, Transform};
 
-use crate::anim::Spring;
+use crate::anim::{Spring, Tween, ease_out, smoothstep};
 use crate::gfx::{self, Image, rgba};
 use crate::text::Weight;
 use crate::{Ctx, Key, Mods, WinRect, glyphs};
@@ -62,6 +62,11 @@ const MARGIN_TOP: f32 = 30.0;
 const MARGIN_BOTTOM: f32 = 70.0;
 const QUERY_FONT: f32 = 22.0;
 const BLINK: f32 = 0.53;
+/// Open and close are timed curves, not a spring: the opening spring
+/// overshot past 1, so the panel flipped between the crisp body and the
+/// resampled layer on its last frames, a visible twitch.
+const OPEN_S: f32 = 0.2;
+const CLOSE_S: f32 = 0.15;
 
 pub struct Spotlight {
     scale: f32,
@@ -73,7 +78,7 @@ pub struct Spotlight {
     rows: Vec<Row>,
     sel: usize,
     visible: bool,
-    open: Spring,
+    open: Tween,
     list: Spring,
     hl: Spring,
     scroll: Spring,
@@ -98,7 +103,7 @@ impl Spotlight {
             rows: Vec::new(),
             sel: 0,
             visible: false,
-            open: Spring::new(0.0, 0.3, 0.82).epsilon(0.001),
+            open: Tween::new(0.0),
             list: Spring::new(0.0, 0.28, 0.9).epsilon(0.002),
             hl: Spring::new(0.0, 0.16, 1.0).epsilon(0.002),
             scroll: Spring::new(0.0, 0.22, 1.0).epsilon(0.002),
@@ -134,7 +139,7 @@ impl Spotlight {
 
     /// True while the window must stay on screen (open, or fading out).
     pub fn shown(&self) -> bool {
-        self.visible || self.open.value > 0.001
+        self.visible || !self.open.settled() || self.open.value > 0.0
     }
 
     pub fn show(&mut self) {
@@ -142,8 +147,7 @@ impl Spotlight {
             return;
         }
         self.visible = true;
-        self.open = Spring::new(self.open.value, 0.3, 0.8).epsilon(0.001);
-        self.open.to(1.0);
+        self.open.to(1.0, OPEN_S, ease_out);
         self.all_selected = !self.query.is_empty();
         self.caret = self.query.len();
         self.blink = 0.0;
@@ -154,8 +158,7 @@ impl Spotlight {
             return;
         }
         self.visible = false;
-        self.open = Spring::new(self.open.value, 0.2, 1.0).epsilon(0.001);
-        self.open.to(0.0);
+        self.open.to(0.0, CLOSE_S, smoothstep);
     }
 
     pub fn query(&self) -> String {
@@ -424,7 +427,7 @@ impl Spotlight {
         }
         let Some(l) = layer.as_mut() else { return };
         self.draw_body_at(l, ctx, px, ptop);
-        let k = 0.96 + 0.04 * t.min(1.0) + (t - 1.0).max(0.0) * 0.04;
+        let k = 0.96 + 0.04 * t.clamp(0.0, 1.0);
         let cx = bx + BODY_W * s / 2.0;
         let (lx, ly) = (bx - px, by - ptop);
         // Scale about the panel's top center.
@@ -587,5 +590,33 @@ impl Spotlight {
 impl Default for Spotlight {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The panel only grows while opening and only shrinks while closing,
+    /// and each ends on an exact value, so the last frame is the crisp body.
+    #[test]
+    fn open_and_close_are_monotonic_and_end_exactly() {
+        let mut sp = Spotlight::new();
+        sp.show();
+        let mut last = 0.0;
+        for _ in 0..60 {
+            sp.update(1.0 / 120.0);
+            assert!(sp.open.value >= last && sp.open.value <= 1.0);
+            last = sp.open.value;
+        }
+        assert_eq!(sp.open.value, 1.0);
+        sp.hide();
+        for _ in 0..60 {
+            sp.update(1.0 / 120.0);
+            assert!(sp.open.value <= last && sp.open.value >= 0.0);
+            last = sp.open.value;
+        }
+        assert_eq!(sp.open.value, 0.0);
+        assert!(!sp.shown());
     }
 }

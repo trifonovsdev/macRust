@@ -1951,7 +1951,9 @@ impl App {
         }
         if self.spot.shown() {
             let caret = self.spot.caret_visible();
-            let sdt = (now - self.spot_clock).as_secs_f32();
+            // Capped: showing the panel (focus, the first query) can stall a
+            // frame, and an uncapped step jumped the opening forward.
+            let sdt = (now - self.spot_clock).as_secs_f32().min(1.0 / 30.0);
             self.spot_clock = now;
             let moving = self.spot.animating();
             self.spot.update(sdt);
