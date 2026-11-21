@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/ui", "crates/shell"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/trifonovsdev/macRust"
@@ -17,7 +17,9 @@ ab_glyph = "0.2"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# Unwind, not abort: a panic in a background thread (media, notifications)
+# must end only that feature, not the whole shell.
+panic = "unwind"
 strip = true
 
 # tiny-skia and the glyph rasterizer are unusably slow without optimizations.

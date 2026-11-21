@@ -23,6 +23,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
+    MB_ICONWARNING, MB_OK, MessageBoxW,
     DefWindowProcW, DispatchMessageW, GetMessageW, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
     PostMessageW, RegisterClassExW, TranslateMessage, WM_APP, WM_HOTKEY, WM_QUIT, WM_TIMER, WNDCLASSEXW,
 };
@@ -80,8 +81,17 @@ pub fn run() {
     // Leaving the taskbar hidden after a crash would strand the user, so any
     // panic puts it back before the process aborts.
     std::panic::set_hook(Box::new(|info| {
-        log(format!("panic: {info}"));
-        system::restore_taskbar();
+        let thread = std::thread::current().name().unwrap_or("?").to_string();
+        log(format!("panic in {thread}: {info}"));
+        // Background threads catch their panics and carry on without the
+        // feature; only the UI thread takes the shell down.
+        if thread == "main" {
+            system::restore_taskbar();
+            alert(&format!(
+                "macRust stopped because of an error:\n\n{info}\n\nDetails: {}",
+                util::data_dir().join("log.txt").display()
+            ));
+        }
     }));
 
     if let Some(pid) = args.iter().position(|a| a == "--watch").and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok()) {
@@ -104,6 +114,8 @@ pub fn run() {
     unsafe {
         let _ = CreateMutexW(None, true, w!("Local\\macRust.shell"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            log("another instance is running");
+            alert("macRust is already running.");
             return;
         }
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -123,6 +135,7 @@ pub fn run() {
     if system::taskbar_state_saved() {
         system::restore_taskbar();
     }
+    log(format!("starting {}", env!("CARGO_PKG_VERSION")));
     register_class();
     let app = App::new();
     APP.with(|cell| *cell.borrow_mut() = Some(app));
@@ -171,6 +184,13 @@ pub fn run() {
                 with_app(|a| a.frame());
             }
         }
+    }
+}
+
+fn alert(text: &str) {
+    let t = wide(text);
+    unsafe {
+        MessageBoxW(None, PCWSTR(t.as_ptr()), w!("macRust"), MB_OK | MB_ICONWARNING);
     }
 }
 
