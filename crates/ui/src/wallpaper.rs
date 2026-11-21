@@ -80,15 +80,14 @@ fn clear_level(screen: &Pixmap) -> (Vec<u8>, usize, usize) {
     let src = screen.data();
     let mut buf = vec![0u8; cw * ch * 4];
     for y in 0..ch {
+        let r0 = &src[(y * 2) * w * 4..][..w * 4];
+        let r1 = &src[(y * 2 + 1).min(h - 1) * w * 4..][..w * 4];
+        let out = &mut buf[y * cw * 4..][..cw * 4];
         for x in 0..cw {
-            let o = (y * cw + x) * 4;
+            let (a, b) = (x * 8, (x * 2 + 1).min(w - 1) * 4);
             for c in 0..4 {
-                let mut acc = 0u32;
-                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                    let (sx, sy) = ((x * 2 + dx).min(w - 1), (y * 2 + dy).min(h - 1));
-                    acc += src[(sy * w + sx) * 4 + c] as u32;
-                }
-                buf[o + c] = (acc / 4) as u8;
+                let acc = r0[a + c] as u32 + r0[b + c] as u32 + r1[a + c] as u32 + r1[b + c] as u32;
+                out[x * 4 + c] = (acc / 4) as u8;
             }
         }
     }
@@ -128,22 +127,27 @@ impl Vibrancy {
         let (lw, lh) = ((w / k).max(1), (h / k).max(1));
         let src = screen.data();
         let mut buf = vec![0u8; lw * lh * 4];
+        // Column sums per block row, then one division per output pixel.
+        let mut acc = vec![0u32; lw * 4];
         for ly in 0..lh {
-            for lx in 0..lw {
-                let mut acc = [0u32; 4];
-                let mut n = 0u32;
-                for y in ly * k..((ly + 1) * k).min(h) {
-                    for x in lx * k..((lx + 1) * k).min(w) {
-                        let i = (y * w + x) * 4;
-                        for c in 0..4 {
-                            acc[c] += src[i + c] as u32;
-                        }
-                        n += 1;
+            acc.fill(0);
+            let rows = (ly * k..((ly + 1) * k).min(h)).len() as u32;
+            for y in ly * k..((ly + 1) * k).min(h) {
+                let row = &src[y * w * 4..][..w * 4];
+                for (lx, a) in acc.chunks_exact_mut(4).enumerate() {
+                    for px in row[lx * k * 4..((lx + 1) * k).min(w) * 4].chunks_exact(4) {
+                        a[0] += px[0] as u32;
+                        a[1] += px[1] as u32;
+                        a[2] += px[2] as u32;
+                        a[3] += px[3] as u32;
                     }
                 }
+            }
+            for lx in 0..lw {
+                let n = rows * (lx * k..((lx + 1) * k).min(w)).len() as u32;
                 let o = (ly * lw + lx) * 4;
                 for c in 0..4 {
-                    buf[o + c] = (acc[c] / n.max(1)) as u8;
+                    buf[o + c] = (acc[lx * 4 + c] / n.max(1)) as u8;
                 }
             }
         }

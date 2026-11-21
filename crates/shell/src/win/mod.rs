@@ -1,6 +1,7 @@
 //! Windows host for the macRust shell.
 
 mod app;
+mod capture;
 mod catalog;
 mod config;
 mod icons;

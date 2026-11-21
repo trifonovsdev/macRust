@@ -138,23 +138,39 @@ pub fn box_blur(buf: &mut [u8], w: usize, h: usize, ch: usize, r: usize, passes:
         return;
     }
     let n = w.max(h) * ch;
-    let (mut src, mut dst) = (vec![0u8; n], vec![0u8; n]);
+    let mut src = vec![0u8; n];
     for _ in 0..passes {
         for y in 0..h {
             let row = &mut buf[y * w * ch..(y + 1) * w * ch];
             src[..w * ch].copy_from_slice(row);
             blur_line(&src[..w * ch], row, w, ch, r);
         }
-        for x in 0..w {
-            for y in 0..h {
-                let s = (y * w + x) * ch;
-                src[y * ch..y * ch + ch].copy_from_slice(&buf[s..s + ch]);
-            }
-            blur_line(&src[..h * ch], &mut dst[..h * ch], h, ch, r);
-            for y in 0..h {
-                let d = (y * w + x) * ch;
-                buf[d..d + ch].copy_from_slice(&dst[y * ch..y * ch + ch]);
-            }
+        blur_columns(buf, w, h, ch, r);
+    }
+}
+
+/// The vertical pass, row by row: one running sum per column keeps memory
+/// access sequential (a column-at-a-time walk was most of the blur's cost).
+fn blur_columns(buf: &mut [u8], w: usize, h: usize, ch: usize, r: usize) {
+    let stride = w * ch;
+    let win = (2 * r + 1) as u32;
+    let last = h as isize - 1;
+    let orig = buf.to_vec();
+    let row = |y: isize| &orig[(y.clamp(0, last) as usize) * stride..][..stride];
+    let mut sum = vec![0u32; stride];
+    for i in -(r as isize)..=(r as isize) {
+        for (s, &v) in sum.iter_mut().zip(row(i)) {
+            *s += v as u32;
+        }
+    }
+    for y in 0..h {
+        let out = &mut buf[y * stride..][..stride];
+        for (o, &s) in out.iter_mut().zip(&sum) {
+            *o = ((s + win / 2) / win) as u8;
+        }
+        let (add, sub) = (row(y as isize + r as isize + 1), row(y as isize - r as isize));
+        for ((s, &a), &b) in sum.iter_mut().zip(add).zip(sub) {
+            *s = *s + a as u32 - b as u32;
         }
     }
 }

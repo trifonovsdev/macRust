@@ -83,6 +83,9 @@ const TIMER_CARET: usize = 3;
 const TIMER_WINDOWS: usize = 4;
 const TIMER_BANNER: usize = 5;
 const TIMER_REPORT: usize = 6;
+const TIMER_BACKDROP: usize = 7;
+/// Live glass refresh: 30 Hz is smooth enough for what moves behind glass.
+const BACKDROP_MS: u32 = 33;
 const HOTKEY_SEARCH: i32 = 1;
 
 const TRASH: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}";
@@ -504,6 +507,9 @@ impl App {
             SetTimer(Some(app.bar_s.hwnd), TIMER_STATUS, 1000, None);
             // A fresh diagnostic report after every start, once things settle.
             SetTimer(Some(app.bar_s.hwnd), TIMER_REPORT, 20_000, None);
+            if app.x.capture.is_some() {
+                SetTimer(Some(app.bar_s.hwnd), TIMER_BACKDROP, BACKDROP_MS, None);
+            }
         }
         app.schedule_clock();
         app
@@ -1726,6 +1732,7 @@ impl App {
                 }
                 TIMER_CARET => self.spot_s.dirty = self.spot.shown(),
                 TIMER_BANNER => self.banner_timer(),
+                TIMER_BACKDROP => self.backdrop_tick(),
                 TIMER_REPORT => {
                     unsafe {
                         let _ = KillTimer(Some(self.bar_s.hwnd), TIMER_REPORT);

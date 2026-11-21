@@ -146,11 +146,21 @@ pub fn material(v: &Vibrancy, ox: f32, oy: f32, w: u32, h: u32, tint: Color) -> 
 }
 
 fn material_with(v: &Vibrancy, ox: f32, oy: f32, w: u32, h: u32, tint: Color, frost: bool) -> Option<Pixmap> {
+    material_in(v, ox, oy, w, h, tint, frost, (0, 0, w as i32, h as i32))
+}
+
+/// The material over a `w` x `h` window, filled only inside `area`
+/// (x0, y0, x1, y1): `draw` reads nothing outside the shape's bounds, and
+/// live glass rebuilds this on every change behind it.
+#[allow(clippy::too_many_arguments)]
+fn material_in(v: &Vibrancy, ox: f32, oy: f32, w: u32, h: u32, tint: Color, frost: bool, area: (i32, i32, i32, i32)) -> Option<Pixmap> {
     let mut pm = Pixmap::new(w.max(1), h.max(1))?;
     let t = premul(tint);
     let data = pm.data_mut();
-    for y in 0..h as usize {
-        for x in 0..w as usize {
+    let (x0, y0) = (area.0.clamp(0, w as i32) as usize, area.1.clamp(0, h as i32) as usize);
+    let (x1, y1) = (area.2.clamp(0, w as i32) as usize, area.3.clamp(0, h as i32) as usize);
+    for y in y0..y1 {
+        for x in x0..x1 {
             let (sx, sy) = (ox + x as f32 + 0.5, oy + y as f32 + 0.5);
             let c = if frost { v.sample_frost(sx, sy) } else { v.sample_clear(sx, sy) };
             let o = (y * w as usize + x) * 4;
@@ -245,11 +255,19 @@ pub fn draw(pm: &mut Pixmap, v: &Vibrancy, mat: &Pixmap, ox: f32, oy: f32, shape
 
 /// What lies behind a floating panel (a capture of the screen under it, or
 /// the wallpaper), with a material cache per tint. Window coordinates.
+#[derive(PartialEq)]
+struct MatKey {
+    tint: [u8; 4],
+    frost: bool,
+    size: (u32, u32),
+    area: (i32, i32, i32, i32),
+}
+
 pub struct Backdrop {
     pub vib: Vibrancy,
     /// Mean luminance 0..1: light backdrops get dark text.
     pub luma: f32,
-    mats: std::cell::RefCell<Vec<([u8; 4], bool, Pixmap)>>,
+    mats: std::cell::RefCell<Vec<(MatKey, Pixmap)>>,
 }
 
 impl Backdrop {
@@ -261,19 +279,25 @@ impl Backdrop {
 
     /// Draws a glass shape; `pm` must be the window the backdrop was taken for.
     pub fn draw(&self, pm: &mut Pixmap, shape: Shape, st: &GlassStyle) {
-        let key = st.tint.to_color_u8();
-        let key = [key.red(), key.green(), key.blue(), key.alpha()];
+        let c = st.tint.to_color_u8();
+        // The same bounds `draw` walks.
+        let area = (
+            shape.x.floor() as i32 - 1,
+            shape.y.floor() as i32 - 1,
+            (shape.x + shape.w).ceil() as i32 + 1,
+            (shape.y + shape.h).ceil() as i32 + 1,
+        );
+        let key = MatKey { tint: [c.red(), c.green(), c.blue(), c.alpha()], frost: st.frost, size: (pm.width(), pm.height()), area };
         let mut mats = self.mats.borrow_mut();
-        let hit = mats.iter().position(|(k, f, m)| *k == key && *f == st.frost && m.width() == pm.width() && m.height() == pm.height());
-        let i = match hit {
+        let i = match mats.iter().position(|(k, _)| *k == key) {
             Some(i) => i,
             None => {
-                let Some(m) = material_with(&self.vib, 0.0, 0.0, pm.width(), pm.height(), st.tint, st.frost) else { return };
-                mats.push((key, st.frost, m));
+                let Some(m) = material_in(&self.vib, 0.0, 0.0, pm.width(), pm.height(), st.tint, st.frost, area) else { return };
+                mats.push((key, m));
                 mats.len() - 1
             }
         };
-        draw(pm, &self.vib, &mats[i].2, 0.0, 0.0, shape, st);
+        draw(pm, &self.vib, &mats[i].1, 0.0, 0.0, shape, st);
     }
 }
 

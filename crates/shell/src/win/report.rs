@@ -71,6 +71,7 @@ impl App {
         );
         let _ = writeln!(info, "taskbar hidden: {}", self.taskbar_hidden);
         let _ = writeln!(info, "wallpaper: {}", system::wallpaper_kind());
+        let _ = writeln!(info, "live glass (desktop duplication): {}", self.x.capture.is_some());
 
         let _ = writeln!(info, "\n[dock]");
         for (key, t) in &self.targets {

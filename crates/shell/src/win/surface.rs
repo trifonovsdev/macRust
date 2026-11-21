@@ -56,6 +56,8 @@ impl Surface {
             )
             .expect("create layered window")
         };
+        // Our glass samples the screen; it must not sample itself.
+        super::capture::exclude_from_capture(hwnd);
         let dc = unsafe { CreateCompatibleDC(None) };
         Self {
             hwnd,

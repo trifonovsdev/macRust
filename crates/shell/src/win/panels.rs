@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use macrust_ui::control::{ControlCenter, ControlEvent, ControlState, NowPlayingView};
 use macrust_ui::gfx::Image;
@@ -14,9 +14,11 @@ use macrust_ui::notify::{Banner, NoteEvent, NoteView, NotificationCenter, Today}
 use macrust_ui::panel::MARGIN;
 use macrust_ui::theme::Theme;
 use macrust_ui::WinRect;
+use macrust_ui::tiny_skia::Pixmap;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, WS_EX_NOACTIVATE};
 
+use super::super::capture::Capture;
 use super::super::media::{ArtId, Command, Media, Snapshot};
 use super::super::notifications::{self, Toast, Update, Watcher};
 use super::super::surface::Surface;
@@ -51,6 +53,13 @@ pub(super) struct Extras {
     queue: VecDeque<Toast>,
     pub(super) privacy: (bool, bool),
     tick: u32,
+    /// Live screen under the glass; None when Desktop Duplication is unavailable
+    /// (then the glass keeps the picture taken when a panel opened).
+    pub(super) capture: Option<Capture>,
+    /// Per surface: hash of the last backdrop, to skip unchanged ones.
+    backdrop_hashes: HashMap<isize, u64>,
+    /// Earliest next live-glass update: heavy updates space themselves out.
+    backdrop_next: Instant,
 }
 
 impl Extras {
@@ -74,6 +83,9 @@ impl Extras {
             queue: VecDeque::new(),
             privacy: (false, false),
             tick: 0,
+            capture: Capture::new(),
+            backdrop_hashes: HashMap::new(),
+            backdrop_next: Instant::now(),
         }
     }
 
@@ -94,6 +106,14 @@ impl Extras {
     pub(super) fn owns(&self, h: HWND) -> bool {
         h == self.cc_s.hwnd || h == self.nc_s.hwnd || h == self.banner_s.hwnd
     }
+}
+
+/// A cheap fingerprint of a picture: every 61st pixel.
+fn sample_hash(pm: &Pixmap) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (pm.width(), pm.height()).hash(&mut h);
+    pm.data().chunks_exact(4).step_by(61).for_each(|p| p.hash(&mut h));
+    h.finish()
 }
 
 /// (dark glyph, light glyph) versions of a tray icon.
@@ -166,6 +186,65 @@ impl App {
         if self.x.tick.is_multiple_of(30) && self.x.nc.is_some() {
             self.refresh_note_views();
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Live glass
+
+    /// New screen content under a visible glass surface redraws its glass.
+    pub(super) fn backdrop_tick(&mut self) {
+        let t = Instant::now();
+        if t < self.x.backdrop_next {
+            return;
+        }
+        let Some(cap) = &mut self.x.capture else { return };
+        if !cap.poll() {
+            return;
+        }
+        let hashes = &mut self.x.backdrop_hashes;
+        let mut fresh = |cap: &mut Capture, s: &Surface| -> Option<Pixmap> {
+            if !s.shown {
+                return None;
+            }
+            let pm = cap.region(s.rect)?;
+            let h = sample_hash(&pm);
+            (hashes.insert(s.hwnd.0 as isize, h) != Some(h)).then_some(pm)
+        };
+        if let Some(pm) = fresh(cap, &self.dock_s) {
+            self.dock.set_backdrop(&pm);
+            self.dock_s.dirty = true;
+        }
+        if let Some(m) = &mut self.menu
+            && !m.closing()
+            && let Some(pm) = fresh(cap, &self.menu_s)
+        {
+            m.set_backdrop(&pm);
+            self.menu_s.dirty = true;
+        }
+        if let Some(c) = &mut self.x.cc
+            && !c.closing()
+            && let Some(pm) = fresh(cap, &self.x.cc_s)
+        {
+            c.set_backdrop(&pm);
+            self.x.cc_s.dirty = true;
+        }
+        if let Some(n) = &mut self.x.nc
+            && !n.closing()
+            && let Some(pm) = fresh(cap, &self.x.nc_s)
+        {
+            n.set_backdrop(&pm);
+            self.x.nc_s.dirty = true;
+        }
+        if let Some(b) = &mut self.x.banner
+            && let Some(pm) = fresh(cap, &self.x.banner_s)
+        {
+            b.set_backdrop(&pm);
+            self.x.banner_s.dirty = true;
+        }
+        self.render();
+        self.stat("backdrop", t);
+        // At most about a quarter of one core while things move behind glass.
+        self.x.backdrop_next = Instant::now() + t.elapsed() * 3;
     }
 
     // -------------------------------------------------------------------

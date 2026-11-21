@@ -118,6 +118,8 @@ pub struct Dock {
     initialized: bool,
     /// Blurred wallpaper + tint for this window: (vibrancy id, dark, rect) -> pixels.
     material: RefCell<Option<(MaterialKey, Pixmap)>>,
+    /// Live picture of what is behind the window; replaces the wallpaper.
+    backdrop: Option<glass::Backdrop>,
     pub events: Vec<DockEvent>,
 }
 
@@ -143,6 +145,7 @@ impl Dock {
             menu_open: false,
             initialized: false,
             material: RefCell::new(None),
+            backdrop: None,
             events: Vec::new(),
         }
     }
@@ -234,6 +237,11 @@ impl Dock {
             }
             s.bounce_hold = !s.e.running;
         }
+    }
+
+    /// What is behind the dock window right now, window-sized.
+    pub fn set_backdrop(&mut self, behind: &Pixmap) {
+        self.backdrop = Some(glass::Backdrop::new(behind));
     }
 
     pub fn set_menu_open(&mut self, open: bool) {
@@ -442,8 +450,9 @@ impl Dock {
 
         let radius = bh * 0.26;
         ctx.shadow(radius, 9.0 * s).draw(pm, bx, by + 3.0 * s, bw, bh, if th.dark { rgba(0, 0, 0, 0.30) } else { rgba(0, 0, 0, 0.10) });
-        match &ctx.vibrancy {
-            Some(v) => {
+        match (&self.backdrop, &ctx.vibrancy) {
+            (Some(b), _) => b.draw(pm, glass::Shape { x: bx, y: by, w: bw, h: bh, r: radius }, &GlassStyle::dock(th.dark, s)),
+            (None, Some(v)) => {
                 let key = (v.id, th.dark, wr);
                 let mut cache = self.material.borrow_mut();
                 if cache.as_ref().is_none_or(|(k, _)| *k != key) {
@@ -455,7 +464,7 @@ impl Dock {
                     glass::draw(pm, v, m, wr.x as f32, wr.y as f32, shape, &GlassStyle::dock(th.dark, s));
                 }
             }
-            None => {
+            (None, None) => {
                 if let Some(path) = gfx::squircle(bx, by, bw, bh, radius) {
                     gfx::fill(pm, &path, th.dock_fallback());
                     gfx::stroke(pm, &path, th.dock_border(), 1.0);

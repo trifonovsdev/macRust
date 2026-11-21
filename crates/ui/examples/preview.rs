@@ -524,4 +524,22 @@ fn main() {
         "frame cost at 2x: dock {dock_ms:.2} ms ({}x{}), spotlight opening {spot_ms:.2} ms ({}x{}), menu bar {bar_ms:.2} ms",
         dr.w, dr.h, r.w, r.h
     );
+    // Live glass: each change of what is behind the dock costs one backdrop.
+    let mut behind = Pixmap::new(dr.w as u32, dr.h as u32).unwrap();
+    behind.draw_pixmap(-dr.x, -dr.y, sc.wall.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    let t0 = Instant::now();
+    for _ in 0..10 {
+        let b = macrust_ui::glass::Backdrop::new(&behind);
+        b.draw(&mut dpm_probe(&dr), macrust_ui::glass::Shape { x: 0.0, y: 0.0, w: 100.0, h: 50.0, r: 10.0 }, &macrust_ui::glass::GlassStyle::dock(true, sc.scale));
+    }
+    println!("live backdrop for the dock at 2x: {:.2} ms", t0.elapsed().as_secs_f64() * 100.0);
+    let t0 = Instant::now();
+    for _ in 0..10 {
+        let _ = macrust_ui::wallpaper::Vibrancy::new(&behind);
+    }
+    println!("  of which blur levels: {:.2} ms", t0.elapsed().as_secs_f64() * 100.0);
+}
+
+fn dpm_probe(r: &WinRect) -> Pixmap {
+    Pixmap::new(r.w as u32, r.h as u32).unwrap()
 }
