@@ -26,10 +26,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::util::log;
 
 /// The press of the left button: WPARAM x, LPARAM y (physical screen px).
-pub const WM_APP_PRESS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 15;
+pub const WM_APP_PRESS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 17;
 /// Its release while a frame is staged, sent: the shell returns once the
 /// frame is on screen.
-pub const WM_APP_RELEASE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 16;
+pub const WM_APP_RELEASE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 18;
 
 /// Well below the system's low-level hook timeout (LowLevelHooksTimeout,
 /// 300 ms by default), past which Windows skips, then removes, the hook.

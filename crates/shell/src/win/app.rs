@@ -75,6 +75,7 @@ pub const WM_APP_MEDIA: u32 = WM_APP + 12;
 pub const WM_APP_NOTES: u32 = WM_APP + 13;
 pub const WM_APP_UPDATE: u32 = WM_APP + 14;
 pub const WM_APP_WIFI: u32 = WM_APP + 15;
+// WM_APP + 17 and + 18 are minbutton::WM_APP_PRESS / WM_APP_RELEASE.
 
 #[path = "panels.rs"]
 mod panels;
