@@ -390,7 +390,10 @@ impl NotificationCenter {
             let pressed = self.pressed == Some(Hit::Card(i));
             draw_card(pm, ctx, self.backdrop.as_ref(), &self.notes[i], x, cy, s, hovered, pressed);
         }
-        draw_calendar(pm, ctx, self.backdrop.as_ref(), self.today, x, cal_y, s);
+        // Under the date in the menu bar: the right end of the column. macOS
+        // fills widget rows from the left, but a lone small widget there sat
+        // half a column away from the clock that opened it (owner, 2026-11-21).
+        draw_calendar(pm, ctx, self.backdrop.as_ref(), self.today, x + (WIDTH - SMALL) * s, cal_y, s);
         panel::fade_all(pm, self.reveal.alpha());
     }
 }
