@@ -41,6 +41,8 @@ pub struct TrayIconView {
     pub id: u64,
     pub icon: Option<Rgba>,
     pub owner_exe: Option<String>,
+    /// The tooltip: the only way to tell Explorer's own icons apart.
+    pub tip: String,
 }
 
 /// Balloons are not reported: Windows turns them into toasts, which the
@@ -71,6 +73,7 @@ const NIM_SETVERSION: u32 = 4;
 
 const NIF_MESSAGE: u32 = 0x1;
 const NIF_ICON: u32 = 0x2;
+const NIF_TIP: u32 = 0x4;
 const NIF_STATE: u32 = 0x8;
 const NIF_GUID: u32 = 0x20;
 const NIS_HIDDEN: u32 = 0x1;
@@ -133,6 +136,7 @@ struct Icon {
     image: Option<Rgba>,
     rect: Option<RECT>,
     owner_exe: Option<String>,
+    tip: String,
 }
 
 impl Icon {
@@ -315,6 +319,7 @@ impl Tray {
                     id: i.id,
                     icon: i.image.clone(),
                     owner_exe: i.owner_exe.clone(),
+                    tip: i.tip.clone(),
                 })
                 .collect()
         })
@@ -549,6 +554,12 @@ fn handle_at(b: &[u8], off: usize) -> isize {
     u32_at(b, off) as i32 as isize
 }
 
+/// szTip: up to 128 UTF-16 units, NUL-terminated.
+fn tip_at(nid: &[u8]) -> String {
+    let units: Vec<u16> = nid[NID_TIP..NID_TIP + 256].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
+    String::from_utf16_lossy(&units)
+}
+
 fn guid_at(b: &[u8], off: usize) -> Option<[u8; 16]> {
     let g: [u8; 16] = b.get(off..off + 16)?.try_into().ok()?;
     (g != [0; 16]).then_some(g)
@@ -603,6 +614,7 @@ fn notify_icon(data: &[u8]) -> Option<bool> {
                         image: None,
                         rect: None,
                         owner_exe: process_path(pid),
+                        tip: String::new(),
                     });
                     s.icons.len() - 1
                 }
@@ -625,6 +637,9 @@ fn notify_icon(data: &[u8]) -> Option<bool> {
 
             if flags & NIF_MESSAGE != 0 {
                 icon.callback = u32_at(&nid, NID_CALLBACK);
+            }
+            if flags & NIF_TIP != 0 {
+                icon.tip = tip_at(&nid);
             }
             if flags & NIF_STATE != 0 {
                 let mask = u32_at(&nid, NID_STATE_MASK);

@@ -7,6 +7,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use macrust_ui::dock::{Dock, DockConfig, DockEntry, Fallback, Section};
+use macrust_ui::extras::Extra;
 use macrust_ui::gfx::{self, Image, rgba};
 use macrust_ui::menu::{MenuEntry, PopupMenu};
 use macrust_ui::control::{ControlCenter, ControlState, NowPlayingView};
@@ -110,7 +111,7 @@ fn macos_icon(pm: &Pixmap) -> Rc<Image> {
 }
 
 fn tpl(img: &Rc<Image>, rgb: [u8; 3]) -> Option<Rc<Image>> {
-    gfx::template(img.base(), rgb).map(|p| Rc::new(Image::new(p)))
+    Extra::convert(img.base()).and_then(|e| e.paint(rgb)).map(|p| Rc::new(Image::new(p)))
 }
 
 fn entries() -> Vec<DockEntry> {
@@ -670,8 +671,8 @@ fn bar_with(sc: &Scene, lang: &str, mic: bool, open: Option<BarItem>, tray_px: u
         .enumerate()
         .map(|(i, src)| TrayItem {
             id: i as u64 + 1,
-            icon_dark: gfx::template(src, [0, 0, 0]).map(|p| Rc::new(Image::new(p))),
-            icon_light: gfx::template(src, [255, 255, 255]).map(|p| Rc::new(Image::new(p))),
+            icon_dark: Extra::convert(src).and_then(|e| e.paint([0, 0, 0])).map(|p| Rc::new(Image::new(p))),
+            icon_light: Extra::convert(src).and_then(|e| e.paint([255, 255, 255])).map(|p| Rc::new(Image::new(p))),
             stamp: 1,
         })
         .collect();
