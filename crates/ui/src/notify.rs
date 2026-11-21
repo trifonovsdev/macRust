@@ -158,9 +158,10 @@ fn days_in(year: i32, month: usize) -> u32 {
 /// on a 46.5 pt baseline, dates from 64.5 pt on a 17.25 pt pitch, seven
 /// columns 18.46 pt apart centred in the widget, today a 17 pt disc.
 ///
-/// Rows and columns are laid out in whole device pixels from one rounded
-/// pitch, and glyphs keep their quarter-pixel x: rounding every cell on its
-/// own made 1x rows alternate 14/15 px and columns 18/19 px.
+/// Rows are laid out in whole device pixels from one rounded pitch (rounding
+/// each row on its own made 1x rows alternate 14/15 px). Each number starts
+/// on a whole pixel: quarter-pixel glyphs rendered some digits bolder or
+/// blurrier than their neighbours on the owner's 1x screen.
 #[allow(clippy::too_many_arguments)]
 fn draw_calendar(pm: &mut Pixmap, ctx: &Ctx, bd: Option<&Backdrop>, t: Today, x: f32, y: f32, s: f32) {
     let th = ctx.theme;
@@ -170,7 +171,7 @@ fn draw_calendar(pm: &mut Pixmap, ctx: &Ctx, bd: Option<&Backdrop>, t: Today, x:
     let st = ctx.strings;
     let fs = CAL_TEXT * s;
     let month = st.months_full[t.month % 12].to_uppercase();
-    ctx.text.draw(pm, &month, x + CAL_LEFT * s, (y + CAL_MONTH * s).round(), CAL_MONTH_TEXT * s, Weight::Bold, red, None);
+    ctx.text.draw(pm, &month, (x + CAL_LEFT * s).round(), (y + CAL_MONTH * s).round(), CAL_MONTH_TEXT * s, Weight::Bold, red, None);
     let col_pitch = CAL_COL * s;
     let col0 = x + size / 2.0 - 3.0 * col_pitch;
     let col_x = |c: usize| col0 + col_pitch * c as f32;
@@ -180,7 +181,7 @@ fn draw_calendar(pm: &mut Pixmap, ctx: &Ctx, bd: Option<&Backdrop>, t: Today, x:
     let dim = th.secondary();
     for (i, l) in st.week_letters.iter().enumerate() {
         let lw = ctx.text.measure(l, fs, Weight::Bold);
-        ctx.text.draw(pm, l, col_x(i) - lw / 2.0, (y + CAL_WEEKDAYS * s).round(), fs, Weight::Bold, dim, None);
+        ctx.text.draw(pm, l, (col_x(i) - lw / 2.0).round(), (y + CAL_WEEKDAYS * s).round(), fs, Weight::Bold, dim, None);
     }
     let first_wd = (t.weekday as i32 - (t.day as i32 - 1)).rem_euclid(7) as usize;
     let lead = (first_wd + 7 - st.week_start) % 7;
@@ -208,7 +209,7 @@ fn draw_calendar(pm: &mut Pixmap, ctx: &Ctx, bd: Option<&Backdrop>, t: Today, x:
         } else {
             label
         };
-        ctx.text.draw(pm, &text, cx - lw / 2.0, base, fs, Weight::Bold, c, None);
+        ctx.text.draw(pm, &text, (cx - lw / 2.0).round(), base, fs, Weight::Bold, c, None);
     }
 }
 

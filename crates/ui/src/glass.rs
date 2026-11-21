@@ -45,7 +45,9 @@ impl GlassStyle {
             refraction: 0.0,
             specular: 0.0,
             glow: 0.0,
-            frost: false,
+            // The light blur let icons behind a widget show as bright blobs;
+            // Tahoe's widget blur measured about 6 pt (TAHOE-CC-MOTION.md).
+            frost: true,
             widget: Some(dark),
         }
     }
