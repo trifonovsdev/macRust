@@ -72,17 +72,28 @@ impl Spring {
     }
 }
 
-pub const BOUNCE_PERIOD: f32 = 0.62;
+/// One launch hop as measured on macOS 26: a decelerating rise, a short hang
+/// at the top and an accelerating fall, without squash.
+pub const BOUNCE_RISE: f32 = 0.28;
+pub const BOUNCE_HANG: f32 = 0.12;
+pub const BOUNCE_FALL: f32 = 0.27;
+pub const BOUNCE_PERIOD: f32 = BOUNCE_RISE + BOUNCE_HANG + BOUNCE_FALL;
 
-/// Height (0..1 of the peak) of the dock launch bounce at `t` seconds.
-/// Every hop is the same ballistic parabola, as in macOS: no damping and no
-/// pause at the top or on the ground.
+/// Height (0..1 of the peak) of the dock launch bounce at `t` seconds; hops repeat.
 pub fn launch_bounce(t: f32) -> f32 {
     if t < 0.0 {
         return 0.0;
     }
-    let phase = (t / BOUNCE_PERIOD).fract();
-    (4.0 * phase * (1.0 - phase)).max(0.0)
+    let p = t % BOUNCE_PERIOD;
+    if p < BOUNCE_RISE {
+        let u = 1.0 - p / BOUNCE_RISE;
+        1.0 - u * u
+    } else if p < BOUNCE_RISE + BOUNCE_HANG {
+        1.0
+    } else {
+        let u = ((p - BOUNCE_RISE - BOUNCE_HANG) / BOUNCE_FALL).min(1.0);
+        1.0 - u * u
+    }
 }
 
 #[cfg(test)]
@@ -113,9 +124,15 @@ mod tests {
     }
 
     #[test]
-    fn bounce_starts_and_ends_on_the_ground() {
+    fn bounce_rises_hangs_and_falls() {
         assert!(launch_bounce(0.0) < 1e-3);
-        assert!((launch_bounce(BOUNCE_PERIOD / 2.0) - 1.0).abs() < 1e-3);
+        assert!((launch_bounce(BOUNCE_RISE) - 1.0).abs() < 1e-3);
+        assert!((launch_bounce(BOUNCE_RISE + BOUNCE_HANG * 0.5) - 1.0).abs() < 1e-6);
+        // Decelerating rise: more than half the height in the first half of the rise.
+        assert!(launch_bounce(BOUNCE_RISE * 0.5) > 0.7);
+        // Accelerating fall: still high halfway down in time.
+        assert!(launch_bounce(BOUNCE_RISE + BOUNCE_HANG + BOUNCE_FALL * 0.5) > 0.7);
         assert!(launch_bounce(BOUNCE_PERIOD * 0.999) < 0.02);
+        assert!((BOUNCE_PERIOD - 0.67).abs() < 1e-4);
     }
 }

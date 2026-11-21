@@ -76,6 +76,23 @@ fn fake_icon(top: Color, bottom: Color, mark: u8) -> Rc<Image> {
     Rc::new(Image::with_shadow(pm))
 }
 
+/// A Windows-style round logo with transparent corners, as `mac_icon` gets it.
+fn legacy_round() -> Rc<Image> {
+    let mut pm = Pixmap::new(256, 256).unwrap();
+    if let Some(c) = gfx::circle(128.0, 128.0, 120.0) {
+        gfx::fill(&mut pm, &c, rgba(40, 160, 230, 1.0));
+    }
+    macrust_ui::glyphs::play(&mut pm, 78.0, 78.0, 100.0, rgba(255, 255, 255, 1.0));
+    Rc::new(Image::with_shadow(gfx::mac_icon(&pm).unwrap()))
+}
+
+/// A classic Win32 glyph icon with transparency.
+fn legacy_glyph() -> Rc<Image> {
+    let mut pm = Pixmap::new(256, 256).unwrap();
+    macrust_ui::glyphs::document(&mut pm, 0.0, 0.0, 256.0);
+    Rc::new(Image::with_shadow(gfx::mac_icon(&pm).unwrap()))
+}
+
 fn tpl(img: &Rc<Image>, rgb: [u8; 3]) -> Option<Rc<Image>> {
     gfx::template(img.base(), rgb).map(|p| Rc::new(Image::new(p)))
 }
@@ -97,6 +114,8 @@ fn entries() -> Vec<DockEntry> {
         app("notes", "Заметки", fake_icon(rgba(255, 230, 120, 1.0), rgba(240, 180, 30, 1.0), 2), true),
         app("term", "Терминал", fake_icon(rgba(90, 90, 96, 1.0), rgba(30, 30, 34, 1.0), 5), false),
         app("settings", "Параметры", fake_icon(rgba(190, 190, 198, 1.0), rgba(120, 120, 130, 1.0), 3), false),
+        app("legacy", "Telegram", legacy_round(), true),
+        app("exe", "Старая программа", legacy_glyph(), false),
         DockEntry {
             key: "downloads".into(),
             label: "Загрузки".into(),
@@ -178,10 +197,7 @@ fn desktop(sc: &Scene, out: &str, name: &str, with_menu: bool, with_spot: bool, 
     dock.set_entries(entries());
     let dr = dock.window_rect();
     if let Some(t) = mouse_tile {
-        let tile = 52.0 * 1.13 * sc.scale;
-        let n = 9.0;
-        let x0 = dr.w as f32 / 2.0 - (n * tile + 16.0 * sc.scale) / 2.0;
-        dock.mouse_move(x0 + t * tile, dr.h as f32 - 30.0 * sc.scale);
+        dock.mouse_move(slot_x(&dock, sc.scale, t), dr.h as f32 - 30.0 * sc.scale);
         settle_dock(&mut dock);
     }
 
@@ -413,12 +429,105 @@ fn icon_sheet(out: &str) {
     for (i, src) in sources.iter().enumerate() {
         let x = (i as u32 * cell + 12) as i32;
         sheet.draw_pixmap(x, 12, src.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
-        for (row, dark) in [(1, false), (2, true)] {
-            let m = gfx::mac_icon(src, dark).unwrap();
+        let m = gfx::mac_icon(src).unwrap();
+        for row in [1, 2] {
             sheet.draw_pixmap(x, (row * cell + 12) as i32, m.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
         }
     }
     sheet.save_png(format!("{out}/icons.png")).unwrap();
+}
+
+/// Window x of slot `t` (fractional) of `entries()` in a resting dock.
+fn slot_x(dock: &Dock, scale: f32, t: f32) -> f32 {
+    let v = DockConfig::default().icon * 0.805 * scale;
+    let pitch = 1.31 * v;
+    let n = entries().len() as f32;
+    let x0 = dock.window_rect().w as f32 / 2.0 - (n * pitch + 0.63 * v) / 2.0;
+    x0 + (t + 0.5) * pitch + if t >= n - 2.0 { 0.63 * v } else { 0.0 }
+}
+
+/// Vertical cyan stripes like the macOS 26 wallpaper in the dark reference
+/// frame (pixel values sampled just above its dock).
+fn stripes_wall(w: u32, h: u32) -> Pixmap {
+    let mut pm = Pixmap::new(w, h).unwrap();
+    let cols: [[f32; 3]; 4] = [[40.0, 175.0, 226.0], [27.0, 156.0, 211.0], [0.0, 120.0, 176.0], [16.0, 117.0, 181.0]];
+    let data = pm.data_mut();
+    for x in 0..w as usize {
+        // Stripes 20 px wide drifting through four tones across the screen.
+        let band = (x / 20) % 4;
+        let c = cols[band];
+        let shade = 0.9 + 0.1 * ((x % 20) as f32 / 19.0);
+        for y in 0..h as usize {
+            let o = (y * w as usize + x) * 4;
+            for k in 0..3 {
+                data[o + k] = (c[k] * shade) as u8;
+            }
+            data[o + 3] = 255;
+        }
+    }
+    pm
+}
+
+fn flat_wall(w: u32, h: u32, c: [u8; 3]) -> Pixmap {
+    let mut pm = Pixmap::new(w, h).unwrap();
+    pm.fill(Color::from_rgba8(c[0], c[1], c[2], 255));
+    pm
+}
+
+fn scene_on(wall: Pixmap, scale: f32, dark: bool) -> Scene {
+    let mut ctx = Ctx::new(Text::bundled(), Theme { dark }, &Strings::RU);
+    ctx.vibrancy = Some(Vibrancy::new(&wall));
+    let (w, h) = (wall.width() as f32, wall.height() as f32);
+    Scene { ctx, wall, w, h, scale }
+}
+
+/// Dock crops for comparison with the macOS 26 reference frames: at rest,
+/// with a label, with a pressed icon, bouncing and with an item sliding in.
+fn dock_studies(sc: &Scene, out: &str, name: &str) {
+    let mut dock = Dock::new(DockConfig::default());
+    dock.set_screen(sc.w, sc.h, sc.scale);
+    dock.set_entries(entries());
+    // The dock takes a live capture of what is behind it, as in the shell.
+    let dr = dock.window_rect();
+    let mut behind = Pixmap::new(dr.w as u32, dr.h as u32).unwrap();
+    behind.draw_pixmap(-dr.x, -dr.y, sc.wall.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    dock.set_backdrop(&behind);
+    crop_dock(sc, out, &format!("{name}-rest"), &dock);
+    let y = dr.h as f32 - 30.0 * sc.scale;
+    dock.mouse_move(slot_x(&dock, sc.scale, 2.0), y);
+    settle_dock(&mut dock);
+    crop_dock(sc, out, &format!("{name}-label"), &dock);
+    dock.mouse_down(slot_x(&dock, sc.scale, 2.0), y);
+    crop_dock(sc, out, &format!("{name}-pressed"), &dock);
+    dock.mouse_move(slot_x(&dock, sc.scale, 9.0), y);
+    settle_dock(&mut dock);
+    crop_dock(sc, out, &format!("{name}-label-stack"), &dock);
+    dock.mouse_leave();
+    settle_dock(&mut dock);
+    // One hop, sampled at 60 fps like the reference sheet.
+    dock.bounce("mail");
+    for f in 0..=42 {
+        if f % 3 == 0 {
+            crop_dock(sc, out, &format!("{name}-bounce-{f:02}"), &dock);
+        }
+        for _ in 0..2 {
+            dock.update(1.0 / 120.0);
+        }
+    }
+    settle_dock(&mut dock);
+    // An item slides in, sampled at 30 fps like the reference sheet.
+    let mut e = entries();
+    let new = e.remove(3);
+    dock.set_entries(e.clone());
+    settle_dock(&mut dock);
+    e.insert(3, new);
+    dock.set_entries(e);
+    for f in 0..=14 {
+        crop_dock(sc, out, &format!("{name}-insert-{f:02}"), &dock);
+        for _ in 0..4 {
+            dock.update(1.0 / 120.0);
+        }
+    }
 }
 
 fn crop_dock(sc: &Scene, out: &str, name: &str, dock: &Dock) {
@@ -660,6 +769,17 @@ fn main() {
     }
 
     icon_sheet(&out);
+    dock_studies(&scene_on(stripes_wall(3840, 2160), 2.0, true), &out, "dock-dark-cyan");
+    dock_studies(&scene_on(flat_wall(1920, 1080, [0, 0, 0]), 1.0, true), &out, "dock-dark-black");
+    dock_studies(&scene_on(flat_wall(2560, 1440, [17, 83, 130]), 2.0, false), &out, "dock-light-blue");
+    // Real wallpapers, e.g. reference frames with their dock painted out.
+    for (var, dark, name) in [("PREVIEW_DOCK_BACKDROP", true, "dock-ref-dark"), ("PREVIEW_DOCK_BACKDROP_LIGHT", false, "dock-ref-light")] {
+        if let Ok(path) = std::env::var(var)
+            && let Ok(wall) = Pixmap::load_png(&path)
+        {
+            dock_studies(&scene_on(wall, 2.0, dark), &out, name);
+        }
+    }
     let retina_light = scene(2880, 1800, 2.0, false);
     desktop(&retina_light, &out, "desktop-light", true, false, None);
     desktop(&retina_light, &out, "desktop-light-hover", false, false, Some(2.4));

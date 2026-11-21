@@ -29,17 +29,16 @@ pub struct GlassStyle {
 }
 
 impl GlassStyle {
+    /// The dock as measured on macOS 26: the backdrop darkened to about 0.78
+    /// with its hue kept (dark) or lifted by about 13% white (light), no
+    /// bevel, highlight or lens; the edge is a hairline drawn by `rim`.
     pub fn dock(dark: bool, scale: f32) -> Self {
         Self {
-            tint: if dark {
-                Color::from_rgba8(18, 18, 22, 92)
-            } else {
-                Color::from_rgba8(255, 255, 255, 56)
-            },
-            bevel: 13.0 * scale,
-            refraction: 11.0 * scale,
-            specular: if dark { 0.55 } else { 0.85 },
-            glow: if dark { 0.05 } else { 0.10 },
+            tint: if dark { Color::from_rgba8(0, 0, 0, 56) } else { Color::from_rgba8(255, 255, 255, 33) },
+            bevel: scale.max(1.0),
+            refraction: 0.0,
+            specular: 0.0,
+            glow: 0.0,
             frost: false,
         }
     }
@@ -295,6 +294,44 @@ pub fn draw(pm: &mut Pixmap, v: &Vibrancy, mat: &Pixmap, ox: f32, oy: f32, shape
                 dst[o + k] = (rgb[k] * cov + dst[o + k] as f32 * inv + 0.5).min(255.0) as u8;
             }
             dst[o + 3] = (255.0 * cov + dst[o + 3] as f32 * inv + 0.5).min(255.0) as u8;
+        }
+    }
+}
+
+/// Lightness added along the inside of a shape's edge, in 0..255 steps:
+/// `top` on the upper edge, `bottom` on the lower one and `side` on the
+/// vertical sides, blended by the edge normal. `width` px, at least one.
+/// Negative values darken. This is the hairline rim of macOS 26 glass.
+pub fn rim(pm: &mut Pixmap, shape: Shape, top: f32, bottom: f32, side: f32, width: f32) {
+    let width = width.max(1.0);
+    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+    let x0 = (shape.x.floor() as i32 - 1).clamp(0, pw);
+    let x1 = ((shape.x + shape.w).ceil() as i32 + 1).clamp(0, pw);
+    let y0 = (shape.y.floor() as i32 - 1).clamp(0, ph);
+    let y1 = ((shape.y + shape.h).ceil() as i32 + 1).clamp(0, ph);
+    let cx = shape.x + shape.w * 0.5;
+    let stride = pw as usize * 4;
+    let dst = pm.data_mut();
+    for y in y0..y1 {
+        let fy = y as f32 + 0.5;
+        let (in0, in1) = match shape.inner_half_span(fy, width + 1.0) {
+            Some(hs) => (((cx - hs).ceil() as i32).clamp(x0, x1), ((cx + hs).floor() as i32).clamp(x0, x1)),
+            None => (x1, x1),
+        };
+        for x in (x0..in0.min(x1)).chain(in1.max(in0)..x1) {
+            let (d, _, ny) = shape.sdf(x as f32 + 0.5, fy);
+            // Overlap of this pixel with the band [-width, 0] of the distance.
+            let band = ((d + 0.5).min(0.0) - (d - 0.5).max(-width)).clamp(0.0, 1.0);
+            if band <= 0.0 {
+                continue;
+            }
+            let l = if ny < 0.0 { top * -ny } else { bottom * ny } + side * (1.0 - ny.abs());
+            let o = y as usize * stride + x as usize * 4;
+            let a = dst[o + 3] as f32;
+            let add = l * band * a / 255.0;
+            for k in 0..3 {
+                dst[o + k] = (dst[o + k] as f32 + add).clamp(0.0, a).round() as u8;
+            }
         }
     }
 }

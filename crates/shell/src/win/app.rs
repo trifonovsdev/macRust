@@ -58,7 +58,7 @@ pub const WM_APP_ICON: u32 = WM_APP + 3;
 pub const WM_APP_CATALOG: u32 = WM_APP + 4;
 pub const WM_APP_DISMISS: u32 = WM_APP + 5;
 pub const WM_APP_MENUKEY: u32 = WM_APP + 6;
-pub const WM_APP_TRASH: u32 = WM_APP + 7;
+// WM_APP + 7 is free.
 pub const WM_APP_TASKBAR: u32 = WM_APP + 8;
 // WM_APP + 10 is system::WM_APPBAR.
 pub const WM_APP_TRAY: u32 = WM_APP + 11;
@@ -90,7 +90,6 @@ const TIMER_BACKDROP: usize = 7;
 const BACKDROP_MS: u32 = 33;
 const HOTKEY_SEARCH: i32 = 1;
 
-const TRASH: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}";
 const KEY_DOWNLOADS: &str = "special:downloads";
 const KEY_TRASH: &str = "special:trash";
 
@@ -213,7 +212,6 @@ pub struct App {
     targets: HashMap<String, DockTarget>,
     dock_icons: HashMap<String, Rc<Image>>,
     /// Source pixels of the dock icons, to reshape them when the theme changes.
-    dock_raw: HashMap<String, icons::Rgba>,
     dock_failed: HashMap<String, Instant>,
     last_appbar_place: Option<Instant>,
     small_icons: HashMap<String, Option<Rc<Image>>>,
@@ -338,9 +336,9 @@ fn image_from(rgba: icons::Rgba, shadow: bool) -> Option<Rc<Image>> {
 }
 
 /// An app icon in the macOS 26 shape (squircle tile or plate).
-fn app_image(rgba: &icons::Rgba, dark: bool, shadow: bool) -> Option<Rc<Image>> {
+fn app_image(rgba: &icons::Rgba, shadow: bool) -> Option<Rc<Image>> {
     let pm = system::pixmap_from_rgba(rgba.w, rgba.h, rgba.data.clone())?;
-    let pm = macrust_ui::gfx::mac_icon(&pm, dark).unwrap_or(pm);
+    let pm = macrust_ui::gfx::mac_icon(&pm).unwrap_or(pm);
     Some(Rc::new(if shadow { Image::with_shadow(pm) } else { Image::new(pm) }))
 }
 
@@ -466,7 +464,6 @@ impl App {
             fg_name: String::new(),
             targets: HashMap::new(),
             dock_icons: HashMap::new(),
-            dock_raw: HashMap::new(),
             dock_failed: HashMap::new(),
             last_appbar_place: None,
             small_icons: HashMap::new(),
@@ -599,18 +596,6 @@ impl App {
         None
     }
 
-    /// Icon plates follow the appearance.
-    fn reshape_icons(&mut self) {
-        let dark = self.ctx.theme.dark;
-        for (k, r) in &self.dock_raw {
-            if let Some(img) = app_image(r, dark, true) {
-                self.dock_icons.insert(k.clone(), img);
-            }
-        }
-        self.small_icons.retain(|k, _| !k.starts_with("note:"));
-        self.rebuild_dock();
-    }
-
     fn refresh_windows(&mut self) {
         let previous = std::mem::take(&mut self.running);
         self.running = tracker::snapshot(&mut self.names);
@@ -718,11 +703,12 @@ impl App {
         }
         if let Some(dl) = known_folder(&FOLDERID_Downloads) {
             let path = dl.to_string_lossy().into_owned();
-            let icon = self.dock_icon(&path);
+            // Downloads and Trash are drawn by the dock in the macOS 26 manner,
+            // not taken from the Windows shell.
             entries.push(DockEntry {
                 key: KEY_DOWNLOADS.into(),
                 label: self.ctx.strings.downloads.into(),
-                icon,
+                icon: None,
                 running: false,
                 section: Section::Stacks,
                 fallback: Fallback::Folder,
@@ -739,11 +725,10 @@ impl App {
                 },
             );
         }
-        let icon = self.dock_icon(TRASH);
         entries.push(DockEntry {
             key: KEY_TRASH.into(),
             label: self.ctx.strings.trash.into(),
-            icon,
+            icon: None,
             running: false,
             section: Section::Stacks,
             fallback: Fallback::Trash,
@@ -1159,7 +1144,6 @@ impl App {
                 std::thread::spawn(|| unsafe {
                     let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
                     let _ = SHEmptyRecycleBinW(None, PCWSTR::null(), 0);
-                    notify(WM_APP_TRASH, 0);
                 });
             }
             t if t >= T_WINDOW_BASE => {
@@ -1277,16 +1261,12 @@ impl App {
         while let Ok((id, rgba)) = self.icon_worker.rx.try_recv() {
             let Some((key, dock)) = self.icon_reqs.remove(&id) else { continue };
             self.icon_pending.remove(&key);
-            let dark = self.ctx.theme.dark;
             if dock {
                 // Folders and the recycle bin keep their own shape, as on a Mac.
                 let special = key.starts_with("::") || std::path::Path::new(&key).is_dir();
-                let img = rgba.as_ref().and_then(|r| if special { image_from(r.clone(), true) } else { app_image(r, dark, true) });
+                let img = rgba.as_ref().and_then(|r| if special { image_from(r.clone(), true) } else { app_image(r, true) });
                 match img {
                     Some(img) => {
-                        if !special && let Some(r) = rgba {
-                            self.dock_raw.insert(key.clone(), r);
-                        }
                         self.dock_icons.insert(key, img);
                         dock_changed = true;
                     }
@@ -1297,7 +1277,7 @@ impl App {
                 continue;
             }
             let img = if key.starts_with("note:") {
-                rgba.as_ref().and_then(|r| app_image(r, dark, false))
+                rgba.as_ref().and_then(|r| app_image(r, false))
             } else {
                 rgba.and_then(|r| image_from(r, false))
             };
@@ -1792,10 +1772,6 @@ impl App {
                 }
                 self.refresh_foreground();
             }
-            WM_APP_TRASH => {
-                self.dock_icons.remove(&TRASH.to_lowercase());
-                self.rebuild_dock();
-            }
             WM_APP_TASKBAR => {
                 if self.taskbar_hidden {
                     system::keep_taskbar_hidden();
@@ -1857,7 +1833,7 @@ impl App {
                     if dark != self.ctx.theme.dark {
                         self.ctx.theme = Theme { dark };
                         self.configure(false);
-                        self.reshape_icons();
+                        self.rebuild_dock();
                     }
                 }
             }

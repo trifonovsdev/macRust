@@ -43,12 +43,6 @@ impl Theme {
     pub fn dock_fallback(&self) -> Color {
         if self.dark { rgba(40, 40, 42, 0.86) } else { rgba(236, 236, 238, 0.82) }
     }
-    pub fn dock_border(&self) -> Color {
-        if self.dark { rgba(0, 0, 0, 0.35) } else { rgba(0, 0, 0, 0.08) }
-    }
-    pub fn indicator(&self) -> Color {
-        if self.dark { rgba(255, 255, 255, 0.62) } else { rgba(0, 0, 0, 0.5) }
-    }
     pub fn tooltip(&self) -> Color {
         if self.dark { rgba(44, 44, 46, 0.94) } else { rgba(240, 240, 242, 0.94) }
     }
