@@ -409,3 +409,78 @@ pub fn fill_from(pm: &mut Pixmap, path: &Path, src: &Pixmap) {
     let shader = tiny_skia::Pattern::new(src.as_ref(), tiny_skia::SpreadMode::Pad, FilterQuality::Nearest, 1.0, Transform::identity());
     fill_shader(pm, path, shader);
 }
+
+// ---------------------------------------------------------------------------
+// macOS 26 icon shape
+
+/// Fits an app icon into the macOS 26 icon shape. Icons that already fill a
+/// square tile are cut to the squircle; any other shape (round logos, glyphs
+/// with transparency) sits on a neutral plate, as macOS does with icons that
+/// do not follow its grid. Returns a square pixmap of `src`'s larger side.
+pub fn mac_icon(src: &Pixmap, dark: bool) -> Option<Pixmap> {
+    let (w, h) = (src.width() as usize, src.height() as usize);
+    let n = w.max(h) as f32;
+    let data = src.data();
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0usize, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            if data[(y * w + x) * 4 + 3] > 24 {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x + 1);
+                y1 = y1.max(y + 1);
+            }
+        }
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let (bw, bh) = ((x1 - x0) as f32, (y1 - y0) as f32);
+    let mut opaque = 0usize;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if data[(y * w + x) * 4 + 3] > 200 {
+                opaque += 1;
+            }
+        }
+    }
+    let fill = opaque as f32 / (bw * bh);
+    let square = (bw / bh - 1.0).abs() < 0.08;
+    let tile = square && bw.min(bh) >= n * 0.6 && fill >= 0.86;
+
+    // Apple's grid: the shape is 824/1024 of the canvas, corner radius 0.225 of it.
+    let size = n * 0.805;
+    let inset = (n - size) / 2.0;
+    let shape = squircle(inset, inset, size, size, size * 0.225)?;
+    let mut out = Pixmap::new(n as u32, n as u32)?;
+    let quality = PixmapPaint { quality: FilterQuality::Bicubic, ..PixmapPaint::default() };
+    if tile {
+        let mut mask = tiny_skia::Mask::new(n as u32, n as u32)?;
+        mask.fill_path(&shape, FillRule::Winding, true, Transform::identity());
+        // A hair larger than the shape, so the tile's own corners never show inside ours.
+        let k = size * 1.02 / bw.min(bh);
+        let o = inset - size * 0.01;
+        let t = Transform::from_row(k, 0.0, 0.0, k, o - x0 as f32 * k, o - y0 as f32 * k);
+        out.draw_pixmap(0, 0, src.as_ref(), &quality, t, Some(&mask));
+        return Some(out);
+    }
+    let (top, bottom, edge) = if dark {
+        (rgba(64, 64, 68, 1.0), rgba(36, 36, 40, 1.0), rgba(255, 255, 255, 0.12))
+    } else {
+        (rgba(255, 255, 255, 1.0), rgba(228, 228, 234, 1.0), rgba(0, 0, 0, 0.08))
+    };
+    if let Some(sh) = tiny_skia::LinearGradient::new(
+        tiny_skia::Point::from_xy(0.0, inset),
+        tiny_skia::Point::from_xy(0.0, inset + size),
+        vec![tiny_skia::GradientStop::new(0.0, top), tiny_skia::GradientStop::new(1.0, bottom)],
+        tiny_skia::SpreadMode::Pad,
+        Transform::identity(),
+    ) {
+        fill_shader(&mut out, &shape, sh);
+    }
+    stroke(&mut out, &shape, edge, (n / 256.0).max(1.0));
+    let k = size * 0.64 / bw.max(bh);
+    let t = Transform::from_row(k, 0.0, 0.0, k, n / 2.0 - (x0 as f32 + bw / 2.0) * k, n / 2.0 - (y0 as f32 + bh / 2.0) * k);
+    out.draw_pixmap(0, 0, src.as_ref(), &quality, t, None);
+    Some(out)
+}

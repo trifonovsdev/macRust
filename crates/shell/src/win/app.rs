@@ -190,6 +190,8 @@ pub struct App {
     fg_name: String,
     targets: HashMap<String, DockTarget>,
     dock_icons: HashMap<String, Rc<Image>>,
+    /// Source pixels of the dock icons, to reshape them when the theme changes.
+    dock_raw: HashMap<String, icons::Rgba>,
     dock_failed: HashMap<String, Instant>,
     last_appbar_place: Option<Instant>,
     small_icons: HashMap<String, Option<Rc<Image>>>,
@@ -309,6 +311,13 @@ fn icon_size_for(scale: f32) -> i32 {
 
 fn image_from(rgba: icons::Rgba, shadow: bool) -> Option<Rc<Image>> {
     let pm = system::pixmap_from_rgba(rgba.w, rgba.h, rgba.data)?;
+    Some(Rc::new(if shadow { Image::with_shadow(pm) } else { Image::new(pm) }))
+}
+
+/// An app icon in the macOS 26 shape (squircle tile or plate).
+fn app_image(rgba: &icons::Rgba, dark: bool, shadow: bool) -> Option<Rc<Image>> {
+    let pm = system::pixmap_from_rgba(rgba.w, rgba.h, rgba.data.clone())?;
+    let pm = macrust_ui::gfx::mac_icon(&pm, dark).unwrap_or(pm);
     Some(Rc::new(if shadow { Image::with_shadow(pm) } else { Image::new(pm) }))
 }
 
@@ -433,6 +442,7 @@ impl App {
             fg_name: String::new(),
             targets: HashMap::new(),
             dock_icons: HashMap::new(),
+            dock_raw: HashMap::new(),
             dock_failed: HashMap::new(),
             last_appbar_place: None,
             small_icons: HashMap::new(),
@@ -556,6 +566,18 @@ impl App {
         self.icon_reqs.insert(id, (key, true));
         self.icon_worker.request(Request { id, parse_name: parse_name.to_string(), size: 256, thumbnail: false });
         None
+    }
+
+    /// Icon plates follow the appearance.
+    fn reshape_icons(&mut self) {
+        let dark = self.ctx.theme.dark;
+        for (k, r) in &self.dock_raw {
+            if let Some(img) = app_image(r, dark, true) {
+                self.dock_icons.insert(k.clone(), img);
+            }
+        }
+        self.small_icons.retain(|k, _| !k.starts_with("note:"));
+        self.rebuild_dock();
     }
 
     fn refresh_windows(&mut self) {
@@ -1170,9 +1192,16 @@ impl App {
         while let Ok((id, rgba)) = self.icon_worker.rx.try_recv() {
             let Some((key, dock)) = self.icon_reqs.remove(&id) else { continue };
             self.icon_pending.remove(&key);
+            let dark = self.ctx.theme.dark;
             if dock {
-                match rgba.and_then(|r| image_from(r, true)) {
+                // Folders and the recycle bin keep their own shape, as on a Mac.
+                let special = key.starts_with("::") || std::path::Path::new(&key).is_dir();
+                let img = rgba.as_ref().and_then(|r| if special { image_from(r.clone(), true) } else { app_image(r, dark, true) });
+                match img {
                     Some(img) => {
+                        if !special && let Some(r) = rgba {
+                            self.dock_raw.insert(key.clone(), r);
+                        }
                         self.dock_icons.insert(key, img);
                         dock_changed = true;
                     }
@@ -1182,7 +1211,11 @@ impl App {
                 }
                 continue;
             }
-            let img = rgba.and_then(|r| image_from(r, false));
+            let img = if key.starts_with("note:") {
+                rgba.as_ref().and_then(|r| app_image(r, dark, false))
+            } else {
+                rgba.and_then(|r| image_from(r, false))
+            };
             if let Some(img) = &img {
                 for (i, k) in self.row_icon_keys.iter().enumerate() {
                     if k.as_deref() == Some(key.as_str()) {
@@ -1694,8 +1727,12 @@ impl App {
                 if wp.0 == SPI_SETDESKWALLPAPER {
                     self.configure(true);
                 } else if topic == "ImmersiveColorSet" && self.settings.appearance == "auto" {
-                    self.ctx.theme = Theme { dark: system::system_dark() };
-                    self.configure(true);
+                    let dark = system::system_dark();
+                    if dark != self.ctx.theme.dark {
+                        self.ctx.theme = Theme { dark };
+                        self.configure(false);
+                        self.reshape_icons();
+                    }
                 }
             }
             WM_POWERBROADCAST => self.refresh_status(),

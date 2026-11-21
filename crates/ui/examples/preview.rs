@@ -365,6 +365,44 @@ fn panels(sc: &Scene, out: &str, name: &str) {
     screen.save_png(format!("{out}/{name}-banner.png")).unwrap();
 }
 
+/// Windows-style icons before and after `mac_icon`, light and dark plates.
+fn icon_sheet(out: &str) {
+    let n = 256u32;
+    let mut sources = Vec::new();
+    // A round logo (Telegram, Chrome style).
+    let mut round = Pixmap::new(n, n).unwrap();
+    if let Some(c) = gfx::circle(128.0, 128.0, 112.0) {
+        gfx::fill(&mut round, &c, rgba(40, 160, 230, 1.0));
+    }
+    macrust_ui::glyphs::play(&mut round, 78.0, 78.0, 100.0, rgba(255, 255, 255, 1.0));
+    sources.push(round);
+    // A bare glyph with transparency (classic Win32 exe icon).
+    let mut glyph = Pixmap::new(n, n).unwrap();
+    macrust_ui::glyphs::folder(&mut glyph, 20.0, 30.0, 216.0);
+    sources.push(glyph);
+    // A full square tile with small rounding (UWP / Win11 style).
+    let mut tile = Pixmap::new(n, n).unwrap();
+    if let Some(r) = gfx::squircle(8.0, 8.0, 240.0, 240.0, 30.0) {
+        gfx::fill(&mut tile, &r, rgba(120, 80, 220, 1.0));
+    }
+    macrust_ui::glyphs::logo(&mut tile, 68.0, 68.0, 120.0, rgba(255, 255, 255, 1.0));
+    sources.push(tile);
+    let cell = 280;
+    let mut sheet = Pixmap::new(cell * 3, cell * 3).unwrap();
+    for (row, bg) in [rgba(236, 236, 240, 1.0), rgba(236, 236, 240, 1.0), rgba(30, 30, 34, 1.0)].iter().enumerate() {
+        gfx::fill_rect(&mut sheet, 0.0, (row as u32 * cell) as f32, (cell * 3) as f32, cell as f32, *bg);
+    }
+    for (i, src) in sources.iter().enumerate() {
+        let x = (i as u32 * cell + 12) as i32;
+        sheet.draw_pixmap(x, 12, src.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        for (row, dark) in [(1, false), (2, true)] {
+            let m = gfx::mac_icon(src, dark).unwrap();
+            sheet.draw_pixmap(x, (row * cell + 12) as i32, m.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        }
+    }
+    sheet.save_png(format!("{out}/icons.png")).unwrap();
+}
+
 fn crop_dock(sc: &Scene, out: &str, name: &str, dock: &Dock) {
     let dr = dock.window_rect();
     let mut bg = Pixmap::new(dr.w as u32, dr.h as u32).unwrap();
@@ -379,6 +417,7 @@ fn main() {
     let out = std::env::args().nth(1).unwrap_or_else(|| "out".into());
     std::fs::create_dir_all(&out).unwrap();
 
+    icon_sheet(&out);
     let retina_light = scene(2880, 1800, 2.0, false);
     desktop(&retina_light, &out, "desktop-light", true, false, None);
     desktop(&retina_light, &out, "desktop-light-hover", false, false, Some(2.4));
