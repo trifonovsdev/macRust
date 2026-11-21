@@ -9,8 +9,9 @@ use std::rc::Rc;
 
 use tiny_skia::{Color, FilterQuality, Path, PathBuilder, Pattern, Pixmap, SpreadMode, Transform};
 
+use crate::anim::{Tween, smoothstep};
 use crate::gfx::{self, Image, rgba};
-use crate::glass::Backdrop;
+use crate::glass::{self, Backdrop, Rim, Shape};
 use crate::panel::{MARGIN, inside};
 use crate::text::Weight;
 use crate::{Ctx, WinRect, glyphs};
@@ -106,8 +107,17 @@ const TRACK_Y: f32 = 40.25;
 const TRACK: f32 = 4.5;
 const BUTTON_X: f32 = 250.0;
 const BUTTON: f32 = 22.0;
-/// Tahoe shows the stack at once; closing was not measured, so it is a short fade.
-const CLOSE_SECS: f32 = 0.12;
+/// Opening, measured at 50 fps on four Tahoe 26 captures
+/// (TAHOE-CC-MOTION.md section 2): labels, discs and glyphs fade in along an
+/// ease-out over 0.20 s while the glass modules (and the dimming around
+/// them) follow a smoothstep over 0.18 s, so the white discs lead and the
+/// tinted glass catches up. Tahoe closes within one frame; closing here plays
+/// the opening backwards (the owner found the instant cut abrupt).
+const OPEN_CONTENT: f32 = 0.20;
+const OPEN_GLASS: f32 = 0.18;
+/// On/off fill of a toggle: not caught on video (NF); it reuses the
+/// opening's content curve.
+const TOGGLE_SECS: f32 = 0.20;
 /// While open the desktop behind the stack dims: x0.83 between modules,
 /// about x0.9 just outside, gone a few points further out.
 const HALO: f32 = 0.17;
@@ -123,7 +133,11 @@ pub struct ControlCenter {
     material: RefCell<Option<(bool, Pixmap)>>,
     halo: RefCell<Option<Pixmap>>,
     pill_w: Cell<f32>,
-    closing: Option<f32>,
+    /// Seconds along the opening; closing runs it back to zero.
+    phase: f32,
+    closing: bool,
+    /// 0 = off, 1 = on: Wi-Fi disc, Bluetooth disc, Dark Mode circle.
+    toggles: [Tween; 3],
     hover: Option<Hit>,
     pressed: Option<Hit>,
     dragging: Option<Hit>,
@@ -132,6 +146,7 @@ pub struct ControlCenter {
 
 impl ControlCenter {
     pub fn new(state: ControlState, scale: f32) -> Self {
+        let toggles = toggle_targets(&state).map(Tween::new);
         Self {
             scale,
             display: state.brightness.is_some(),
@@ -140,7 +155,9 @@ impl ControlCenter {
             material: RefCell::new(None),
             halo: RefCell::new(None),
             pill_w: Cell::new(90.0 * scale),
-            closing: None,
+            phase: 0.0,
+            closing: false,
+            toggles,
             hover: None,
             pressed: None,
             dragging: None,
@@ -165,6 +182,13 @@ impl ControlCenter {
             st.brightness = self.state.brightness;
         }
         self.state = st;
+        self.sync_toggles();
+    }
+
+    fn sync_toggles(&mut self) {
+        for (t, on) in self.toggles.iter_mut().zip(toggle_targets(&self.state)) {
+            t.to(on, TOGGLE_SECS, ease_out_quad);
+        }
     }
 
     fn rows(&self) -> f32 {
@@ -201,26 +225,27 @@ impl ControlCenter {
     }
 
     pub fn close(&mut self) {
-        if self.closing.is_none() {
-            self.closing = Some(0.0);
-        }
+        self.closing = true;
     }
     pub fn closing(&self) -> bool {
-        self.closing.is_some()
+        self.closing
     }
     pub fn finished(&self) -> bool {
-        self.closing.is_some_and(|t| t >= CLOSE_SECS)
+        self.closing && self.phase <= 0.0
     }
     pub fn animating(&self) -> bool {
-        self.closing.is_some() && !self.finished()
+        let moving = if self.closing { self.phase > 0.0 } else { self.phase < OPEN_CONTENT };
+        moving || self.toggles.iter().any(|t| !t.settled())
     }
     pub fn update(&mut self, dt: f32) {
-        if let Some(t) = &mut self.closing {
-            *t += dt;
+        self.phase = if self.closing { self.phase.min(OPEN_CONTENT) - dt } else { (self.phase + dt).min(OPEN_CONTENT) }.max(0.0);
+        for t in &mut self.toggles {
+            t.step(dt);
         }
     }
-    fn alpha(&self) -> f32 {
-        self.closing.map_or(1.0, |t| (1.0 - t / CLOSE_SECS).clamp(0.0, 1.0))
+    /// Opacity of the glass layer and of the content layer.
+    fn reveal(&self) -> (f32, f32) {
+        (smoothstep(self.phase / OPEN_GLASS), ease_out_quad(self.phase / OPEN_CONTENT))
     }
 
     /// Top-left of the stack in the window, whole pixels.
@@ -375,6 +400,7 @@ impl ControlCenter {
             Hit::Display | Hit::Sound => None,
         };
         self.events.extend(ev);
+        self.sync_toggles();
     }
 
     /// The module material over the whole stack: the blurred backdrop with its
@@ -410,7 +436,7 @@ impl ControlCenter {
         }
     }
 
-    /// A module: the material inside `path` and a hairline rim.
+    /// A module: the material inside `path` and the lit 1 pt rim.
     fn module(&self, pm: &mut Pixmap, ctx: &Ctx, r: R, radius: f32, pressed: bool) {
         let dark = ctx.theme.dark;
         let Some(path) = rrect(r.0, r.1, r.2, r.3, radius) else { return };
@@ -421,10 +447,7 @@ impl ControlCenter {
         if pressed {
             gfx::fill(pm, &path, rgba(0, 0, 0, 0.14));
         }
-        let lw = (0.5 * self.scale).max(1.0);
-        if let Some(p) = rrect(r.0 + lw / 2.0, r.1 + lw / 2.0, r.2 - lw, r.3 - lw, radius - lw / 2.0) {
-            gfx::stroke(pm, &p, rgba(255, 255, 255, if dark { 0.2 } else { 0.45 }), lw);
-        }
+        glass::lit_rim(pm, Shape { x: r.0, y: r.1, w: r.2, h: r.3, r: radius.min(r.2 / 2.0).min(r.3 / 2.0) }, Rim::module(dark), self.scale);
     }
 
     /// Vibrant ink over module `r`: luminance `lum` (0..255) carrying
@@ -454,16 +477,67 @@ impl ControlCenter {
     }
 
     pub fn draw(&self, pm: &mut Pixmap, ctx: &Ctx) {
-        let s = self.scale;
-        let st = &self.state;
         let dark = ctx.theme.dark;
-        self.draw_halo(pm);
         {
             let mut m = self.material.borrow_mut();
             if m.as_ref().is_none_or(|(d, p)| *d != dark || p.width() != pm.width() || p.height() != pm.height()) {
                 *m = self.build_material(pm.width(), pm.height(), dark).map(|p| (dark, p));
             }
         }
+        let fs = TITLE * self.scale;
+        let tw = ctx.text.measure(ctx.strings.control_settings, fs, Weight::Medium);
+        self.pill_w.set((tw + 21.0 * self.scale).round());
+        let (glass_a, content_a) = self.reveal();
+        self.draw_halo(pm);
+        self.draw_glass(pm, ctx);
+        crate::panel::fade_all(pm, glass_a);
+        if content_a >= 0.999 {
+            self.draw_content(pm, ctx);
+        } else if content_a > 0.0
+            && let Some(mut layer) = Pixmap::new(pm.width(), pm.height())
+        {
+            self.draw_content(&mut layer, ctx);
+            crate::panel::fade_all(&mut layer, content_a);
+            pm.draw_pixmap(0, 0, layer.as_ref(), &tiny_skia::PixmapPaint::default(), Transform::identity(), None);
+        }
+    }
+
+    /// Whether `h` is held down with the pointer still on it.
+    fn lit(&self, h: Hit) -> bool {
+        self.pressed == Some(h) && self.hover == Some(h)
+    }
+
+    fn rect(&self, h: Hit) -> R {
+        self.layout().into_iter().find(|(k, _)| *k == h).map(|(_, r)| r).unwrap_or_default()
+    }
+
+    /// Every glass module: the layer that fades in behind the content.
+    fn draw_glass(&self, pm: &mut Pixmap, ctx: &Ctx) {
+        let s = self.scale;
+        for (row, label) in [(0.0, Hit::WifiLabel), (1.0, Hit::BluetoothLabel)] {
+            self.module(pm, ctx, self.cell(0.0, row, 2.0, 1.0), RADIUS * s, self.lit(label));
+        }
+        self.module(pm, ctx, self.cell(2.0, 0.0, 2.0, 2.0), RADIUS * s, false);
+        for h in [Hit::Dark, Hit::Shot, Hit::Calc, Hit::Lock] {
+            let r = self.rect(h);
+            self.module(pm, ctx, r, r.2 / 2.0, self.lit(h) && h != Hit::Dark);
+        }
+        let mut sliders = vec![Hit::Sound];
+        if self.display {
+            sliders.insert(0, Hit::Display);
+        }
+        for h in sliders {
+            self.module(pm, ctx, self.slider(h), RADIUS * s, false);
+        }
+        let p = self.pill();
+        self.module(pm, ctx, p, p.3 / 2.0, self.lit(Hit::Edit));
+    }
+
+    /// Labels, discs, glyphs and slider fills over the glass.
+    fn draw_content(&self, pm: &mut Pixmap, ctx: &Ctx) {
+        let s = self.scale;
+        let st = &self.state;
+        let dark = ctx.theme.dark;
         // Measured BB label colours over a (113,39,72) module: title (255,230,250),
         // status (240,186,212), transport (250,183,212): white text tinted by the module.
         // Light modules sit at a higher luminance, so their labels go whiter.
@@ -473,8 +547,9 @@ impl ControlCenter {
         let accent = ctx.theme.accent();
         let l = self.layout();
         let rect = |h: Hit| l.iter().find(|(k, _)| *k == h).map(|(_, r)| *r).unwrap_or_default();
-        let lit = |h: Hit| self.pressed == Some(h) && self.hover == Some(h);
+        let lit = |h: Hit| self.lit(h);
         let off_disc = rgba(255, 255, 255, if dark { 0.14 } else { 0.22 });
+        let on_disc = rgba(255, 253, 255, 1.0);
 
         // Wi-Fi and Bluetooth: a disc, a title and a status that may wrap.
         let wifi_sub = match &st.wifi {
@@ -484,27 +559,22 @@ impl ControlCenter {
         };
         let bt_on = st.bluetooth.unwrap_or(false);
         let bt_sub = if bt_on { ctx.strings.on } else { ctx.strings.off };
-        let wifi_on = st.wifi.as_ref().is_some_and(|w| w.0);
-        let wifi_idle = wifi_on && st.wifi.as_ref().is_some_and(|w| w.1.is_none());
-        for (row, disc, label, title, sub, on) in [
-            (0.0, Hit::Wifi, Hit::WifiLabel, ctx.strings.wifi, wifi_sub.as_str(), wifi_on),
-            (1.0, Hit::Bluetooth, Hit::BluetoothLabel, ctx.strings.bluetooth, bt_sub, bt_on),
+        let wifi_idle = st.wifi.as_ref().is_some_and(|w| w.1.is_none());
+        for (row, disc, title, sub, on) in [
+            (0.0, Hit::Wifi, ctx.strings.wifi, wifi_sub.as_str(), self.toggles[0].value),
+            (1.0, Hit::Bluetooth, ctx.strings.bluetooth, bt_sub, self.toggles[1].value),
         ] {
             let m = self.cell(0.0, row, 2.0, 1.0);
-            self.module(pm, ctx, m, RADIUS * s, lit(label));
             let d = rect(disc);
             let (cx, cy) = (d.0 + d.2 / 2.0, d.1 + d.3 / 2.0);
             if let Some(p) = gfx::circle(cx, cy, d.2 / 2.0) {
-                gfx::fill(pm, &p, if on { rgba(255, 253, 255, 1.0) } else { off_disc });
+                gfx::fill(pm, &p, mix(off_disc, on_disc, on));
                 if lit(disc) {
                     gfx::fill(pm, &p, rgba(0, 0, 0, 0.12));
                 }
             }
-            let gc = match (on, disc == Hit::Wifi && wifi_idle) {
-                (true, true) => rgba(190, 190, 194, 1.0),
-                (true, false) => accent,
-                _ => glyph_ink(m),
-            };
+            let on_glyph = if disc == Hit::Wifi && wifi_idle { rgba(190, 190, 194, 1.0) } else { accent };
+            let gc = mix(glyph_ink(m), on_glyph, on);
             if disc == Hit::Wifi {
                 wifi(pm, cx, cy, 16.0 * s, gc);
             } else {
@@ -529,25 +599,30 @@ impl ControlCenter {
 
         self.now_playing(pm, ctx, &rect, &lit);
 
-        // Appearance, screen capture, calculator, lock.
+        // Appearance, screen capture, calculator, lock. Dark Mode on is a
+        // white circle over its module.
         for h in [Hit::Dark, Hit::Shot, Hit::Calc, Hit::Lock] {
             let r = rect(h);
-            let on = h == Hit::Dark && st.dark;
+            let on = if h == Hit::Dark { self.toggles[2].value } else { 0.0 };
             let (cx, cy) = (r.0 + r.2 / 2.0, r.1 + r.3 / 2.0);
-            if on {
-                if let Some(p) = gfx::circle(cx, cy, r.2 / 2.0) {
-                    gfx::fill(pm, &p, rgba(255, 253, 255, 1.0));
-                    if lit(h) {
-                        gfx::fill(pm, &p, rgba(0, 0, 0, 0.12));
-                    }
+            if on > 0.0
+                && let Some(p) = gfx::circle(cx, cy, r.2 / 2.0)
+            {
+                gfx::fill(pm, &p, rgba(255, 253, 255, on));
+                if lit(h) {
+                    gfx::fill(pm, &p, rgba(0, 0, 0, 0.12 * on));
                 }
-            } else {
-                self.module(pm, ctx, r, r.2 / 2.0, lit(h));
             }
-            let c = if on { accent } else { glyph_ink(r) };
+            if h == Hit::Dark && lit(h) && on < 1.0 {
+                // The module's own press shade, under a half-faded disc.
+                if let Some(p) = rrect(r.0, r.1, r.2, r.3, r.2 / 2.0) {
+                    gfx::fill(pm, &p, rgba(0, 0, 0, 0.14 * (1.0 - on)));
+                }
+            }
+            let c = mix(glyph_ink(r), accent, on);
             match h {
                 Hit::Dark => appearance(pm, cx, cy, 20.0 * s, c),
-                Hit::Shot => viewfinder(pm, cx, cy, 23.0 * s, c, if on { c } else { sub_ink(r) }),
+                Hit::Shot => viewfinder(pm, cx, cy, 23.0 * s, c, sub_ink(r)),
                 Hit::Calc => {
                     let g = 24.0 * s;
                     glyphs::calculator_glyph(pm, cx - g / 2.0, cy - g / 2.0, g, c);
@@ -568,7 +643,6 @@ impl ControlCenter {
         sliders.push((Hit::Sound, Hit::SoundButton, ctx.strings.sound, vol));
         for (h, button, label, v) in sliders {
             let m = self.slider(h);
-            self.module(pm, ctx, m, RADIUS * s, false);
             ctx.text.draw(pm, label, m.0 + 16.0 * s, m.1 + 23.5 * s, TITLE * s, Weight::Bold, title_ink(m), None);
             let t = self.track(h);
             if let Some(p) = rrect(t.0, t.1, t.2, t.3, t.3 / 2.0) {
@@ -605,21 +679,16 @@ impl ControlCenter {
         // The text pill under the stack (Tahoe's "Edit Controls").
         let fs = TITLE * s;
         let tw = ctx.text.measure(ctx.strings.control_settings, fs, Weight::Medium);
-        self.pill_w.set((tw + 21.0 * s).round());
         let p = self.pill();
-        self.module(pm, ctx, p, p.3 / 2.0, lit(Hit::Edit));
         let base = p.1 + p.3 / 2.0 + ctx.text.cap_height(fs) / 2.0;
         let ink = self.vibrant(p, if dark { 185.0 } else { 215.0 }, 1.4);
         ctx.text.draw(pm, ctx.strings.control_settings, p.0 + (p.2 - tw) / 2.0, base, fs, Weight::Medium, ink, None);
-
-        crate::panel::fade_all(pm, self.alpha());
     }
 
     fn now_playing(&self, pm: &mut Pixmap, ctx: &Ctx, rect: &dyn Fn(Hit) -> R, lit: &dyn Fn(Hit) -> bool) {
         let s = self.scale;
         let st = &self.state;
         let np = self.cell(2.0, 0.0, 2.0, 2.0);
-        self.module(pm, ctx, np, RADIUS * s, false);
         let art = 37.5 * s;
         let (ax, ay) = (np.0 + 13.0 * s, np.1 + 12.5 * s);
         let text_w = np.2 - 26.0 * s;
@@ -688,14 +757,34 @@ impl ControlCenter {
 }
 
 /// Dark: luminance pulled to about 58/255 (measured: (60,12,37) -> (96,42,68),
-/// (156,7,72) -> (194,11,90)); light: to about 120/255. The frosted level is
-/// already saturated x1.6, so `sat` brings the net chroma to about x1.2.
+/// (156,7,72) -> (194,11,90)). Light (four 50 fps Tahoe captures over a blue
+/// wallpaper, before vs after opening): `L' = 0.5 L + 45` (L 174 -> 132,
+/// L 60 -> 74) with the chroma x1.25. The frosted level is already saturated
+/// x1.6, so `sat` brings the net chroma to x1.2 (dark) and x1.25 (light).
 fn lift(c: [f32; 3], dark: bool) -> [u8; 4] {
-    let (target, k, sat) = if dark { (58.0, 0.9, 0.75) } else { (120.0, 0.7, 0.62) };
+    let (target, k, sat) = if dark { (58.0, 0.9, 0.75) } else { (90.0, 0.5, 0.78) };
     let y = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
     let ny = y + (target - y) * k;
     let ch = |v: f32| (ny + (v - y) * sat).clamp(0.0, 255.0).round() as u8;
     [ch(c[0]), ch(c[1]), ch(c[2]), 255]
+}
+
+fn ease_out_quad(u: f32) -> f32 {
+    let v = 1.0 - u.clamp(0.0, 1.0);
+    1.0 - v * v
+}
+
+/// Targets of the three toggles for `st`.
+fn toggle_targets(st: &ControlState) -> [f32; 3] {
+    let on = |b: bool| if b { 1.0 } else { 0.0 };
+    [on(st.wifi.as_ref().is_some_and(|w| w.0)), on(st.bluetooth.unwrap_or(false)), on(st.dark)]
+}
+
+/// Straight-alpha mix of two colours.
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let f = |x: f32, y: f32| x + (y - x) * t;
+    Color::from_rgba(f(a.red(), b.red()), f(a.green(), b.green()), f(a.blue(), b.blue()), f(a.alpha(), b.alpha())).unwrap_or(b)
 }
 
 /// Premultiplied black that is `HALO` over the stack's box and fades out
@@ -955,13 +1044,33 @@ mod tests {
     }
 
     #[test]
-    fn closing_is_a_short_fade_and_opening_is_instant() {
+    fn opening_fades_in_as_measured_and_closing_reverses_it() {
         let mut c = cc(None);
-        assert!(!c.animating() && c.alpha() == 1.0);
-        c.close();
-        c.update(0.06);
-        assert!(c.animating() && c.alpha() < 0.6);
+        assert!(c.animating() && c.reveal() == (0.0, 0.0));
         c.update(0.1);
+        let (glass, content) = c.reveal();
+        // Content leads the glass: 0.75 vs 0.62 half way through.
+        assert!((content - 0.75).abs() < 0.01 && glass > 0.55 && glass < content);
+        c.update(0.2);
+        assert!(!c.animating() && c.reveal() == (1.0, 1.0));
+        c.close();
+        c.update(0.1);
+        assert!(c.animating() && !c.finished());
+        c.update(0.11);
         assert!(c.finished());
+    }
+
+    #[test]
+    fn toggles_cross_fade() {
+        let mut c = cc(None);
+        c.update(0.3);
+        let l = c.layout();
+        let bt = l.iter().find(|(k, _)| *k == Hit::Bluetooth).map(|(_, r)| *r).unwrap();
+        assert_eq!(click(&mut c, bt), [ControlEvent::Bluetooth(true)]);
+        assert!(c.animating() && c.toggles[1].value == 0.0);
+        c.update(0.1);
+        assert!((c.toggles[1].value - 0.75).abs() < 0.01);
+        c.update(0.1);
+        assert!(!c.animating() && c.toggles[1].value == 1.0);
     }
 }

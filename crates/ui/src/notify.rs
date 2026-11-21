@@ -8,7 +8,7 @@ use tiny_skia::Pixmap;
 
 use crate::anim::Spring;
 use crate::gfx::{self, Image, rgba};
-use crate::glass::{self, Backdrop, GlassStyle, Shape};
+use crate::glass::{self, Backdrop, GlassStyle, Rim, Shape};
 use crate::panel::{self, MARGIN, Reveal, inside};
 use crate::text::Weight;
 use crate::{Ctx, glyphs};
@@ -54,6 +54,15 @@ const ICON: f32 = 34.0;
 const GAP: f32 = 8.0;
 const HEADER: f32 = 30.0;
 const CAL_H: f32 = SMALL;
+/// Calendar widget, pt (BB 26.0 at 2 px/pt, widget x 705-1012, y 86-393):
+/// month cap 7.5 pt, weekday and date caps 7-7.25 pt.
+const CAL_LEFT: f32 = 17.5;
+const CAL_MONTH: f32 = 29.5;
+const CAL_MONTH_TEXT: f32 = 10.3;
+const CAL_WEEKDAYS: f32 = 46.5;
+const CAL_TEXT: f32 = 10.0;
+const CAL_COL: f32 = 18.46;
+const CAL_DISC: f32 = 17.0;
 const TITLE: f32 = 13.0;
 const BODY: f32 = 13.0;
 const LINE: f32 = 17.0;
@@ -68,9 +77,9 @@ fn card_h(ctx: &Ctx, n: &NoteView, s: f32) -> f32 {
     ((CARD_PAD * 2.0 + 16.0 + lines * LINE) * s).max((CARD_PAD * 2.0 + ICON) * s)
 }
 
-/// A card's or widget's material: glass over the captured backdrop (or a
-/// plain fill without one) and the 0.5 pt rim, lighter at the bottom in dark
-/// mode and at the top in light mode.
+/// A card's or widget's material: the measured widget glass over the captured
+/// backdrop (or a plain fill without one) and the lit 1 pt rim. No outer ring
+/// or shadow: none shows around Tahoe's widgets.
 #[allow(clippy::too_many_arguments)]
 fn plate(pm: &mut Pixmap, ctx: &Ctx, bd: Option<&Backdrop>, x: f32, y: f32, w: f32, h: f32, r: f32, s: f32) {
     let dark = ctx.theme.dark;
@@ -78,14 +87,11 @@ fn plate(pm: &mut Pixmap, ctx: &Ctx, bd: Option<&Backdrop>, x: f32, y: f32, w: f
     match bd {
         Some(b) => b.draw(pm, shape, &GlassStyle::card(dark, s)),
         None => {
-            let fill = if dark { rgba(30, 30, 32, 0.92) } else { rgba(250, 250, 252, 0.94) };
+            let fill = if dark { rgba(17, 17, 18, 0.92) } else { rgba(250, 250, 252, 0.94) };
             glass::hairline(pm, shape, 0.0, 1e4, fill, fill);
         }
     }
-    let ring = if dark { rgba(0, 0, 0, 0.35) } else { rgba(0, 0, 0, 0.06) };
-    glass::hairline(pm, shape, -1.0, 0.0, ring, ring);
-    let (top, bottom) = if dark { (rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.26)) } else { (rgba(255, 255, 255, 0.9), rgba(255, 255, 255, 0.4)) };
-    glass::hairline(pm, shape, 0.0, 0.5 * s, top, bottom);
+    glass::lit_rim(pm, shape, Rim::widget(dark), s);
 }
 
 /// One notification card; `close` draws the dismiss button on its corner.
@@ -147,9 +153,14 @@ fn days_in(year: i32, month: usize) -> u32 {
     }
 }
 
-/// The small month widget, measured on Tahoe 26.0: month name, weekday
-/// letters, then the dates on a 18.5 pt column pitch; today is a filled disc
-/// and the weekend columns are dimmer.
+/// The small month widget, measured on Tahoe 26.0 (BB, 2 px/pt; TAHOE-CC-MOTION.md
+/// section 6): month name cap top 22 pt and baseline 29.5 pt, weekday letters
+/// on a 46.5 pt baseline, dates from 64.5 pt on a 17.25 pt pitch, seven
+/// columns 18.46 pt apart centred in the widget, today a 17 pt disc.
+///
+/// Rows and columns are laid out in whole device pixels from one rounded
+/// pitch, and glyphs keep their quarter-pixel x: rounding every cell on its
+/// own made 1x rows alternate 14/15 px and columns 18/19 px.
 #[allow(clippy::too_many_arguments)]
 fn draw_calendar(pm: &mut Pixmap, ctx: &Ctx, bd: Option<&Backdrop>, t: Today, x: f32, y: f32, s: f32) {
     let th = ctx.theme;
@@ -157,34 +168,37 @@ fn draw_calendar(pm: &mut Pixmap, ctx: &Ctx, bd: Option<&Backdrop>, t: Today, x:
     plate(pm, ctx, bd, x, y, size, size, WIDGET_R * s, s);
     let red = rgba(227, 49, 65, 1.0);
     let st = ctx.strings;
-    let fs = 10.0 * s;
+    let fs = CAL_TEXT * s;
     let month = st.months_full[t.month % 12].to_uppercase();
-    ctx.text.draw(pm, &month, (x + 17.5 * s).round(), (y + 28.5 * s).round(), fs, Weight::Bold, red, None);
-    let col_x = |c: usize| x + (20.75 + 18.5 * c as f32) * s;
+    ctx.text.draw(pm, &month, x + CAL_LEFT * s, (y + CAL_MONTH * s).round(), CAL_MONTH_TEXT * s, Weight::Bold, red, None);
+    let col_pitch = CAL_COL * s;
+    let col0 = x + size / 2.0 - 3.0 * col_pitch;
+    let col_x = |c: usize| col0 + col_pitch * c as f32;
     // Columns of Saturday and Sunday.
     let weekend = |c: usize| matches!((c + st.week_start) % 7, 0 | 6);
     let label = th.label();
     let dim = th.secondary();
     for (i, l) in st.week_letters.iter().enumerate() {
         let lw = ctx.text.measure(l, fs, Weight::Bold);
-        ctx.text.draw(pm, l, (col_x(i) - lw / 2.0).round(), (y + 46.0 * s).round(), fs, Weight::Bold, dim, None);
+        ctx.text.draw(pm, l, col_x(i) - lw / 2.0, (y + CAL_WEEKDAYS * s).round(), fs, Weight::Bold, dim, None);
     }
     let first_wd = (t.weekday as i32 - (t.day as i32 - 1)).rem_euclid(7) as usize;
-    let col0 = (first_wd + 7 - st.week_start) % 7;
+    let lead = (first_wd + 7 - st.week_start) % 7;
     let days = days_in(t.year, t.month);
-    let rows = (col0 + days as usize).div_ceil(7);
-    // Five rows sit 17.25 pt apart; six start higher and close up to end on
-    // the same last baseline.
-    let (first, pitch) = if rows > 5 { (60.5, 14.5) } else { (64.0, 17.25) };
+    let rows = (lead + days as usize).div_ceil(7);
+    let (first, pitch) = cal_rows(rows);
+    let first = (y + first * s).round();
+    let pitch = (pitch * s).round();
+    let cap = ctx.text.cap_height(fs);
     for d in 1..=days {
-        let cell = col0 + d as usize - 1;
+        let cell = lead + d as usize - 1;
         let (col, row) = (cell % 7, cell / 7);
         let cx = col_x(col);
-        let base = (y + (first + row as f32 * pitch) * s).round();
+        let base = first + row as f32 * pitch;
         let text = d.to_string();
         let lw = ctx.text.measure(&text, fs, Weight::Bold);
         let today = d == t.day;
-        if today && let Some(p) = gfx::circle(cx, base - ctx.text.cap_height(fs) / 2.0, 8.25 * s) {
+        if today && let Some(p) = gfx::circle(cx, base - cap / 2.0, CAL_DISC / 2.0 * s) {
             gfx::fill(pm, &p, red);
         }
         let c = if today {
@@ -194,7 +208,20 @@ fn draw_calendar(pm: &mut Pixmap, ctx: &Ctx, bd: Option<&Backdrop>, t: Today, x:
         } else {
             label
         };
-        ctx.text.draw(pm, &text, (cx - lw / 2.0).round(), base, fs, Weight::Bold, c, None);
+        ctx.text.draw(pm, &text, cx - lw / 2.0, base, fs, Weight::Bold, c, None);
+    }
+}
+
+/// First date baseline and row pitch, pt from the widget top. Five rows are
+/// measured (64.5 + 17.25 n, the last on 133.5). Six rows were not captured
+/// (NF): they keep the weekday-to-last-row span and share it evenly, so the
+/// grid stays inside the same margins.
+fn cal_rows(rows: usize) -> (f32, f32) {
+    if rows > 5 {
+        let pitch = (133.5 - CAL_WEEKDAYS) / 6.0;
+        (CAL_WEEKDAYS + pitch, pitch)
+    } else {
+        (64.5, 17.25)
     }
 }
 

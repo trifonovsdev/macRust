@@ -26,12 +26,14 @@ pub struct GlassStyle {
     /// Strongly blurred backdrop (controls over app windows) instead of the
     /// nearly clear one (the dock over the wallpaper).
     pub frost: bool,
+    /// `Some(dark)`: the measured widget fill (`widget_fill`) instead of
+    /// `tint` over the backdrop.
+    pub widget: Option<bool>,
 }
 
 impl GlassStyle {
-    /// Notification Center widgets, notification cards and banners. Dark:
-    /// the blurred backdrop at about x0.5 with its hue kept (a black desktop
-    /// reads (17,17,17)); light: near-opaque white cards. Rim: `hairline`.
+    /// Notification Center widgets, notification cards and banners: the
+    /// measured widget fill (`widget_fill`); the rim is `Rim::widget`.
     pub fn card(dark: bool, _scale: f32) -> Self {
         Self {
             tint: if dark {
@@ -43,7 +45,8 @@ impl GlassStyle {
             refraction: 0.0,
             specular: 0.0,
             glow: 0.0,
-            frost: true,
+            frost: false,
+            widget: Some(dark),
         }
     }
 
@@ -62,6 +65,7 @@ impl GlassStyle {
             specular: 0.0,
             glow: 0.0,
             frost: true,
+            widget: None,
         }
     }
 
@@ -78,8 +82,106 @@ impl GlassStyle {
             specular: if dark { 0.5 } else { 0.8 },
             glow: 0.06,
             frost: true,
+            widget: None,
         }
     }
+}
+
+/// The lit 1 pt rim of macOS 26 glass, measured: an outer 0.5 pt band
+/// screened with white at `a(p) = base + diag * px * ny + ends * |nx|` and an
+/// inner 0.5 pt band at `inner` times that. `px` runs -1..1 across the shape
+/// and `(nx, ny)` is the outward edge normal, so the top-left and
+/// bottom-right of every shape catch the light and the other two corners stay
+/// dim, as on the Dock (TAHOE-DOCK-2.md 1.2, TAHOE-CC-MOTION.md section 4).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rim {
+    pub base: f32,
+    pub diag: f32,
+    pub ends: f32,
+    pub inner: f32,
+}
+
+impl Rim {
+    /// Control Center modules. Dark: the Dock's values (BB: +14-29 L over an
+    /// L 55 module); light: 0.15 at top-right up to 0.45 at top-left.
+    pub fn module(dark: bool) -> Self {
+        if dark { Self { base: 0.085, diag: 0.04, ends: 0.04, inner: 0.38 } } else { Self { base: 0.30, diag: 0.15, ends: 0.05, inner: 0.38 } }
+    }
+
+    /// Widgets and notification cards. Dark (BB desktop widgets over a near
+    /// black wallpaper): 0.18 at top-right and bottom-left, 0.36-0.39 at
+    /// top-left and bottom-right, 0.31-0.38 on the sides. Light: NF, the
+    /// module rim stands in.
+    pub fn widget(dark: bool) -> Self {
+        if dark { Self { base: 0.27, diag: 0.09, ends: 0.08, inner: 0.6 } } else { Self::module(false) }
+    }
+}
+
+/// Screens `rim` onto what is already drawn inside `shape` (premultiplied).
+pub fn lit_rim(pm: &mut Pixmap, shape: Shape, rim: Rim, scale: f32) {
+    if shape.w < 1.0 || shape.h < 1.0 {
+        return;
+    }
+    let half = (0.5 * scale).max(0.5);
+    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+    let x0 = (shape.x.floor() as i32 - 1).clamp(0, pw);
+    let x1 = ((shape.x + shape.w).ceil() as i32 + 1).clamp(0, pw);
+    let y0 = (shape.y.floor() as i32 - 1).clamp(0, ph);
+    let y1 = ((shape.y + shape.h).ceil() as i32 + 1).clamp(0, ph);
+    let (cx, hx) = (shape.x + shape.w * 0.5, shape.w * 0.5);
+    let stride = pw as usize * 4;
+    let dst = pm.data_mut();
+    for y in y0..y1 {
+        let fy = y as f32 + 0.5;
+        let (in0, in1) = match shape.inner_half_span(fy, 2.0 * half + 1.0) {
+            Some(hs) => (((cx - hs).ceil() as i32).clamp(x0, x1), ((cx + hs).floor() as i32).clamp(x0, x1)),
+            None => (x1, x1),
+        };
+        for x in (x0..in0.min(x1)).chain(in1.max(in0)..x1) {
+            let fx = x as f32 + 0.5;
+            let (d, nx, ny) = shape.sdf(fx, fy);
+            let band = |outer: f32, inner: f32| ((d + 0.5).min(-outer) - (d - 0.5).max(-inner)).clamp(0.0, 1.0);
+            let w = band(0.0, half) + rim.inner * band(half, 2.0 * half);
+            if w <= 0.0 {
+                continue;
+            }
+            let px = ((fx - cx) / hx).clamp(-1.0, 1.0);
+            let a = ((rim.base + rim.diag * px * ny + rim.ends * nx.abs()) * w).clamp(0.0, 1.0);
+            let o = y as usize * stride + x as usize * 4;
+            let alpha = dst[o + 3] as f32;
+            for k in 0..3 {
+                let c = dst[o + k] as f32;
+                dst[o + k] = (c + (alpha - c) * a + 0.5).min(alpha) as u8;
+            }
+        }
+    }
+}
+
+/// Desktop and Notification Center widgets over backdrop colour `c` (0..255,
+/// from the lightly blurred level, which carries a 1.25 saturation boost).
+/// Dark, fitted to BB's widgets over magenta, pink and near-black wallpaper:
+/// luminance in linear light `0.175 Y + 0.0049` (L 122 -> 52, L 13 -> 17) and
+/// 0.70 of the backdrop's sRGB chroma, so colour reads deeper than the
+/// backdrop. Light: 90% white over the backdrop (Apple's guide art; not
+/// measured on video).
+pub fn widget_fill(c: [f32; 3], dark: bool) -> [f32; 3] {
+    if !dark {
+        return c.map(|v| v * 0.098 + 255.0 * 0.902);
+    }
+    let l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let lo = to_srgb(0.175 * to_linear(l) + 0.0049);
+    let k = 0.70 / 1.25;
+    c.map(|v| (lo + (v - l) * k).clamp(0.0, 255.0))
+}
+
+fn to_linear(v: f32) -> f32 {
+    let c = (v / 255.0).clamp(0.0, 1.0);
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+fn to_srgb(l: f32) -> f32 {
+    let l = l.clamp(0.0, 1.0);
+    255.0 * if l <= 0.003_130_8 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 }
 }
 
 /// A rounded rectangle in window pixels.
@@ -177,14 +279,15 @@ pub fn material(v: &Vibrancy, ox: f32, oy: f32, w: u32, h: u32, tint: Color) -> 
 }
 
 fn material_with(v: &Vibrancy, ox: f32, oy: f32, w: u32, h: u32, tint: Color, frost: bool) -> Option<Pixmap> {
-    material_in(v, ox, oy, w, h, tint, frost, (0, 0, w as i32, h as i32))
+    material_in(v, ox, oy, w, h, tint, frost, (0, 0, w as i32, h as i32), None)
 }
 
 /// The material over a `w` x `h` window, filled only inside `area`
 /// (x0, y0, x1, y1): `draw` reads nothing outside the shape's bounds, and
 /// live glass rebuilds this on every change behind it.
+/// `widget`: Some(dark) fills with `widget_fill` instead of the tint.
 #[allow(clippy::too_many_arguments)]
-fn material_in(v: &Vibrancy, ox: f32, oy: f32, w: u32, h: u32, tint: Color, frost: bool, area: (i32, i32, i32, i32)) -> Option<Pixmap> {
+fn material_in(v: &Vibrancy, ox: f32, oy: f32, w: u32, h: u32, tint: Color, frost: bool, area: (i32, i32, i32, i32), widget: Option<bool>) -> Option<Pixmap> {
     let mut pm = Pixmap::new(w.max(1), h.max(1))?;
     let t = premul(tint);
     let data = pm.data_mut();
@@ -195,8 +298,12 @@ fn material_in(v: &Vibrancy, ox: f32, oy: f32, w: u32, h: u32, tint: Color, fros
             let (sx, sy) = (ox + x as f32 + 0.5, oy + y as f32 + 0.5);
             let c = if frost { v.sample_frost(sx, sy) } else { v.sample_clear(sx, sy) };
             let o = (y * w as usize + x) * 4;
+            let out = match widget {
+                Some(dark) => widget_fill(c, dark),
+                None => [0, 1, 2].map(|k| t[k] * 255.0 + c[k] * (1.0 - t[3])),
+            };
             for k in 0..3 {
-                data[o + k] = (t[k] * 255.0 + c[k] * (1.0 - t[3]) + 0.5).min(255.0) as u8;
+                data[o + k] = (out[k] + 0.5).min(255.0) as u8;
             }
             data[o + 3] = 255;
         }
@@ -391,6 +498,7 @@ pub fn rim(pm: &mut Pixmap, shape: Shape, top: f32, bottom: f32, side: f32, widt
 struct MatKey {
     tint: [u8; 4],
     frost: bool,
+    widget: Option<bool>,
     size: (u32, u32),
     area: (i32, i32, i32, i32),
 }
@@ -424,12 +532,12 @@ impl Backdrop {
             (shape.x + shape.w).ceil() as i32 + 1,
             (shape.y + shape.h).ceil() as i32 + 1,
         );
-        let key = MatKey { tint: [c.red(), c.green(), c.blue(), c.alpha()], frost: st.frost, size: (pm.width(), pm.height()), area };
+        let key = MatKey { tint: [c.red(), c.green(), c.blue(), c.alpha()], frost: st.frost, widget: st.widget, size: (pm.width(), pm.height()), area };
         let mut mats = self.mats.borrow_mut();
         let i = match mats.iter().position(|(k, _)| *k == key) {
             Some(i) => i,
             None => {
-                let Some(m) = material_in(&self.vib, 0.0, 0.0, pm.width(), pm.height(), st.tint, st.frost, area) else { return };
+                let Some(m) = material_in(&self.vib, 0.0, 0.0, pm.width(), pm.height(), st.tint, st.frost, area, st.widget) else { return };
                 mats.push((key, m));
                 mats.len() - 1
             }
