@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use macrust_ui::dock::{Dock, DockConfig, DockEntry, DockEvent, Fallback, Section};
 use macrust_ui::genie::{Path as GeniePath, Rect as GenieRect};
+use macrust_ui::scale::{Path as ScalePath, Rect as ScaleRect};
 use macrust_ui::gfx::Image;
 use macrust_ui::menu::{MenuEntry, MenuEvent, PopupMenu};
 use macrust_ui::menubar::{BarEvent, BarItem, MenuBar, Status};
@@ -46,6 +47,7 @@ use windows::core::PCWSTR;
 use super::catalog::{self, Batch};
 use super::config::{self, Pin, Settings, Source};
 use super::genie::{self, Genie};
+use super::scale::{self, Scale};
 use super::icons::{self, IconWorker, Request};
 use super::macicons::{self, MacIcons};
 use super::minbutton::{self, WM_APP_PRESS, WM_APP_RELEASE};
@@ -251,7 +253,10 @@ pub struct App {
     own_pid: u32,
     /// Tray, Control Center, Notification Center, banners (panels.rs).
     x: panels::Extras,
-    /// Minimize into and restore out of Dock icons (genie.rs).
+    /// Minimize into and restore out of Dock icons: the Scale effect
+    /// (scale.rs) or the Genie (genie.rs), by `minimize_effect`.
+    use_scale: bool,
+    scale: Scale,
     genie: Genie,
     /// The Dock's glass was last built with the Genie drawn into it.
     genie_glass: bool,
@@ -501,7 +506,9 @@ impl App {
         let taskbar_msg = unsafe { windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(windows::core::w!("TaskbarCreated")) };
 
         let cfg = DockConfig { icon: settings.icon_size, magnified: settings.magnified, magnify: settings.magnify };
-        let genie = Genie::new(dock_s.hwnd, extras.capture.is_some());
+        let use_scale = settings.minimize_effect != "genie";
+        let genie = Genie::new(dock_s.hwnd, extras.capture.is_some(), !use_scale);
+        let scale = Scale::new(dock_s.hwnd, use_scale);
         let mut app = Self {
             ctx,
             settings,
@@ -548,6 +555,8 @@ impl App {
             taskbar_msg,
             own_pid: unsafe { GetCurrentProcessId() },
             x: extras,
+            use_scale,
+            scale,
             genie,
             genie_glass: false,
             shell_msg: 0,
@@ -595,6 +604,8 @@ impl App {
         BAR_H.store(self.bar.height_px(), Ordering::Relaxed);
         self.genie.set_top(self.bar.height_px());
         self.genie.prepare((self.screen.w, self.screen.h));
+        self.scale.set_top(self.bar.height_px());
+        self.scale.prepare((self.screen.w, self.screen.h));
         if reload_wallpaper {
             let wall = system::wallpaper(self.screen.w as u32, self.screen.h as u32)
                 .unwrap_or_else(|| wallpaper::procedural(self.screen.w as u32, self.screen.h as u32, self.ctx.theme.dark));
@@ -641,6 +652,7 @@ impl App {
     }
 
     pub fn shutdown(&mut self) {
+        self.scale.shutdown();
         self.genie.shutdown();
         if self.shell_msg != 0 {
             unsafe {
@@ -989,7 +1001,11 @@ impl App {
     /// can play, plainly otherwise. `event`: Windows is already minimizing
     /// them (a title-bar click) since this GetTickCount, so the snapshot comes
     /// from a frame captured before it.
-    fn genie_minimize(&mut self, key: &str, windows: &[HWND], event: Option<u32>, why: &str) {
+    fn genie_minimize(&mut self, key: &str, windows: &[HWND], event: Option<u32>, why: &'static str) {
+        if self.use_scale {
+            self.scale_minimize(key, windows, event.is_some(), why);
+            return;
+        }
         let since = Instant::now();
         let mut items = Vec::new();
         for &h in windows {
@@ -1018,6 +1034,10 @@ impl App {
 
     /// Restores `windows` out of the Dock icon of `key`; the first comes to the front.
     fn genie_restore(&mut self, key: &str, windows: &[HWND]) {
+        if self.use_scale {
+            self.scale_restore(key, windows);
+            return;
+        }
         let screen = (self.screen.w, self.screen.h);
         // The one to activate goes last, so it ends up in front.
         for (i, &h) in windows.iter().enumerate().rev() {
@@ -1030,6 +1050,10 @@ impl App {
     /// A window started (`start`) or stopped being minimized, by any means;
     /// `tick` is the event's GetTickCount.
     fn minimize_event(&mut self, h: HWND, start: bool, tick: u32) {
+        if self.use_scale {
+            self.scale_minimize_event(h, start, tick);
+            return;
+        }
         if !start {
             self.genie.restored_elsewhere(h);
             return;
@@ -1053,10 +1077,123 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // Scale effect (scale.rs)
+
+    fn scale_path(&self, key: &str, win: WinRect) -> Option<ScalePath> {
+        let g = Self::genie_path(&self.dock, &self.screen, self.fullscreen, key, win)?;
+        let r = |r: GenieRect| ScaleRect { x: r.x, y: r.y, w: r.w, h: r.h };
+        Some(ScalePath { win: r(g.win), icon: r(g.icon) })
+    }
+
+    /// `h` and where it goes; None when the effect cannot play (see `genie_path`).
+    fn scale_item(&self, key: &str, h: HWND) -> Option<scale::Item> {
+        let (frame, borders) = if winops::is_minimized(h) {
+            let b = self.genie.borders_of(h);
+            (winops::restore_frame(h, b)?.0, b)
+        } else {
+            (winops::frame_rect(h)?, Some(winops::borders(h)))
+        };
+        let path = self.scale_path(key, frame)?;
+        Some(scale::Item { hwnd: h, path, borders })
+    }
+
+    /// `already`: Windows has minimized them (the minimize event).
+    fn scale_minimize(&mut self, key: &str, windows: &[HWND], already: bool, via: &'static str) {
+        let since = Instant::now();
+        let mut items = Vec::new();
+        for &h in windows {
+            match if self.scale.enabled { self.scale_item(key, h) } else { None } {
+                Some(it) => items.push(it),
+                None if !already => winops::minimize(h),
+                None => trace(format!("scale minimize via {via}: no path to the Dock icon, skipped")),
+            }
+        }
+        self.scale.minimize(items, already, (self.screen.w, self.screen.h), via, since);
+    }
+
+    /// Restores `windows` out of the Dock icon of `key`; the first comes to the front.
+    fn scale_restore(&mut self, key: &str, windows: &[HWND]) {
+        let since = Instant::now();
+        let screen = (self.screen.w, self.screen.h);
+        // The one to activate goes last, so it ends up in front.
+        for (i, &h) in windows.iter().enumerate().rev() {
+            let activate = i == 0;
+            let item = if self.scale.enabled && winops::is_minimized(h) { self.scale_item(key, h) } else { None };
+            if !item.is_some_and(|it| self.scale.restore(it, activate, screen, since)) {
+                if activate {
+                    winops::activate(h);
+                } else {
+                    winops::restore(h);
+                }
+            }
+        }
+    }
+
+    fn scale_minimize_event(&mut self, h: HWND, start: bool, tick: u32) {
+        if !start {
+            self.scale.restored_elsewhere(h);
+            return;
+        }
+        if self.scale.busy(h) || !self.scale.session() {
+            return;
+        }
+        let late = unsafe { windows::Win32::System::SystemInformation::GetTickCount() }.wrapping_sub(tick);
+        if self.scale.armed() == Some(h) {
+            // The release went by without the hook waiting for us.
+            trace(format!("scale event: minimize of the armed window, handled {late} ms after it"));
+            self.scale.fire(h, "minimize event (armed)", Instant::now());
+            minbutton::set_armed(None);
+            return;
+        }
+        if let Some(key) = self.dock_key_of(h) {
+            trace(format!("scale event: minimize seen after Windows hid the window, handled {late} ms after it"));
+            self.scale_minimize(&key, &[h], true, "minimize event");
+        }
+    }
+
+    /// The left button went down on a minimize button of a window in the
+    /// Dock: its thumbnail is registered, hidden, for the release.
+    fn scale_press(&mut self, x: i32, y: i32) {
+        use windows::Win32::UI::WindowsAndMessaging::HTMINBUTTON;
+        self.scale.disarm();
+        minbutton::set_armed(None);
+        if !self.scale.session() || self.fullscreen {
+            return;
+        }
+        let Some((h, hit)) = self.hit_test(x, y) else { return };
+        if hit != HTMINBUTTON || winops::is_minimized(h) || self.scale.busy(h) {
+            return;
+        }
+        let Some(key) = self.dock_key_of(h) else { return };
+        let since = Instant::now();
+        let Some(item) = self.scale_item(&key, h) else { return };
+        if self.scale.arm(item, (self.screen.w, self.screen.h)) {
+            minbutton::set_armed(Some(h));
+            trace(format!("scale armed: minimize button pressed, thumbnail registered in {:.1} ms", since.elapsed().as_secs_f32() * 1000.0));
+        }
+    }
+
+    /// The release while a thumbnail is armed; the hook holds it until this
+    /// returns. True if the thumbnail went on screen.
+    fn scale_release(&mut self, x: i32, y: i32) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::HTMINBUTTON;
+        let since = Instant::now();
+        minbutton::set_armed(None);
+        let Some(h) = self.scale.armed() else { return false };
+        let on = self.hit_test(x, y).is_some_and(|(at, hit)| at == h && hit == HTMINBUTTON);
+        if on && self.scale.fire(h, "title-bar button", since) {
+            return true;
+        }
+        self.scale.disarm();
+        trace("scale disarmed: released off the minimize button");
+        false
+    }
+
+    // -----------------------------------------------------------------------
     // Genie: minimizes started outside the Dock, seen before the window hides
 
     fn genie_hooks_install(&mut self) {
-        if !self.genie.session() {
+        if !(if self.use_scale { self.scale.session() } else { self.genie.session() }) {
             return;
         }
         minbutton::start(self.bar_s.hwnd);
@@ -1066,7 +1203,7 @@ impl App {
                 self.shell_msg = RegisterWindowMessageW(windows::core::w!("SHELLHOOK"));
             }
         }
-        log(format!("genie: mouse hook started, shell hook {}", if self.shell_msg != 0 { "registered" } else { "refused" }));
+        log(format!("minimize effect: mouse hook started, shell hook {}", if self.shell_msg != 0 { "registered" } else { "refused" }));
     }
 
     /// The top-level window at screen `x, y` and what part of it is there
@@ -1093,6 +1230,10 @@ impl App {
     /// in the Dock, the Genie's first frame is staged for the release.
     fn press(&mut self, x: i32, y: i32) {
         use windows::Win32::UI::WindowsAndMessaging::HTMINBUTTON;
+        if self.use_scale {
+            self.scale_press(x, y);
+            return;
+        }
         self.genie.disarm();
         minbutton::set_armed(None);
         if !self.genie.session() || self.genie.animating() || self.fullscreen {
@@ -1118,6 +1259,9 @@ impl App {
     /// the release until this returns. True if the frame went on screen.
     fn release(&mut self, x: i32, y: i32) -> bool {
         use windows::Win32::UI::WindowsAndMessaging::HTMINBUTTON;
+        if self.use_scale {
+            return self.scale_release(x, y);
+        }
         let since = Instant::now();
         minbutton::set_armed(None);
         let Some(h) = self.genie.armed() else { return false };
@@ -1155,7 +1299,17 @@ impl App {
         let Some(key) = self.dock_key_of(h) else { return LRESULT(0) };
         let iconic = winops::is_minimized(h);
         trace(format!("genie: Windows asks for the minimize rect of a {} window", if iconic { "minimized" } else { "shown" }));
-        if !iconic && self.genie.session() && !self.genie.busy(h) && !self.fullscreen {
+        if self.use_scale {
+            if !iconic && self.scale.session() && !self.scale.busy(h) && !self.fullscreen {
+                let since = Instant::now();
+                let armed = self.scale.armed() == Some(h)
+                    || self.scale_item(&key, h).is_some_and(|it| self.scale.arm(it, (self.screen.w, self.screen.h)));
+                if armed {
+                    self.scale.fire(h, "shell hook", since);
+                }
+                minbutton::set_armed(None);
+            }
+        } else if !iconic && self.genie.session() && !self.genie.busy(h) && !self.fullscreen {
             let since = Instant::now();
             let armed = self.genie.armed() == Some(h)
                 || self.genie_item(&key, h, None).is_some_and(|it| self.genie.arm(it, (self.screen.w, self.screen.h)));
@@ -1779,7 +1933,8 @@ impl App {
     }
 
     pub fn animating(&self) -> bool {
-        self.genie.animating()
+        self.scale.animating()
+            || self.genie.animating()
             || self.dock.animating()
             || self.spot.animating()
             || self.menu.as_ref().is_some_and(|m| m.animating())
@@ -1811,6 +1966,11 @@ impl App {
             self.menu_s.dirty = true;
         }
         self.extras_update(dt);
+        if self.scale.animating() {
+            let t = Instant::now();
+            self.scale.step();
+            self.stat("scale", t);
+        }
         if self.genie.animating() {
             let t = Instant::now();
             self.genie.step((self.screen.w, self.screen.h), self.x.capture.as_mut());

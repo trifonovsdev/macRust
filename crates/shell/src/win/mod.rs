@@ -11,6 +11,7 @@ mod media;
 mod minbutton;
 mod net;
 mod notifications;
+mod scale;
 mod surface;
 mod system;
 mod tracker;

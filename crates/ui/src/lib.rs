@@ -12,6 +12,7 @@ pub mod glyphs;
 pub mod menu;
 pub mod menubar;
 pub mod panel;
+pub mod scale;
 pub mod control;
 pub mod notify;
 pub mod search;

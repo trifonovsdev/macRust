@@ -66,7 +66,7 @@ const UNCOVER_MAX_S: f32 = 0.7;
 // ---------------------------------------------------------------------------
 // Windows' own minimize animation
 
-fn spi_min_animate() -> Option<bool> {
+pub(super) fn spi_min_animate() -> Option<bool> {
     let mut ai = ANIMATIONINFO { cbSize: size_of::<ANIMATIONINFO>() as u32, iMinAnimate: 0 };
     unsafe {
         SystemParametersInfoW(
@@ -101,7 +101,7 @@ fn marker() -> std::path::PathBuf {
 
 /// Turns Windows' minimize animation off; the marker is written first, so a
 /// crash at any point leaves enough behind to turn it back on.
-fn suppress() -> bool {
+pub(super) fn suppress() -> bool {
     let _ = std::fs::write(marker(), "1");
     if spi_set_min_animate(false) {
         return true;
@@ -518,8 +518,6 @@ pub struct Genie {
     armed: Option<Run>,
     cache: HashMap<isize, Cached>,
     stamp: u64,
-    /// Restores left to Windows' own animation, which is on until they finish.
-    native: Vec<(HWND, Instant)>,
     /// Invisible resize borders of windows seen on screen.
     borders: HashMap<isize, (i32, i32, i32, i32)>,
     cost: (f64, f64, u32),
@@ -549,17 +547,21 @@ fn probe_transitions(h: HWND) {
 }
 
 impl Genie {
-    pub fn new(dock: HWND, capture: bool) -> Genie {
-        let enabled = spi_min_animate().unwrap_or(false);
+    /// `active`: the Genie is the chosen minimize effect; otherwise this
+    /// stays idle and leaves Windows' animation alone.
+    pub fn new(dock: HWND, capture: bool, active: bool) -> Genie {
+        let enabled = active && spi_min_animate().unwrap_or(false);
         let session = enabled && capture && suppress();
-        log(format!(
-            "genie: {}",
+        if active {
+            log(format!(
+            "minimize effect: genie, {}",
             match (enabled, session) {
                 (false, _) => "off (Windows minimize animation is off)",
                 (true, true) => "on, title-bar minimizes too",
                 (true, false) => "on for the Dock only (no screen capture)",
             }
-        ));
+            ));
+        }
         let build = super::system::reg_string(
             windows::Win32::System::Registry::HKEY_LOCAL_MACHINE,
             "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
@@ -576,7 +578,6 @@ impl Genie {
             armed: None,
             cache: HashMap::new(),
             stamp: 0,
-            native: Vec::new(),
             borders: HashMap::new(),
             cost: (0.0, 0.0, 0),
             probed: false,
@@ -592,7 +593,7 @@ impl Genie {
     /// Whether a title-bar minimize can play the Genie: the snapshot then has
     /// to come from the last captured frame.
     pub fn session(&self) -> bool {
-        self.session && self.native.is_empty()
+        self.session
     }
 
     pub fn shutdown(&mut self) {
@@ -603,7 +604,7 @@ impl Genie {
     }
 
     pub fn animating(&self) -> bool {
-        !self.runs.is_empty() || !self.native.is_empty()
+        !self.runs.is_empty()
     }
 
     pub fn busy(&self, h: HWND) -> bool {
@@ -699,8 +700,8 @@ impl Genie {
         }
     }
 
-    /// Restores `h` out of its Dock icon when its snapshot is kept, else with
-    /// Windows' own animation. `path_for` maps the window's frame to its
+    /// Restores `h` out of its Dock icon when its snapshot is kept, else
+    /// without an animation. `path_for` maps the window's frame to its
     /// path; `activate` brings it to the front.
     pub fn restore(&mut self, h: HWND, path_for: &dyn Fn(WinRect) -> Option<Path>, activate: bool, screen: (i32, i32)) {
         let key = h.0 as isize;
@@ -726,11 +727,10 @@ impl Genie {
         self.step(screen, None);
     }
 
+    /// No snapshot: the window comes back without an animation. Turning
+    /// Windows' own one on for it also let other minimizes play it.
     fn restore_native(&mut self, h: HWND, activate: bool) {
-        if self.session && self.enabled {
-            spi_set_min_animate(true);
-            self.native.push((h, Instant::now()));
-        }
+        trace("genie restore: no snapshot, restored without the effect");
         if activate {
             winops::activate(h);
         } else {
@@ -873,11 +873,8 @@ impl Genie {
     /// `animating()`. `cap` tells when a restored window is on screen.
     pub fn step(&mut self, screen: (i32, i32), mut cap: Option<&mut Capture>) {
         let now = Instant::now();
-        self.native.retain(|&(h, since)| {
-            let e = since.elapsed().as_secs_f32();
-            (winops::is_minimized(h) || e < 0.05) && e < 1.0
-        });
-        if self.native.is_empty() && self.session && spi_min_animate() == Some(true) {
+        // Something else turned Windows' animation back on.
+        if self.session && spi_min_animate() == Some(true) {
             spi_set_min_animate(false);
         }
         if self.runs.is_empty() {
@@ -1004,7 +1001,7 @@ impl Genie {
             ));
             self.cost = (0.0, 0.0, 0);
         }
-        if self.op_suppressed && self.native.is_empty() {
+        if self.op_suppressed {
             release_min_animate();
             self.op_suppressed = false;
         }
