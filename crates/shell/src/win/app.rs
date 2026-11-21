@@ -77,7 +77,7 @@ pub const WM_APP_MEDIA: u32 = WM_APP + 12;
 pub const WM_APP_NOTES: u32 = WM_APP + 13;
 pub const WM_APP_UPDATE: u32 = WM_APP + 14;
 pub const WM_APP_WIFI: u32 = WM_APP + 15;
-// WM_APP + 17 and + 18 are minbutton::WM_APP_PRESS / WM_APP_RELEASE.
+// WM_APP + 17 and + 18 are minbutton::WM_APP_PRESS / WM_APP_RELEASE, + 19 is scale::WM_APP_SCALE.
 
 #[path = "panels.rs"]
 mod panels;
@@ -518,7 +518,7 @@ impl App {
         let cfg = DockConfig { icon: settings.icon_size, magnified: settings.magnified, magnify: settings.magnify };
         let use_scale = settings.minimize_effect != "genie";
         let genie = Genie::new(dock_s.hwnd, extras.capture.is_some(), !use_scale);
-        let scale = Scale::new(dock_s.hwnd, use_scale);
+        let scale = Scale::new(dock_s.hwnd, bar_s.hwnd, use_scale);
         let mut app = Self {
             ctx,
             settings,
@@ -1947,8 +1947,7 @@ impl App {
     }
 
     pub fn animating(&self) -> bool {
-        self.scale.animating()
-            || self.genie.animating()
+        self.genie.animating()
             || self.dock.animating()
             || self.spot.animating()
             || self.menu.as_ref().is_some_and(|m| m.animating())
@@ -1982,11 +1981,6 @@ impl App {
             self.menu_s.dirty = true;
         }
         self.extras_update(dt);
-        if self.scale.animating() {
-            let t = Instant::now();
-            self.scale.step();
-            self.stat("scale", t);
-        }
         if self.genie.animating() {
             let t = Instant::now();
             self.genie.step((self.screen.w, self.screen.h), self.x.capture.as_mut());
@@ -2320,6 +2314,7 @@ impl App {
             WM_APP_MINIMIZE => {
                 self.minimize_event(HWND(wp.0 as *mut _), lp.0 & 1 != 0, (lp.0 >> 1) as u32);
             }
+            scale::WM_APP_SCALE => self.scale.on_message(wp),
             WM_APP_PRESS => self.press(wp.0 as isize as i32, lp.0 as i32),
             WM_APP_RELEASE => return Some(LRESULT(self.release(wp.0 as isize as i32, lp.0 as i32) as isize)),
             WM_APP_TASKBAR => {
