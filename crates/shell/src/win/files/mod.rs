@@ -506,11 +506,12 @@ pub fn enabled() -> bool {
 }
 
 /// Opens a file manager window: in the running process, else a new one.
-pub fn open_window(path: Option<&str>, select: Option<&str>) {
+/// False when neither worked, so the caller can fall back to Explorer.
+pub fn open_window(path: Option<&str>, select: Option<&str>) -> bool {
     if forward(path, select) {
-        return;
+        return true;
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else { return false };
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--files");
     if let Some(p) = path {
@@ -522,8 +523,12 @@ pub fn open_window(path: Option<&str>, select: Option<&str>) {
     unsafe {
         let _ = AllowSetForegroundWindow(windows::Win32::UI::WindowsAndMessaging::ASFW_ANY);
     }
-    if let Err(e) = cmd.spawn() {
-        log(format!("files: could not start the file manager: {}", e.kind()));
+    match cmd.spawn() {
+        Ok(_) => true,
+        Err(e) => {
+            log(format!("files: could not start the file manager: {}, Explorer opens it", e.kind()));
+            false
+        }
     }
 }
 

@@ -283,8 +283,8 @@ pub fn open_with(target: &str, args: &str) {
         // checking a network path can take seconds.
         if super::files::enabled()
             && let Some((folder, select)) = super::files::route(&target, &args)
+            && super::files::open_window(folder.as_deref(), select.as_deref())
         {
-            super::files::open_window(folder.as_deref(), select.as_deref());
             return;
         }
         let (t, a) = (wide(&target), wide(&args));
