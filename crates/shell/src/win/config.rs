@@ -58,7 +58,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             icon_size: 52.0,
-            magnified: 92.0,
+            magnified: 72.0,
             // Off by default in macOS; the owner wants it on.
             magnify: true,
             hide_taskbar: true,
@@ -134,6 +134,10 @@ pub fn load_settings() -> Settings {
     if version < 4 {
         s.magnify = true;
     }
+    // Version 5: the owner found 92 pt too big; the old default moves to 72.
+    if version < 5 && s.magnified == 92.0 {
+        s.magnified = 72.0;
+    }
     // Version 3 added `auto_update`, version 4 `animate_opening`; older files
     // get them with their defaults.
     if version < SETTINGS_VERSION {
@@ -142,7 +146,7 @@ pub fn load_settings() -> Settings {
     s
 }
 
-const SETTINGS_VERSION: u32 = 4;
+const SETTINGS_VERSION: u32 = 5;
 
 pub fn save_settings(s: &Settings) {
     let text = format!(

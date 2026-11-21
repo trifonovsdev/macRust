@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use tiny_skia::Pixmap;
 
-use crate::anim::{BOUNCE_PERIOD, Spring, Tween, ease_out, launch_bounce, smoothstep};
+use crate::anim::{BOUNCE_PERIOD, Tween, ease_out, launch_bounce, smoothstep};
 use crate::gfx::{self, Image, rgba};
 use crate::glass;
 use crate::text::Weight;
@@ -56,7 +56,7 @@ pub struct DockConfig {
 
 impl Default for DockConfig {
     fn default() -> Self {
-        Self { icon: 52.0, magnified: 92.0, magnify: false }
+        Self { icon: 52.0, magnified: 72.0, magnify: false }
     }
 }
 
@@ -114,8 +114,17 @@ const REMOVE_S: f32 = 0.27;
 const LABEL_IN_S: f32 = 0.16;
 const LABEL_OUT_S: f32 = 0.12;
 const LABEL_RISE: f32 = 4.0;
-/// Half-width of the magnification bell, in tiles.
-const RANGE: f32 = 2.7;
+// Magnification, measured on macOS 26 (out/ref/TAHOE-MAGNIFY.md): a half
+// cosine reaching zero RANGE base slots from the cursor, the Dock stays centred,
+// the gap between icons and the bar's height do not scale. The zoom snaps on
+// in MAG_IN_S and collapses in MAG_OUT_S (ease-in-out, no spring); the bell
+// stays where the pointer left.
+const RANGE: f32 = 3.0;
+const MAG_IN_S: f32 = 0.08;
+const MAG_OUT_S: f32 = 0.17;
+/// Sum of the bell over the slots plus the separator's share: the widest the
+/// magnified Dock gets, in base slots per unit of extra scale.
+const MAG_SPREAD: f32 = 3.9 + 0.45;
 const TIP_SPACE: f32 = 46.0;
 const EDGE_MARGIN: f32 = 130.0;
 
@@ -127,7 +136,8 @@ pub struct Dock {
     slots: Vec<Slot>,
     mouse: Option<(f32, f32)>,
     last_mx: f32,
-    mag: Spring,
+    /// Magnification amount, 0..1.
+    mag: Tween,
     tip: Tween,
     tip_slot: Option<usize>,
     hover: Option<usize>,
@@ -141,8 +151,9 @@ pub struct Dock {
     pub events: Vec<DockEvent>,
 }
 
-fn bell(t: f32) -> f32 {
-    if t.abs() >= 1.0 { 0.0 } else { (1.0 + (PI * t).cos()) * 0.5 }
+/// `d` in base slots from the cursor.
+fn bell(d: f32) -> f32 {
+    if d.abs() >= RANGE { 0.0 } else { (PI / 2.0 * d / RANGE).cos() }
 }
 
 impl Dock {
@@ -155,7 +166,7 @@ impl Dock {
             slots: Vec::new(),
             mouse: None,
             last_mx: 0.0,
-            mag: Spring::new(0.0, 0.32, 0.92),
+            mag: Tween::new(0.0),
             tip: Tween::new(0.0),
             tip_slot: None,
             hover: None,
@@ -188,7 +199,7 @@ impl Dock {
         let s = self.scale;
         let tile = self.cfg.icon * TILE * s;
         let n = self.slots.len() as f32 + 1.0;
-        let extra = (self.cfg.magnified / self.cfg.icon - 1.0).max(0.0) * RANGE * tile;
+        let extra = (self.cfg.magnified / self.cfg.icon - 1.0).max(0.0) * MAG_SPREAD * tile / 2.0;
         let v = self.v();
         let w = (n * tile + (SEP_W * v + 2.0 * (SIDE * v + EDGE_MARGIN)) * s + 2.0 * extra).min(self.screen_w).ceil();
         let h = ((GAP_BOTTOM + (v * BAR - self.cfg.icon) / 2.0 + self.cfg.magnified.max(self.cfg.icon * 1.55) + TIP_SPACE) * s).ceil();
@@ -269,10 +280,14 @@ impl Dock {
         self.backdrop = Some(glass::Backdrop::new(behind));
     }
 
+    /// While a Dock menu is open the zoom holds; it collapses when the menu
+    /// closes with the pointer outside.
     pub fn set_menu_open(&mut self, open: bool) {
         self.menu_open = open;
         if open {
             self.tip.to(0.0, LABEL_OUT_S, |u| u);
+        } else if self.mouse.is_none() {
+            self.mag.to(0.0, MAG_OUT_S, smoothstep);
         }
     }
 
@@ -318,46 +333,33 @@ impl Dock {
         }
         let total0: f32 = cells.iter().map(|c| c.1).sum();
         let start0 = (win_w - total0) / 2.0;
-        let amount = if self.cfg.magnify { self.mag.value.clamp(0.0, 1.2) } else { 0.0 };
+        let amount = if self.cfg.magnify { self.mag.value.clamp(0.0, 1.0) } else { 0.0 };
         let maxf = (self.cfg.magnified / self.cfg.icon).max(1.0);
-        let range = RANGE * tile0;
         let mx = self.last_mx;
+        // The gap between icon boxes keeps its width; boxes and the separator scale.
+        let gap0 = tile0 - icon0;
         let mut cum0 = start0;
-        let mut factors = Vec::with_capacity(cells.len());
+        let mut widths = Vec::with_capacity(cells.len());
         for (c, w0) in &cells {
-            let center = cum0 + w0 / 2.0;
+            let f = 1.0 + (maxf - 1.0) * amount * bell((mx - (cum0 + w0 / 2.0)) / tile0);
             cum0 += w0;
-            let f = match c {
-                Cell::Slot(_) => 1.0 + (maxf - 1.0) * amount * bell((mx - center) / range),
-                Cell::Separator => 1.0,
-            };
-            factors.push(f);
+            widths.push(match c {
+                Cell::Slot(i) => {
+                    let a = self.slots[*i].appear.value.max(0.0);
+                    (tile0 - gap0) * a * f + gap0 * a
+                }
+                Cell::Separator => w0 * f,
+            });
         }
-        // Anchor: the point under the cursor stays under the cursor, so the dock
-        // grows on both sides of it instead of sliding.
-        let u = mx.clamp(start0, start0 + total0.max(0.0));
-        let mut acc0 = start0;
-        let mut acc = 0.0;
-        let mut m_u = 0.0;
-        for (i, (_, w0)) in cells.iter().enumerate() {
-            let w = w0 * factors[i];
-            if u <= acc0 + w0 || i == cells.len() - 1 {
-                let frac = if *w0 > 0.0 { ((u - acc0) / w0).clamp(0.0, 1.0) } else { 0.0 };
-                m_u = acc + frac * w;
-                break;
-            }
-            acc0 += w0;
-            acc += w;
-        }
-        let start = if cells.is_empty() { start0 } else { u - m_u };
+        let total: f32 = widths.iter().sum();
+        // Centred on the screen whatever the cursor does (measured).
+        let start = (win_w - total) / 2.0;
         let mut x = start;
         let mut out = Vec::with_capacity(cells.len());
-        for (i, (c, w0)) in cells.iter().enumerate() {
-            let w = w0 * factors[i];
-            out.push((*c, x, w));
+        for ((c, _), w) in cells.iter().zip(&widths) {
+            out.push((*c, x, *w));
             x += w;
         }
-        let total = x - start;
         let v = icon0 * ART;
         let bh = v * BAR;
         let side = SIDE * v;
@@ -373,9 +375,8 @@ impl Dock {
     fn icon_box(&self, g: &Geo, slot: usize, x: f32, w: f32) -> (f32, f32, f32) {
         let sl = &self.slots[slot];
         let a = sl.appear.value.clamp(0.0, 1.0);
-        let tile0 = g.icon0 * TILE * a;
-        let factor = if tile0 > 0.0 { w / tile0 } else { 1.0 };
-        let size = g.icon0 * factor * a;
+        // The cell is the box plus a gap that never scales (see geo).
+        let size = (w - g.icon0 * (TILE - 1.0) * a).max(0.0);
         let lift = sl.bounce.map(launch_bounce).unwrap_or(0.0) * g.icon0 * ART * HOP;
         (x + (w - size) / 2.0, g.icon_bottom - size - lift, size)
     }
@@ -415,13 +416,15 @@ impl Dock {
     pub fn mouse_move(&mut self, x: f32, y: f32) {
         self.mouse = Some((x, y));
         self.last_mx = x;
-        self.mag.to(1.0);
+        self.mag.to(1.0, MAG_IN_S, smoothstep);
         self.refresh_hover();
     }
 
     pub fn mouse_leave(&mut self) {
         self.mouse = None;
-        self.mag.to(0.0);
+        if !self.menu_open {
+            self.mag.to(0.0, MAG_OUT_S, smoothstep);
+        }
         self.pressed = None;
         self.refresh_hover();
     }
@@ -664,22 +667,38 @@ mod tests {
     }
 
     #[test]
-    fn magnified_icon_stays_under_the_cursor() {
-        let mut d = Dock::new(DockConfig { magnify: true, ..DockConfig::default() });
+    fn magnification_follows_the_measured_profile_and_timing() {
+        let mut d = Dock::new(DockConfig { magnify: true, icon: 52.0, magnified: 104.0 });
         d.set_entries((0..8).map(|i| entry(&i.to_string())).collect());
         let wr = d.window_rect();
-        let g0 = d.geo(wr.w as f32, wr.h as f32);
+        let (ww, wh) = (wr.w as f32, wr.h as f32);
+        let g0 = d.geo(ww, wh);
         let (_, x, w) = g0.cells[3];
-        let mx = x + w * 0.3;
-        d.mouse_move(mx, wr.h as f32 - 20.0);
-        for _ in 0..240 {
+        d.mouse_move(x + w / 2.0, wh - 20.0);
+        // Fully on after 0.08 s.
+        for _ in 0..10 {
             d.update(1.0 / 120.0);
         }
-        let g1 = d.geo(wr.w as f32, wr.h as f32);
-        let (_, x1, w1) = g1.cells[3];
-        assert!(w1 > w * 1.5);
-        assert!((x1 + w1 * 0.3 - mx).abs() < 0.5, "anchor drifted");
+        assert_eq!(d.mag.value, 1.0);
+        let g1 = d.geo(ww, wh);
+        let box_of = |g: &Geo, i: usize| g.cells[i].2 - (g0.cells[i].2 - d.cfg.icon);
+        // Box scale at 0, 1, 2 slots: 2, 1.87, 1.5 (cos(pi d / 6)).
+        for (i, want) in [(3, 2.0), (2, 1.866), (4, 1.866), (1, 1.5), (5, 1.5), (7, 1.0)] {
+            let got = box_of(&g1, i) / d.cfg.icon;
+            assert!((got - want).abs() < 0.01, "slot {i}: {got} vs {want}");
+        }
+        // Centred on the window whatever the cursor does, and inside it.
+        let (first, last) = (g1.cells[0], g1.cells[g1.cells.len() - 1]);
+        assert!(((first.1 + last.1 + last.2) / 2.0 - ww / 2.0).abs() < 0.5);
+        assert!(g1.bg.0 >= 0.0 && g1.bg.0 + g1.bg.2 <= ww);
+        // Collapses in 0.17 s: half way at 85 ms.
         d.mouse_leave();
+        let mut t = 0.0;
+        while t < 0.085 - 1e-4 {
+            d.update(1.0 / 200.0);
+            t += 1.0 / 200.0;
+        }
+        assert!((d.mag.value - 0.5).abs() < 0.03, "{}", d.mag.value);
         for _ in 0..240 {
             d.update(1.0 / 120.0);
         }
