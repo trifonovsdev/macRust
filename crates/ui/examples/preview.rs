@@ -754,6 +754,10 @@ fn tahoe_bar(sc: &Scene, out: &str, name: &str, open: Option<BarItem>) {
 
 /// Notification Center hanging under the clock, as the shell places it.
 fn tahoe_nc(sc: &Scene, out: &str, name: &str, with_notes: bool) {
+    tahoe_nc_on(sc, out, name, with_notes, Today { year: 2026, month: 10, day: 21, weekday: 6 });
+}
+
+fn tahoe_nc_on(sc: &Scene, out: &str, name: &str, with_notes: bool, today: Today) {
     let s = sc.scale;
     let mut screen = sc.wall.clone();
     let bar = bar_with(sc, "RU", false, Some(BarItem::Clock), 16);
@@ -761,7 +765,6 @@ fn tahoe_nc(sc: &Scene, out: &str, name: &str, with_notes: bool) {
     let mut bpm = pixmap_for(br);
     bar.draw(&mut bpm, &sc.ctx);
     blit(&mut screen, &bpm, br);
-    let today = Today { year: 2026, month: 10, day: 21, weekday: 6 };
     let mut nc = NotificationCenter::new(if with_notes { notes() } else { Vec::new() }, today, s, sc.h - br.h as f32);
     for _ in 0..120 {
         nc.update(1.0 / 120.0);
@@ -802,6 +805,11 @@ fn tahoe_set(out: &str) {
     tahoe_nc(&pink2, out, "tahoe-nc-dark-2x", true);
     tahoe_nc(&light2, out, "tahoe-nc-light-2x", true);
     tahoe_nc(&owner, out, "tahoe-nc-black-ru-1x", true);
+    // BB's widget: September 2025, the 16th, over a near-black desktop.
+    let mut night = Pixmap::new(3840, 2160).unwrap();
+    night.fill(Color::from_rgba8(8, 8, 9, 255));
+    let night = scene_on(night, 2.0, true, &Strings::EN);
+    tahoe_nc_on(&night, out, "tahoe-nc-sep2025-2x", false, Today { year: 2025, month: 8, day: 16, weekday: 2 });
 }
 
 fn main() {
@@ -985,6 +993,7 @@ fn cc_scene(out: &str, name: &str, kind: &str, s: f32, strings: &'static Strings
     let ctx = Ctx::new(Text::bundled(), Theme { dark: state.dark }, strings);
     let (w, h) = ((420.0 * s) as u32, (520.0 * s) as u32);
     let bar = (macrust_ui::menubar::HEIGHT * s).round() as i32;
+    let cc_state = state.clone();
     let mut cc = ControlCenter::new(state, s);
     let r = cc.window_rect(w as i32, bar);
     let stack_top = cc.body_rect(r).y as f32 / s;
@@ -992,11 +1001,48 @@ fn cc_scene(out: &str, name: &str, kind: &str, s: f32, strings: &'static Strings
     let mut behind = Pixmap::new(r.w as u32, r.h as u32).unwrap();
     behind.draw_pixmap(-r.x, -r.y, screen.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
     cc.set_backdrop(&behind);
-    cc.update(1.0 / 60.0);
+    let clean = screen.clone();
+    cc.update(0.5);
     let mut cpm = pixmap_for(r);
     cc.draw(&mut cpm, &ctx);
     blit(&mut screen, &cpm, r);
     screen.save_png(format!("{out}/cc-{name}.png")).unwrap();
+    if std::env::var_os("PREVIEW_CC_MOTION").is_none() {
+        return;
+    }
+    // Opening, closing and a Bluetooth toggle at 50 fps, the rate of the
+    // Tahoe captures they are compared with.
+    let frame = |cc: &ControlCenter, tag: &str| {
+        let mut screen = clean.clone();
+        let mut cpm = pixmap_for(r);
+        cc.draw(&mut cpm, &ctx);
+        blit(&mut screen, &cpm, r);
+        screen.save_png(format!("{out}/cc-{name}-{tag}.png")).unwrap();
+    };
+    let mut cc = ControlCenter::new(cc_state.clone(), s);
+    cc.set_backdrop(&behind);
+    for i in 0..=13 {
+        frame(&cc, &format!("open-{i:02}"));
+        cc.update(0.02);
+    }
+    cc.update(0.5);
+    {
+        // The Bluetooth disc: 13 pt + half of 34 pt in, row 2 of the 71 pt grid.
+        let b = cc.body_rect(WinRect { x: 0, y: 0, w: 0, h: 0 });
+        let (x, y) = (b.x as f32 + 30.0 * s, b.y as f32 + 101.0 * s);
+        cc.mouse_down(x, y);
+        cc.mouse_up(x, y);
+        cc.mouse_move(0.0, 0.0);
+        for i in 0..=11 {
+            frame(&cc, &format!("toggle-{i:02}"));
+            cc.update(0.02);
+        }
+    }
+    cc.close();
+    for i in 0..=11 {
+        frame(&cc, &format!("close-{i:02}"));
+        cc.update(0.02);
+    }
 }
 
 fn control_scenes(out: &str) {
