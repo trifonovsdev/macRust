@@ -48,6 +48,26 @@ pub struct Strings {
     pub calc_hint: &'static str,
     pub days: [&'static str; 7],
     pub months: [&'static str; 12],
+    pub wifi: &'static str,
+    pub bluetooth: &'static str,
+    pub on: &'static str,
+    pub off: &'static str,
+    pub not_connected: &'static str,
+    pub not_playing: &'static str,
+    pub dark_mode: &'static str,
+    pub screenshot: &'static str,
+    pub display: &'static str,
+    pub sound: &'static str,
+    pub no_notifications: &'static str,
+    pub clear_all: &'static str,
+    pub now: &'static str,
+    pub min_ago: &'static str,
+    pub days_full: [&'static str; 7],
+    pub months_full: [&'static str; 12],
+    /// Weekday letters starting from the first day of the week.
+    pub week_letters: [&'static str; 7],
+    /// 0 = Sunday, 1 = Monday.
+    pub week_start: usize,
 }
 
 impl Strings {
@@ -99,6 +119,26 @@ impl Strings {
         calc_hint: "Enter — скопировать результат",
         days: ["Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"],
         months: ["янв.", "февр.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."],
+        wifi: "Wi‑Fi",
+        bluetooth: "Bluetooth",
+        on: "Вкл.",
+        off: "Выкл.",
+        not_connected: "Не подключено",
+        not_playing: "Не воспроизводится",
+        dark_mode: "Тёмный режим",
+        screenshot: "Снимок экрана",
+        display: "Дисплей",
+        sound: "Звук",
+        no_notifications: "Нет уведомлений",
+        clear_all: "Очистить",
+        now: "сейчас",
+        min_ago: "мин назад",
+        days_full: ["Воскресенье", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"],
+        months_full: [
+            "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+        ],
+        week_letters: ["П", "В", "С", "Ч", "П", "С", "В"],
+        week_start: 1,
     };
 
     pub const EN: Strings = Strings {
@@ -149,6 +189,27 @@ impl Strings {
         calc_hint: "Press Enter to copy the result",
         days: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
         months: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+        wifi: "Wi‑Fi",
+        bluetooth: "Bluetooth",
+        on: "On",
+        off: "Off",
+        not_connected: "Not Connected",
+        not_playing: "Not Playing",
+        dark_mode: "Dark Mode",
+        screenshot: "Screenshot",
+        display: "Display",
+        sound: "Sound",
+        no_notifications: "No Notifications",
+        clear_all: "Clear",
+        now: "now",
+        min_ago: "min ago",
+        days_full: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+        months_full: [
+            "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November",
+            "December",
+        ],
+        week_letters: ["S", "M", "T", "W", "T", "F", "S"],
+        week_start: 0,
     };
 
     /// Menu-bar clock: «Пт 21 нояб. 14:32» / «Fri Nov 21 14:32».

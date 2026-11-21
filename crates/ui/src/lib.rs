@@ -5,9 +5,13 @@
 pub mod anim;
 pub mod dock;
 pub mod gfx;
+pub mod glass;
 pub mod glyphs;
 pub mod menu;
 pub mod menubar;
+pub mod panel;
+pub mod control;
+pub mod notify;
 pub mod search;
 pub mod spotlight;
 pub mod strings;

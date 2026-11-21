@@ -312,3 +312,127 @@ pub fn trash(pm: &mut Pixmap, x: f32, y: f32, s: f32) {
         fill_grad(pm, &p, t - s * 0.06, t + s * 0.02, rgba(236, 236, 240, 1.0), rgba(190, 190, 198, 1.0));
     }
 }
+
+fn poly(pts: &[(f32, f32)], close: bool) -> Option<tiny_skia::Path> {
+    let mut pb = PathBuilder::new();
+    let (&(x0, y0), rest) = pts.split_first()?;
+    pb.move_to(x0, y0);
+    for &(x, y) in rest {
+        pb.line_to(x, y);
+    }
+    if close {
+        pb.close();
+    }
+    pb.finish()
+}
+
+pub fn bluetooth(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    let p = |a: f32, b: f32| (x + s * a, y + s * b);
+    let pts = [p(0.3, 0.3), p(0.7, 0.68), p(0.5, 0.86), p(0.5, 0.14), p(0.7, 0.32), p(0.3, 0.7)];
+    if let Some(path) = poly(&pts, false) {
+        gfx::stroke_round(pm, &path, c, line_w(s) * 1.1);
+    }
+}
+
+/// Crescent moon (dark mode).
+pub fn moon(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    let mut pb = PathBuilder::new();
+    let (cx, cy, r) = (x + s * 0.5, y + s * 0.5, s * 0.38);
+    arc(&mut pb, cx, cy, r, -PI * 0.3, PI * 1.5, true);
+    arc(&mut pb, cx + s * 0.16, cy - s * 0.14, r * 0.8, PI * 1.3, PI * 0.1, false);
+    pb.close();
+    if let Some(p) = pb.finish() {
+        gfx::fill(pm, &p, c);
+    }
+}
+
+pub fn sun(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    let (cx, cy) = (x + s * 0.5, y + s * 0.5);
+    if let Some(p) = gfx::circle(cx, cy, s * 0.2) {
+        gfx::fill(pm, &p, c);
+    }
+    for i in 0..8 {
+        let a = i as f32 * TAU / 8.0;
+        if let Some(p) = poly(&[(cx + a.cos() * s * 0.32, cy + a.sin() * s * 0.32), (cx + a.cos() * s * 0.44, cy + a.sin() * s * 0.44)], false) {
+            gfx::stroke_round(pm, &p, c, line_w(s));
+        }
+    }
+}
+
+pub fn speaker(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color, waves: u8) {
+    let p = |a: f32, b: f32| (x + s * a, y + s * b);
+    if let Some(path) = poly(&[p(0.1, 0.38), p(0.26, 0.38), p(0.48, 0.18), p(0.48, 0.82), p(0.26, 0.62), p(0.1, 0.62)], true) {
+        gfx::fill(pm, &path, c);
+    }
+    for i in 0..waves.min(2) {
+        let mut pb = PathBuilder::new();
+        arc(&mut pb, x + s * 0.48, y + s * 0.5, s * (0.18 + 0.16 * i as f32), -PI * 0.28, PI * 0.28, true);
+        if let Some(path) = pb.finish() {
+            gfx::stroke_round(pm, &path, c, line_w(s));
+        }
+    }
+}
+
+pub fn play(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    let p = |a: f32, b: f32| (x + s * a, y + s * b);
+    if let Some(path) = poly(&[p(0.24, 0.14), p(0.86, 0.5), p(0.24, 0.86)], true) {
+        gfx::fill(pm, &path, c);
+    }
+}
+
+pub fn pause(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    for bx in [0.22f32, 0.58] {
+        if let Some(path) = gfx::squircle(x + s * bx, y + s * 0.14, s * 0.2, s * 0.72, s * 0.05) {
+            gfx::fill(pm, &path, c);
+        }
+    }
+}
+
+/// Two triangles: skip forward, or back when `back`.
+pub fn skip(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color, back: bool) {
+    let f = |a: f32| if back { x + s * (1.0 - a) } else { x + s * a };
+    for o in [0.0f32, 0.4] {
+        if let Some(path) = poly(&[(f(0.1 + o), y + s * 0.22), (f(0.5 + o), y + s * 0.5), (f(0.1 + o), y + s * 0.78)], true) {
+            gfx::fill(pm, &path, c);
+        }
+    }
+}
+
+pub fn music_note(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    let p = |a: f32, b: f32| (x + s * a, y + s * b);
+    if let Some(path) = poly(&[p(0.4, 0.72), p(0.4, 0.18), p(0.82, 0.1), p(0.82, 0.62)], false) {
+        gfx::stroke(pm, &path, c, line_w(s) * 1.2);
+    }
+    if let Some(path) = poly(&[p(0.4, 0.18), p(0.82, 0.1), p(0.82, 0.26), p(0.4, 0.34)], true) {
+        gfx::fill(pm, &path, c);
+    }
+    for (cx, cy) in [(0.3, 0.74), (0.72, 0.64)] {
+        if let Some(path) = gfx::circle(x + s * cx, y + s * cy, s * 0.12) {
+            gfx::fill(pm, &path, c);
+        }
+    }
+}
+
+/// A dashed selection frame: the screenshot tool.
+pub fn screenshot(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    let lw = line_w(s);
+    let (a, b) = (0.14f32, 0.86f32);
+    let l = 0.22f32;
+    for (cx, cy, dx, dy) in [(a, a, 1.0, 1.0), (b, a, -1.0, 1.0), (a, b, 1.0, -1.0), (b, b, -1.0, -1.0)] {
+        let pts = [(x + s * cx, y + s * (cy + dy * l)), (x + s * cx, y + s * cy), (x + s * (cx + dx * l), y + s * cy)];
+        if let Some(path) = poly(&pts, false) {
+            gfx::stroke_round(pm, &path, c, lw);
+        }
+    }
+    if let Some(path) = gfx::circle(x + s * 0.5, y + s * 0.5, s * 0.12) {
+        gfx::fill(pm, &path, c);
+    }
+}
+
+pub fn close_x(pm: &mut Pixmap, x: f32, y: f32, s: f32, c: Color) {
+    for (a, b) in [((0.3, 0.3), (0.7, 0.7)), ((0.7, 0.3), (0.3, 0.7))] {
+        if let Some(path) = poly(&[(x + s * a.0, y + s * a.1), (x + s * b.0, y + s * b.1)], false) {
+            gfx::stroke_round(pm, &path, c, line_w(s) * 1.2);
+        }
+    }
+}

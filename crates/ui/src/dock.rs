@@ -9,6 +9,7 @@ use tiny_skia::Pixmap;
 
 use crate::anim::{BOUNCE_PERIOD, Spring, launch_bounce};
 use crate::gfx::{self, Image, rgba};
+use crate::glass::{self, GlassStyle};
 use crate::text::Weight;
 use crate::{Ctx, WinRect, glyphs};
 
@@ -434,29 +435,27 @@ impl Dock {
         }
         gfx::put_rect(pm, bx, top, bw + 1.0, wh - top.floor(), [0, 0, 0, 1]);
 
-        let radius = bh * 0.3;
-        ctx.shadow(radius, 7.0 * s).draw(pm, bx, by + 2.0 * s, bw, bh, if th.dark { rgba(0, 0, 0, 0.32) } else { rgba(0, 0, 0, 0.13) });
-        if let Some(path) = gfx::squircle(bx, by, bw, bh, radius) {
-            match &ctx.vibrancy {
-                Some(v) => {
-                    let key = (v.id, th.dark, wr);
-                    let mut cache = self.material.borrow_mut();
-                    if cache.as_ref().is_none_or(|(k, _)| *k != key) {
-                        *cache = v
-                            .material(wr.x as f32, wr.y as f32, pm.width(), pm.height(), th.dock_tint())
-                            .map(|m| (key, m));
-                    }
-                    match cache.as_ref() {
-                        Some((_, m)) => gfx::fill_from(pm, &path, m),
-                        None => gfx::fill(pm, &path, th.dock_fallback()),
-                    }
+        let radius = bh * 0.4;
+        ctx.shadow(radius, 9.0 * s).draw(pm, bx, by + 3.0 * s, bw, bh, if th.dark { rgba(0, 0, 0, 0.30) } else { rgba(0, 0, 0, 0.10) });
+        match &ctx.vibrancy {
+            Some(v) => {
+                let key = (v.id, th.dark, wr);
+                let mut cache = self.material.borrow_mut();
+                if cache.as_ref().is_none_or(|(k, _)| *k != key) {
+                    let st = GlassStyle::dock(th.dark, s);
+                    *cache = glass::material(v, wr.x as f32, wr.y as f32, pm.width(), pm.height(), st.tint).map(|m| (key, m));
                 }
-                None => gfx::fill(pm, &path, th.dock_fallback()),
+                if let Some((_, m)) = cache.as_ref() {
+                    let shape = glass::Shape { x: bx, y: by, w: bw, h: bh, r: radius };
+                    glass::draw(pm, v, m, wr.x as f32, wr.y as f32, shape, &GlassStyle::dock(th.dark, s));
+                }
             }
-            gfx::stroke(pm, &path, th.dock_border(), 1.0);
-        }
-        if let Some(rim) = gfx::squircle(bx + 1.0, by + 1.0, bw - 2.0, bh - 2.0, radius - 1.0) {
-            gfx::stroke(pm, &rim, th.dock_rim(), 1.0);
+            None => {
+                if let Some(path) = gfx::squircle(bx, by, bw, bh, radius) {
+                    gfx::fill(pm, &path, th.dock_fallback());
+                    gfx::stroke(pm, &path, th.dock_border(), 1.0);
+                }
+            }
         }
 
         for (c, x, w) in &g.cells {

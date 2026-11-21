@@ -143,6 +143,40 @@ impl Text {
         trimmed + "…"
     }
 
+    /// Greedy word wrap into at most `max_lines`; the last line is ellipsized.
+    pub fn wrap(&self, s: &str, size: f32, w: Weight, max_w: f32, max_lines: usize) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        for para in s.split('\n') {
+            let mut cur = String::new();
+            for word in para.split_whitespace() {
+                let cand = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+                if cur.is_empty() || self.measure(&cand, size, w) <= max_w {
+                    cur = cand;
+                } else {
+                    lines.push(std::mem::take(&mut cur));
+                    cur = word.to_string();
+                }
+            }
+            lines.push(cur);
+            if lines.len() > max_lines {
+                break;
+            }
+        }
+        lines.retain(|l| !l.is_empty());
+        if lines.len() > max_lines {
+            lines.truncate(max_lines);
+            if let Some(last) = lines.last_mut() {
+                *last = self.ellipsize(&format!("{last} …"), size, w, max_w);
+            }
+        }
+        for l in &mut lines {
+            if self.measure(l, size, w) > max_w {
+                *l = self.ellipsize(l, size, w, max_w);
+            }
+        }
+        lines
+    }
+
     /// Draws `s` with its baseline at `baseline`; returns the advance width.
     /// `clip` is an optional pixel box `(x0, y0, x1, y1)`.
     #[allow(clippy::too_many_arguments)]

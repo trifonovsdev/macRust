@@ -73,9 +73,46 @@ pub fn procedural(w: u32, h: u32, dark: bool) -> Pixmap {
     pm
 }
 
+/// Half resolution, a few pixels of blur and a little extra saturation.
+fn clear_level(screen: &Pixmap) -> (Vec<u8>, usize, usize) {
+    let (w, h) = (screen.width() as usize, screen.height() as usize);
+    let (cw, ch) = ((w / 2).max(1), (h / 2).max(1));
+    let src = screen.data();
+    let mut buf = vec![0u8; cw * ch * 4];
+    for y in 0..ch {
+        for x in 0..cw {
+            let o = (y * cw + x) * 4;
+            for c in 0..4 {
+                let mut acc = 0u32;
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (sx, sy) = ((x * 2 + dx).min(w - 1), (y * 2 + dy).min(h - 1));
+                    acc += src[(sy * w + sx) * 4 + c] as u32;
+                }
+                buf[o + c] = (acc / 4) as u8;
+            }
+        }
+    }
+    box_blur(&mut buf, cw, ch, 4, 2, 3);
+    for px in buf.chunks_exact_mut(4) {
+        let a = px[3].max(1) as f32;
+        let (r, g, b) = (px[0] as f32 / a, px[1] as f32 / a, px[2] as f32 / a);
+        let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let sat = |v: f32| ((l + (v - l) * 1.25).clamp(0.0, 1.0) * a).round() as u8;
+        px[0] = sat(r);
+        px[1] = sat(g);
+        px[2] = sat(b);
+        px[3] = 255;
+    }
+    (buf, cw, ch)
+}
+
 pub struct Vibrancy {
     low: Pixmap,
     k: f32,
+    /// Lightly blurred half-resolution copy: what Liquid Glass refracts.
+    clear: Vec<u8>,
+    clear_w: usize,
+    clear_h: usize,
     /// Changes whenever the wallpaper does; caches built from it compare this.
     pub id: u64,
 }
@@ -87,6 +124,7 @@ impl Vibrancy {
     pub fn new(screen: &Pixmap) -> Self {
         let k = 8usize;
         let (w, h) = (screen.width() as usize, screen.height() as usize);
+        let (clear, clear_w, clear_h) = clear_level(screen);
         let (lw, lh) = ((w / k).max(1), (h / k).max(1));
         let src = screen.data();
         let mut buf = vec![0u8; lw * lh * 4];
@@ -124,6 +162,9 @@ impl Vibrancy {
         Self {
             low: Pixmap::from_vec(buf, size).expect("low pixmap"),
             k: k as f32,
+            clear,
+            clear_w,
+            clear_h,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -150,6 +191,30 @@ impl Vibrancy {
         p.set_color(tint);
         pm.fill_rect(rect, &p, Transform::identity(), None);
         Some(pm)
+    }
+
+    /// Bilinear sample of the lightly blurred, opaque wallpaper at a screen
+    /// point: RGB, 0..255.
+    #[inline]
+    pub fn sample_clear(&self, sx: f32, sy: f32) -> [f32; 3] {
+        let (w, h) = (self.clear_w, self.clear_h);
+        let fx = (sx * 0.5 - 0.5).clamp(0.0, (w - 1) as f32);
+        let fy = (sy * 0.5 - 0.5).clamp(0.0, (h - 1) as f32);
+        let (x0, y0) = (fx as usize, fy as usize);
+        let dx = if x0 + 1 < w { 4 } else { 0 };
+        let dy = if y0 + 1 < h { w * 4 } else { 0 };
+        let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+        let i = (y0 * w + x0) * 4;
+        let d = &self.clear[i..i + dy + dx + 3];
+        let mut out = [0.0; 3];
+        for (c, o) in out.iter_mut().enumerate() {
+            let (a, b) = (d[c] as f32, d[dx + c] as f32);
+            let (e, f) = (d[dy + c] as f32, d[dy + dx + c] as f32);
+            let top = a + (b - a) * tx;
+            let bot = e + (f - e) * tx;
+            *o = top + (bot - top) * ty;
+        }
+        out
     }
 
     /// Mean luminance (0..1) of a screen rectangle of the blurred wallpaper.

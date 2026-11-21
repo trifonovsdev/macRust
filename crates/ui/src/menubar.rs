@@ -1,10 +1,10 @@
 //! The menu bar along the top edge of the screen.
 
-use std::cell::RefCell;
+use std::rc::Rc;
 
 use tiny_skia::Pixmap;
 
-use crate::gfx::{self, rgba};
+use crate::gfx::{self, Image, rgba};
 use crate::text::Weight;
 use crate::{Ctx, WinRect, glyphs};
 
@@ -17,6 +17,13 @@ pub enum BarItem {
     Battery,
     Wifi,
     Search,
+    /// Control Center.
+    Control,
+    /// Orange/green dot while an app records the microphone or camera.
+    Privacy,
+    /// A notification-area icon of another app, by tray id.
+    Tray(u64),
+    /// Opens the Notification Center.
     Clock,
 }
 
@@ -32,6 +39,16 @@ pub enum BarEvent {
     Open { item: BarItem, x: f32, bottom: f32 },
     CloseMenus,
     Click(BarItem),
+    /// Right click on a tray icon; `x` is the icon's center, window px.
+    Context { item: BarItem, x: f32 },
+}
+
+#[derive(Clone)]
+pub struct TrayItem {
+    pub id: u64,
+    pub icon: Option<Rc<Image>>,
+    /// Changes whenever the icon picture changes.
+    pub stamp: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -43,10 +60,9 @@ pub struct Status {
     /// Connected to a network; `None` when unknown.
     pub wifi: Option<bool>,
     pub clock: String,
+    pub mic: bool,
+    pub camera: bool,
 }
-
-/// Wallpaper id, dark text, width, height.
-type MaterialKey = (u64, bool, u32, u32);
 
 pub const HEIGHT: f32 = 24.0;
 const FONT: f32 = 13.0;
@@ -60,7 +76,7 @@ pub struct MenuBar {
     pressed: Option<BarItem>,
     open: Option<BarItem>,
     dark_text: bool,
-    material: RefCell<Option<(MaterialKey, Pixmap)>>,
+    tray: Vec<TrayItem>,
     pub events: Vec<BarEvent>,
 }
 
@@ -75,7 +91,7 @@ impl MenuBar {
             pressed: None,
             open: None,
             dark_text: true,
-            material: RefCell::new(None),
+            tray: Vec::new(),
             events: Vec::new(),
         }
     }
@@ -102,6 +118,23 @@ impl MenuBar {
         self.status = st;
         self.relayout(ctx);
         true
+    }
+
+    /// Returns true when the icons changed.
+    pub fn set_tray(&mut self, tray: Vec<TrayItem>, ctx: &Ctx) -> bool {
+        let same = tray.len() == self.tray.len()
+            && tray.iter().zip(&self.tray).all(|(a, b)| a.id == b.id && a.stamp == b.stamp);
+        if same {
+            return false;
+        }
+        self.tray = tray;
+        self.relayout(ctx);
+        true
+    }
+
+    /// Screen-independent rect (window px) of a tray icon, for the tray host.
+    pub fn item_rect(&self, item: BarItem) -> Option<(f32, f32)> {
+        self.items.iter().find(|(i, _, _)| *i == item).map(|(_, a, b)| (*a, *b))
     }
 
     pub fn status(&self) -> &Status {
@@ -142,21 +175,33 @@ impl MenuBar {
         items.push((BarItem::Window, x, x + w));
 
         let mut r = self.width - 6.0 * s;
-        let mut push_right = |item: BarItem, w: f32, items: &mut Vec<(BarItem, f32, f32)>| {
-            items.push((item, r - w, r));
-            r -= w;
+        let push_right = |item: BarItem, w: f32, items: &mut Vec<(BarItem, f32, f32)>, r: &mut f32| {
+            items.push((item, *r - w, *r));
+            *r -= w;
         };
-        push_right(BarItem::Clock, t.measure(&self.status.clock, fs, Weight::Regular) + 2.0 * pad, &mut items);
-        push_right(BarItem::Search, 30.0 * s, &mut items);
+        push_right(BarItem::Clock, t.measure(&self.status.clock, fs, Weight::Regular) + 2.0 * pad, &mut items, &mut r);
+        push_right(BarItem::Control, 32.0 * s, &mut items, &mut r);
+        if self.status.mic || self.status.camera {
+            push_right(BarItem::Privacy, 16.0 * s, &mut items, &mut r);
+        }
+        push_right(BarItem::Search, 30.0 * s, &mut items, &mut r);
         if self.status.wifi.is_some() {
-            push_right(BarItem::Wifi, 30.0 * s, &mut items);
+            push_right(BarItem::Wifi, 30.0 * s, &mut items, &mut r);
         }
         if let Some((pct, _)) = self.status.battery {
             let tw = t.measure(&format!("{pct}%"), fs, Weight::Regular);
-            push_right(BarItem::Battery, tw + 34.0 * s + 2.0 * pad, &mut items);
+            push_right(BarItem::Battery, tw + 34.0 * s + 2.0 * pad, &mut items, &mut r);
         }
         if !self.status.lang.is_empty() {
-            push_right(BarItem::Lang, t.measure(&self.status.lang, fs, Weight::Medium) + 2.0 * pad, &mut items);
+            push_right(BarItem::Lang, t.measure(&self.status.lang, fs, Weight::Medium) + 2.0 * pad, &mut items, &mut r);
+        }
+        // Tray icons fill leftwards but never run into the app menus.
+        let menus_end = items.iter().filter(|(i, _, _)| i.is_menu()).map(|(_, _, b)| *b).fold(0.0, f32::max);
+        for ti in &self.tray {
+            if r - 28.0 * s < menus_end + 40.0 * s {
+                break;
+            }
+            push_right(BarItem::Tray(ti.id), 28.0 * s, &mut items, &mut r);
         }
         self.items = items;
     }
@@ -208,6 +253,13 @@ impl MenuBar {
         }
     }
 
+    pub fn right_click(&mut self, x: f32) {
+        if let Some((item @ BarItem::Tray(_), a)) = self.item_at(x) {
+            let b = self.item_rect(item).map(|r| r.1).unwrap_or(a);
+            self.events.push(BarEvent::Context { item, x: (a + b) / 2.0 });
+        }
+    }
+
     pub fn mouse_up(&mut self, x: f32, _y: f32) {
         if let Some(p) = self.pressed.take()
             && self.item_at(x).map(|h| h.0) == Some(p)
@@ -223,24 +275,20 @@ impl MenuBar {
     pub fn draw(&self, pm: &mut Pixmap, ctx: &Ctx) {
         let s = self.scale;
         let (w, h) = (pm.width() as f32, pm.height() as f32);
-        pm.fill(tiny_skia::Color::TRANSPARENT);
-        let Some(rect) = tiny_skia::Rect::from_xywh(0.0, 0.0, w, h) else { return };
-        let full = tiny_skia::PathBuilder::from_rect(rect);
-        let fallback = if ctx.theme.dark { rgba(30, 30, 32, 0.9) } else { rgba(240, 240, 242, 0.9) };
-        match &ctx.vibrancy {
-            Some(v) => {
-                let key = (v.id, self.dark_text, pm.width(), pm.height());
-                let mut cache = self.material.borrow_mut();
-                if cache.as_ref().is_none_or(|(k, _)| *k != key) {
-                    let tint = if self.dark_text { rgba(255, 255, 255, 0.26) } else { rgba(0, 0, 0, 0.14) };
-                    *cache = v.material(0.0, 0.0, pm.width(), pm.height(), tint).map(|m| (key, m));
-                }
-                match cache.as_ref() {
-                    Some((_, m)) => pm.data_mut().copy_from_slice(m.data()),
-                    None => gfx::fill(pm, &full, fallback),
+        // As in macOS 26 the bar has no material: the wallpaper shows through.
+        // Alpha 1 keeps the whole strip clickable; a faint shade along the top
+        // edge holds the contrast of light text on busy pictures.
+        gfx::put_rect(pm, 0.0, 0.0, w, h, [0, 0, 0, 1]);
+        let shade = if self.dark_text { 0.0 } else { 0.16 };
+        if shade > 0.0 {
+            let data = pm.data_mut();
+            let (pw, rows) = (w as usize, h as usize);
+            for y in 0..rows {
+                let a = ((shade * (1.0 - y as f32 / rows as f32)) * 255.0) as u8;
+                for px in data[y * pw * 4..(y + 1) * pw * 4].chunks_exact_mut(4) {
+                    px[3] = px[3].max(a);
                 }
             }
-            None => gfx::fill(pm, &full, fallback),
         }
         let fg = if self.dark_text { rgba(0, 0, 0, 0.86) } else { rgba(255, 255, 255, 0.96) };
         let lit_bg = if self.dark_text { rgba(0, 0, 0, 0.11) } else { rgba(255, 255, 255, 0.22) };
@@ -249,7 +297,7 @@ impl MenuBar {
         let pad = 9.0 * s;
         for &(item, x0, x1) in &self.items {
             let lit = self.open == Some(item) || (self.pressed == Some(item) && self.hover == Some(item));
-            if lit && let Some(p) = gfx::squircle(x0, 3.0 * s, x1 - x0, h - 6.0 * s, 5.0 * s) {
+            if lit && let Some(p) = gfx::squircle(x0, 2.0 * s, x1 - x0, h - 4.0 * s, (h - 4.0 * s) / 2.0) {
                 gfx::fill(pm, &p, lit_bg);
             }
             let cx = (x0 + x1) / 2.0;
@@ -278,6 +326,23 @@ impl MenuBar {
                 BarItem::Search => {
                     let gs = 14.0 * s;
                     glyphs::magnifier(pm, cx - gs / 2.0, h / 2.0 - gs / 2.0, gs, fg);
+                }
+                BarItem::Control => {
+                    let gs = 15.0 * s;
+                    glyphs::switches(pm, (cx - gs / 2.0).round(), (h / 2.0 - gs / 2.0).round(), gs, fg);
+                }
+                BarItem::Privacy => {
+                    // Orange: microphone; green: camera (it implies the microphone too).
+                    let c = if self.status.camera { rgba(52, 199, 89, 1.0) } else { rgba(255, 149, 0, 1.0) };
+                    if let Some(p) = gfx::circle(cx, h / 2.0, 3.5 * s) {
+                        gfx::fill(pm, &p, c);
+                    }
+                }
+                BarItem::Tray(id) => {
+                    if let Some(img) = self.tray.iter().find(|t| t.id == id).and_then(|t| t.icon.as_ref()) {
+                        let size = (16.0 * s).round();
+                        img.draw(pm, (cx - size / 2.0).round(), (h / 2.0 - size / 2.0).round(), size, 1.0, false);
+                    }
                 }
                 BarItem::Clock => {
                     ctx.text.draw(pm, &self.status.clock, x0 + pad, base, fs, Weight::Regular, fg, None);

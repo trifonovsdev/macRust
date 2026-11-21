@@ -39,18 +39,12 @@ impl Theme {
     pub fn shadow(&self) -> Color {
         if self.dark { rgba(0, 0, 0, 0.5) } else { rgba(0, 0, 0, 0.26) }
     }
-    /// Tint laid over the blurred wallpaper of the dock.
-    pub fn dock_tint(&self) -> Color {
-        if self.dark { rgba(28, 28, 30, 0.42) } else { rgba(255, 255, 255, 0.34) }
-    }
+    /// Dock color when no wallpaper material is available.
     pub fn dock_fallback(&self) -> Color {
         if self.dark { rgba(40, 40, 42, 0.86) } else { rgba(236, 236, 238, 0.82) }
     }
     pub fn dock_border(&self) -> Color {
         if self.dark { rgba(0, 0, 0, 0.35) } else { rgba(0, 0, 0, 0.08) }
-    }
-    pub fn dock_rim(&self) -> Color {
-        if self.dark { rgba(255, 255, 255, 0.16) } else { rgba(255, 255, 255, 0.45) }
     }
     pub fn indicator(&self) -> Color {
         if self.dark { rgba(255, 255, 255, 0.62) } else { rgba(0, 0, 0, 0.5) }
