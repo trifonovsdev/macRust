@@ -367,15 +367,6 @@ impl App {
         }
     }
 
-    /// Window rect for a panel body of `body_w` that hangs under the right end of the bar.
-    fn panel_rect(&self, win: (i32, i32)) -> WinRect {
-        let s = self.screen.scale;
-        let m = (MARGIN * s).round() as i32;
-        let x = self.screen.w - (8.0 * s).round() as i32 - win.0 + m;
-        let y = self.bar.height_px() + (5.0 * s).round() as i32 - m;
-        WinRect { x, y, w: win.0, h: win.1 }
-    }
-
     /// Window rect for Notification Center and banners: Tahoe hangs them in a
     /// column whose right edge lines up with the clock's text (18.5 pt from
     /// the screen edge), 15 pt below the bar.
@@ -389,7 +380,12 @@ impl App {
 
     fn arm_outside_click(&mut self, r: WinRect) {
         let m = (MARGIN * self.screen.scale).round() as i32;
-        for (a, v) in MENU_RECT.iter().zip([r.x + m, r.y + m, r.x + r.w - m, r.y + r.h - m]) {
+        self.arm_outside_body(WinRect { x: r.x + m, y: r.y + m, w: r.w - 2 * m, h: r.h - 2 * m });
+    }
+
+    /// Clicks outside `body` (screen rect) close the panels.
+    fn arm_outside_body(&mut self, b: WinRect) {
+        for (a, v) in MENU_RECT.iter().zip([b.x, b.y, b.x + b.w, b.y + b.h]) {
             a.store(v, std::sync::atomic::Ordering::Relaxed);
         }
         MENU_FROM_BAR.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -410,7 +406,8 @@ impl App {
         self.x.media.send(Command::Refresh);
         let st = self.control_state();
         let mut cc = ControlCenter::new(st, self.screen.scale);
-        let r = self.panel_rect(cc.window_size());
+        let r = cc.window_rect(self.screen.w, self.bar.height_px());
+        let body = cc.body_rect(r);
         // The glass blurs what is under the panel; taken once, before it shows.
         if let Some(behind) = system::capture(r) {
             cc.set_backdrop(&behind);
@@ -420,7 +417,7 @@ impl App {
         self.x.cc_s.dirty = true;
         self.bar.set_open(Some(BarItem::Control));
         self.bar_s.dirty = true;
-        self.arm_outside_click(r);
+        self.arm_outside_body(body);
         self.render();
         self.x.cc_s.raise();
     }
@@ -723,7 +720,7 @@ impl App {
             behind.draw_pixmap(-r.x, -r.y, wall.as_ref(), &macrust_ui::tiny_skia::PixmapPaint::default(), macrust_ui::tiny_skia::Transform::identity(), None);
             Some(behind)
         };
-        let r = self.panel_rect(cc.window_size());
+        let r = cc.window_rect(self.screen.w, self.bar.height_px());
         if let Some(behind) = crop(r) {
             cc.set_backdrop(&behind);
         }
@@ -926,7 +923,7 @@ impl App {
         if self.x.cc_s.dirty
             && let Some(cc) = &self.x.cc
         {
-            let r = self.panel_rect(cc.window_size());
+            let r = cc.window_rect(self.screen.w, self.bar.height_px());
             self.x.cc_s.prepare(r);
             cc.draw(&mut self.x.cc_s.pm, &self.ctx);
             clear_rows(&mut self.x.cc_s.pm, bar_h - r.y);
