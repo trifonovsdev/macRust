@@ -1,10 +1,9 @@
 //! Pull-down and context menus.
 
-use tiny_skia::Pixmap;
+use tiny_skia::{Color, Pixmap};
 
-use crate::anim::Spring;
 use crate::gfx::{self, rgba};
-use crate::glass::{Backdrop, GlassStyle, Shape};
+use crate::glass::{self, Backdrop, GlassStyle, Shape};
 use crate::text::Weight;
 use crate::{Ctx, Key, glyphs};
 
@@ -44,26 +43,59 @@ pub enum MenuEvent {
     Pick(u32),
 }
 
-// Points.
-const ITEM_H: f32 = 24.0;
-const SEP_H: f32 = 11.0;
-const VPAD: f32 = 6.0;
-const LEFT: f32 = 22.0;
-const RIGHT: f32 = 16.0;
+// Points, measured on Tahoe 26.0 menus (TAHOE-SPEC.md section 3).
+const ITEM_H: f32 = 22.0;
+const SEP_H: f32 = 10.0;
+/// Space above the first and below the last row; the selection sits this far
+/// from the panel edges on all sides.
+const VPAD: f32 = 5.0;
+const INSET: f32 = 5.0;
+/// Text start without and with a checkmark column.
+const LEFT: f32 = 16.0;
+const LEFT_CHECK: f32 = 26.0;
+const RIGHT: f32 = 14.0;
+const SHORTCUT_GAP: f32 = 24.0;
+const SEP_INSET: f32 = 14.0;
 const FONT: f32 = 13.0;
-const RADIUS: f32 = 12.0;
+const RADIUS: f32 = 12.5;
+const SEL_RADIUS: f32 = 5.0;
 /// Room for the shadow around the body.
 pub const MARGIN_X: f32 = 24.0;
 pub const MARGIN_TOP: f32 = 12.0;
 pub const MARGIN_BOTTOM: f32 = 34.0;
+/// The picked row blinks off for half of this before the menu closes.
 const FLASH: f32 = 0.13;
+/// macOS menus appear at once and fade out briefly.
+const FADE_OUT: f32 = 0.2;
+
+fn selection(dark: bool) -> Color {
+    // Tahoe darkens the accent in dark menus: (20,80,178), not systemBlue.
+    if dark { rgba(20, 80, 178, 1.0) } else { rgba(0, 122, 255, 1.0) }
+}
+
+fn text_color(dark: bool) -> Color {
+    if dark { rgba(242, 242, 242, 1.0) } else { rgba(0, 0, 0, 0.85) }
+}
+
+fn secondary(dark: bool) -> Color {
+    if dark { rgba(255, 255, 255, 0.5) } else { rgba(0, 0, 0, 0.45) }
+}
+
+fn disabled(dark: bool) -> Color {
+    if dark { rgba(255, 255, 255, 0.25) } else { rgba(0, 0, 0, 0.25) }
+}
+
+fn separator(dark: bool) -> Color {
+    if dark { rgba(255, 255, 255, 0.14) } else { rgba(0, 0, 0, 0.1) }
+}
 
 pub struct PopupMenu {
     entries: Vec<MenuEntry>,
     scale: f32,
     hover: Option<usize>,
-    alpha: Spring,
-    closing: bool,
+    /// Seconds since `close`, while fading out.
+    closing: Option<f32>,
+    left: f32,
     flash: Option<(usize, f32)>,
     body_w: f32,
     body_h: f32,
@@ -90,11 +122,10 @@ impl PopupMenu {
                 short_w = short_w.max(ctx.text.measure(&e.shortcut, FONT * s, Weight::Regular));
             }
         }
-        let gap = if short_w > 0.0 { 28.0 * s } else { 0.0 };
-        let body_w = (LEFT * s + text_w + gap + short_w + RIGHT * s).max(170.0 * s).ceil();
-        let mut alpha = Spring::new(0.0, 0.14, 1.0).epsilon(0.002);
-        alpha.to(1.0);
-        Self { entries, scale, hover: None, alpha, closing: false, flash: None, body_w, body_h: h.ceil(), backdrop: None, owner, events: Vec::new() }
+        let left = if entries.iter().any(|e| e.checked) { LEFT_CHECK } else { LEFT };
+        let gap = if short_w > 0.0 { SHORTCUT_GAP * s } else { 0.0 };
+        let body_w = (left * s + text_w + gap + short_w + RIGHT * s).max(170.0 * s).ceil();
+        Self { entries, scale, hover: None, closing: None, left, flash: None, body_w, body_h: h.ceil(), backdrop: None, owner, events: Vec::new() }
     }
 
     /// What is behind the window, window-sized; the menu is glass over it.
@@ -118,28 +149,32 @@ impl PopupMenu {
     }
 
     pub fn close(&mut self) {
-        if !self.closing {
-            self.closing = true;
-            self.alpha = Spring::new(self.alpha.value, 0.24, 1.0).epsilon(0.002);
-            self.alpha.to(0.0);
+        if self.closing.is_none() {
+            self.closing = Some(0.0);
         }
     }
 
     pub fn closing(&self) -> bool {
-        self.closing
+        self.closing.is_some()
     }
 
     /// The fade-out finished; the host can hide the window.
     pub fn finished(&self) -> bool {
-        self.closing && self.alpha.settled()
+        self.closing.is_some_and(|t| t >= FADE_OUT)
     }
 
     pub fn animating(&self) -> bool {
-        !self.alpha.settled() || self.flash.is_some()
+        self.closing.is_some_and(|t| t < FADE_OUT) || self.flash.is_some()
+    }
+
+    fn alpha(&self) -> f32 {
+        self.closing.map_or(1.0, |t| 1.0 - (t / FADE_OUT).clamp(0.0, 1.0))
     }
 
     pub fn update(&mut self, dt: f32) {
-        self.alpha.step(dt);
+        if let Some(t) = &mut self.closing {
+            *t += dt;
+        }
         if let Some((i, t)) = self.flash {
             let t = t + dt;
             if t >= FLASH {
@@ -171,7 +206,7 @@ impl PopupMenu {
     }
 
     pub fn mouse_move(&mut self, x: f32, y: f32) {
-        if self.flash.is_none() && !self.closing {
+        if self.flash.is_none() && self.closing.is_none() {
             self.hover = self.item_at(x, y);
         }
     }
@@ -184,7 +219,7 @@ impl PopupMenu {
 
     /// Returns true if the click hit an item.
     pub fn mouse_up(&mut self, x: f32, y: f32) -> bool {
-        if self.closing || self.flash.is_some() {
+        if self.closing.is_some() || self.flash.is_some() {
             return true;
         }
         match self.item_at(x, y) {
@@ -198,7 +233,7 @@ impl PopupMenu {
     }
 
     pub fn key(&mut self, key: Key) {
-        if self.closing || self.flash.is_some() {
+        if self.closing.is_some() || self.flash.is_some() {
             return;
         }
         let selectable: Vec<usize> =
@@ -232,61 +267,88 @@ impl PopupMenu {
     pub fn draw(&self, pm: &mut Pixmap, ctx: &Ctx) {
         pm.fill(tiny_skia::Color::TRANSPARENT);
         let s = self.scale;
-        let th = ctx.theme;
-        let a = self.alpha.value.clamp(0.0, 1.0);
+        let dark = ctx.theme.dark;
+        let a = self.alpha();
         if a <= 0.0 {
             return;
         }
         let (ox, oy) = self.body_offset();
         let (bx, by, bw, bh) = (ox as f32, oy as f32, self.body_w, self.body_h);
         let r = RADIUS * s;
-        ctx.shadow(r, 14.0 * s).draw(pm, bx, by + 8.0 * s, bw, bh, gfx::fade(th.shadow(), 0.7));
+        let shape = Shape { x: bx, y: by, w: bw, h: bh, r };
+        ctx.shadow(r, 14.0 * s).draw(pm, bx, by + 8.0 * s, bw, bh, gfx::fade(ctx.theme.shadow(), 0.7));
         match &self.backdrop {
-            Some(b) => b.draw(pm, Shape { x: bx, y: by, w: bw, h: bh, r }, &GlassStyle::menu(th.dark, s)),
+            Some(b) => b.draw(pm, shape, &GlassStyle::menu(dark, s)),
             None => {
-                if let Some(p) = gfx::squircle(bx, by, bw, bh, r) {
-                    gfx::fill(pm, &p, th.panel());
-                    gfx::stroke(pm, &p, th.panel_border(), 1.0);
-                }
+                let fill = if dark { rgba(22, 22, 22, 1.0) } else { rgba(240, 240, 242, 1.0) };
+                glass::hairline(pm, shape, 0.0, 1e4, fill, fill);
             }
         }
+        // A dark 1 px ring outside, a 0.5 pt light hairline inside.
+        let ring = if dark { rgba(0, 0, 0, 0.6) } else { rgba(0, 0, 0, 0.14) };
+        glass::hairline(pm, shape, -1.0, 0.0, ring, ring);
+        let rim = if dark { rgba(255, 255, 255, 0.4) } else { rgba(255, 255, 255, 0.7) };
+        glass::hairline(pm, shape, 0.0, 0.5 * s, rim, rim);
+
         let fs = FONT * s;
+        let left = self.left * s;
         let mut cy = by + VPAD * s;
         for (i, e) in self.entries.iter().enumerate() {
             if e.separator {
-                let ly = (cy + SEP_H * s / 2.0).floor();
-                gfx::fill_rect(pm, bx + 12.0 * s, ly, bw - 24.0 * s, s.max(1.0).round(), th.separator());
+                let t = s.max(1.0).round();
+                let ly = (cy + (SEP_H * s - t) / 2.0).round();
+                gfx::fill_rect(pm, bx + SEP_INSET * s, ly, bw - 2.0 * SEP_INSET * s, t, separator(dark));
                 cy += SEP_H * s;
                 continue;
             }
             let h = ITEM_H * s;
             let flash_off = matches!(self.flash, Some((fi, t)) if fi == i && t < FLASH / 2.0);
             let lit = self.hover == Some(i) && e.enabled && !flash_off;
-            if lit && let Some(p) = gfx::squircle(bx + 6.0 * s, cy, bw - 12.0 * s, h, 7.0 * s) {
-                gfx::fill(pm, &p, th.accent());
+            if lit && let Some(p) = gfx::squircle(bx + INSET * s, cy.round(), bw - 2.0 * INSET * s, h.round(), SEL_RADIUS * s) {
+                gfx::fill(pm, &p, selection(dark));
             }
             let color = if lit {
                 rgba(255, 255, 255, 1.0)
             } else if e.enabled {
-                th.label()
+                text_color(dark)
             } else {
-                th.tertiary()
+                disabled(dark)
             };
             let base = (cy + h / 2.0 + ctx.text.cap_height(fs) / 2.0).round();
             if e.checked {
-                glyphs::checkmark(pm, bx + 7.0 * s, cy + h / 2.0 - 6.0 * s, 12.0 * s, color);
+                let g = 11.0 * s;
+                glyphs::checkmark(pm, (bx + 10.0 * s).round(), cy + (h - g) / 2.0, g, color);
             }
-            let max_label = bw - (LEFT + RIGHT) * s;
+            let max_label = bw - left - RIGHT * s;
             let label = ctx.text.ellipsize(&e.label, fs, Weight::Regular, max_label);
-            ctx.text.draw(pm, &label, bx + LEFT * s, base, fs, Weight::Regular, color, None);
+            ctx.text.draw(pm, &label, (bx + left).round(), base, fs, Weight::Regular, color, None);
             if !e.shortcut.is_empty() {
                 let sw = ctx.text.measure(&e.shortcut, fs, Weight::Regular);
-                let sc = if lit { rgba(255, 255, 255, 0.85) } else { th.secondary() };
-                ctx.text.draw(pm, &e.shortcut, bx + bw - RIGHT * s - sw, base, fs, Weight::Regular, sc, None);
+                let sc = if lit { rgba(255, 255, 255, 0.85) } else { secondary(dark) };
+                ctx.text.draw(pm, &e.shortcut, (bx + bw - RIGHT * s - sw).round(), base, fs, Weight::Regular, sc, None);
             }
             cy += h;
         }
         // The glass cannot be drawn translucent, so the finished menu fades as a whole.
         crate::panel::fade_all(pm, a);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opens_at_once_and_fades_out_briefly() {
+        let ctx = Ctx::new(crate::text::Text::bundled(), crate::theme::Theme { dark: true }, &crate::strings::Strings::EN);
+        let mut m = PopupMenu::new(vec![MenuEntry::item("One", 1), MenuEntry::sep(), MenuEntry::item("Two", 2)], 0, 1.0, &ctx);
+        assert!(!m.animating());
+        assert_eq!(m.alpha(), 1.0);
+        assert_eq!(m.body_size().1, (2.0 * VPAD + 2.0 * ITEM_H + SEP_H).ceil());
+        m.close();
+        m.update(0.1);
+        assert!(m.animating() && !m.finished());
+        m.update(0.11);
+        assert!(m.finished());
     }
 }

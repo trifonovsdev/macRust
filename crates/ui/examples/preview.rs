@@ -224,8 +224,8 @@ fn desktop(sc: &Scene, out: &str, name: &str, with_menu: bool, with_spot: bool, 
         }
         let (mw, mh) = menu.window_size();
         let (ox, oy) = menu.body_offset();
-        menu.mouse_move(ox as f32 + 40.0, oy as f32 + (6.0 + 24.0 * 2.0 + 11.0 + 8.0) * sc.scale);
-        let r = WinRect { x: (6.0 * sc.scale) as i32 - ox, y: bar.height_px() + (2.0 * sc.scale) as i32 - oy, w: mw, h: mh };
+        menu.mouse_move(ox as f32 + 40.0, oy as f32 + (5.0 + 22.0 * 2.0 + 10.0 + 8.0) * sc.scale);
+        let r = WinRect { x: (10.0 * sc.scale) as i32 - ox, y: bar.height_px() - oy, w: mw, h: mh };
         let mut behind = Pixmap::new(mw as u32, mh as u32).unwrap();
         behind.draw_pixmap(-r.x, -r.y, screen.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
         menu.set_backdrop(&behind);
@@ -432,9 +432,226 @@ fn crop_dock(sc: &Scene, out: &str, name: &str, dock: &Dock) {
     bg.save_png(format!("{out}/{name}.png")).unwrap();
 }
 
+
+/// A pink-to-blue striped wallpaper like the one under Tahoe's Apple menu
+/// in the reference capture.
+fn stripes(w: u32, h: u32) -> Pixmap {
+    let mut pm = Pixmap::new(w, h).unwrap();
+    let d = pm.data_mut();
+    for y in 0..h {
+        for x in 0..w {
+            let t = x as f32 / w as f32;
+            let band = 0.82 + 0.18 * ((x as f32 / w as f32 * 60.0).sin() * 0.5 + 0.5);
+            let v = 1.0 - 0.35 * (y as f32 / h as f32);
+            let (r, g, b) = (221.0 + (60.0 - 221.0) * t, 88.0 + (70.0 - 88.0) * t, 158.0 + (190.0 - 158.0) * t);
+            let o = ((y * w + x) * 4) as usize;
+            d[o] = (r * band * v) as u8;
+            d[o + 1] = (g * band * v) as u8;
+            d[o + 2] = (b * band * v) as u8;
+            d[o + 3] = 255;
+        }
+    }
+    pm
+}
+
+/// Stand-ins for Windows notification-area icons at `n` px: a white glyph,
+/// a colourful logo, a dim grey glyph and a coloured flat glyph.
+fn tray_sources(n: u32) -> Vec<Pixmap> {
+    let f = n as f32;
+    let mut out = Vec::new();
+    let mut speaker = Pixmap::new(n, n).unwrap();
+    let mut pb = macrust_ui::tiny_skia::PathBuilder::new();
+    pb.move_to(f * 0.1, f * 0.38);
+    pb.line_to(f * 0.3, f * 0.38);
+    pb.line_to(f * 0.55, f * 0.15);
+    pb.line_to(f * 0.55, f * 0.85);
+    pb.line_to(f * 0.3, f * 0.62);
+    pb.line_to(f * 0.1, f * 0.62);
+    pb.close();
+    gfx::fill(&mut speaker, &pb.finish().unwrap(), rgba(255, 255, 255, 1.0));
+    gfx::fill_rect(&mut speaker, f * 0.68, f * 0.3, (f * 0.08).max(1.0), f * 0.4, rgba(255, 255, 255, 1.0));
+    gfx::fill_rect(&mut speaker, f * 0.84, f * 0.18, (f * 0.08).max(1.0), f * 0.64, rgba(255, 255, 255, 1.0));
+    out.push(speaker);
+    let mut tg = Pixmap::new(n, n).unwrap();
+    if let Some(c) = gfx::circle(f / 2.0, f / 2.0, f * 0.47) {
+        gfx::fill(&mut tg, &c, rgba(40, 160, 230, 1.0));
+    }
+    macrust_ui::glyphs::play(&mut tg, f * 0.28, f * 0.28, f * 0.46, rgba(255, 255, 255, 1.0));
+    out.push(tg);
+    let mut shield = Pixmap::new(n, n).unwrap();
+    if let Some(r) = gfx::squircle(f * 0.2, f * 0.1, f * 0.6, f * 0.8, f * 0.25) {
+        gfx::fill(&mut shield, &r, rgba(200, 200, 200, 0.55));
+    }
+    out.push(shield);
+    let mut usb = Pixmap::new(n, n).unwrap();
+    if let Some(r) = gfx::squircle(f * 0.3, f * 0.08, f * 0.4, f * 0.84, f * 0.1) {
+        gfx::fill(&mut usb, &r, rgba(240, 190, 40, 1.0));
+    }
+    out.push(usb);
+    out
+}
+
+fn bar_with(sc: &Scene, lang: &str, mic: bool, open: Option<BarItem>, tray_px: u32) -> MenuBar {
+    let mut bar = MenuBar::new();
+    bar.set_screen(sc.w, sc.scale, &sc.ctx);
+    bar.set_status(
+        Status {
+            app: "Проводник".into(),
+            lang: lang.into(),
+            battery: None,
+            wifi: Some(true),
+            clock: sc.ctx.strings.clock(6, 21, 10, 14, 36),
+            mic,
+            camera: false,
+        },
+        &sc.ctx,
+    );
+    bar.update_contrast(&sc.ctx);
+    let tray: Vec<TrayItem> = tray_sources(tray_px)
+        .iter()
+        .enumerate()
+        .map(|(i, src)| TrayItem {
+            id: i as u64 + 1,
+            icon_dark: gfx::template(src, [0, 0, 0]).map(|p| Rc::new(Image::new(p))),
+            icon_light: gfx::template(src, [255, 255, 255]).map(|p| Rc::new(Image::new(p))),
+            stamp: 1,
+        })
+        .collect();
+    bar.set_tray(tray, &sc.ctx);
+    bar.set_open(open);
+    bar
+}
+
+fn scene_on(wall: Pixmap, scale: f32, dark: bool, strings: &'static Strings) -> Scene {
+    let (w, h) = (wall.width() as f32, wall.height() as f32);
+    let mut ctx = Ctx::new(Text::bundled(), Theme { dark }, strings);
+    ctx.vibrancy = Some(Vibrancy::new(&wall));
+    Scene { ctx, wall, w, h, scale }
+}
+
+fn crop(pm: &Pixmap, x: i32, y: i32, w: u32, h: u32) -> Pixmap {
+    let mut out = Pixmap::new(w, h).unwrap();
+    out.draw_pixmap(-x, -y, pm.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    out
+}
+
+/// The Apple menu open from the bar, hovering its first item.
+fn tahoe_menu(sc: &Scene, out: &str, name: &str) {
+    let s = sc.scale;
+    let mut screen = sc.wall.clone();
+    let bar = bar_with(sc, "RU", false, Some(BarItem::Logo), 16);
+    let br = bar.window_rect();
+    let mut bpm = pixmap_for(br);
+    bar.draw(&mut bpm, &sc.ctx);
+    blit(&mut screen, &bpm, br);
+    let st = sc.ctx.strings;
+    let mut menu = PopupMenu::new(
+        vec![
+            MenuEntry::item(st.about, 1),
+            MenuEntry::sep(),
+            MenuEntry::item(st.settings, 2),
+            MenuEntry::item(st.store, 3),
+            MenuEntry::sep(),
+            MenuEntry::item(st.force_quit, 4).shortcut("Ctrl+Shift+Esc"),
+            MenuEntry::sep(),
+            MenuEntry::item(st.sleep, 5),
+            MenuEntry::item(st.restart, 6),
+            MenuEntry::item(st.shut_down, 7),
+            MenuEntry::sep(),
+            MenuEntry::item(st.lock, 8).shortcut("Win+L"),
+            MenuEntry::item(st.log_out, 9).enabled(false),
+        ],
+        1,
+        s,
+        &sc.ctx,
+    );
+    let (mw, mh) = menu.window_size();
+    let (ox, oy) = menu.body_offset();
+    menu.mouse_move(ox as f32 + 40.0 * s, oy as f32 + 10.0 * s);
+    let x = bar.item_rect(BarItem::Logo).map(|_| 10.0 * s).unwrap_or(0.0);
+    let r = WinRect { x: x.round() as i32 - ox, y: bar.height_px() - oy, w: mw, h: mh };
+    menu.set_backdrop(&crop(&screen, r.x, r.y, mw as u32, mh as u32));
+    let mut mpm = pixmap_for(r);
+    menu.draw(&mut mpm, &sc.ctx);
+    blit(&mut screen, &mpm, r);
+    let (bw, bh) = menu.body_size();
+    let w = (r.x + ox) as u32 + bw as u32 + (40.0 * s) as u32;
+    let h = (r.y + oy) as u32 + bh as u32 + (20.0 * s) as u32;
+    crop(&screen, 0, 0, w, h).save_png(format!("{out}/{name}.png")).unwrap();
+}
+
+/// The right end of the menu bar, 700 pt wide.
+fn tahoe_bar(sc: &Scene, out: &str, name: &str, open: Option<BarItem>) {
+    let s = sc.scale;
+    let mut screen = sc.wall.clone();
+    let bar = bar_with(sc, "RU", true, open, (16.0 * s) as u32);
+    let br = bar.window_rect();
+    let mut bpm = pixmap_for(br);
+    bar.draw(&mut bpm, &sc.ctx);
+    blit(&mut screen, &bpm, br);
+    let w = (700.0 * s) as u32;
+    crop(&screen, sc.w as i32 - w as i32, 0, w, br.h as u32).save_png(format!("{out}/{name}.png")).unwrap();
+}
+
+/// Notification Center hanging under the clock, as the shell places it.
+fn tahoe_nc(sc: &Scene, out: &str, name: &str, with_notes: bool) {
+    let s = sc.scale;
+    let mut screen = sc.wall.clone();
+    let bar = bar_with(sc, "RU", false, Some(BarItem::Clock), 16);
+    let br = bar.window_rect();
+    let mut bpm = pixmap_for(br);
+    bar.draw(&mut bpm, &sc.ctx);
+    blit(&mut screen, &bpm, br);
+    let today = Today { year: 2026, month: 10, day: 21, weekday: 6 };
+    let mut nc = NotificationCenter::new(if with_notes { notes() } else { Vec::new() }, today, s, sc.h - br.h as f32);
+    for _ in 0..120 {
+        nc.update(1.0 / 120.0);
+    }
+    let (nw, nh) = nc.window_size(&sc.ctx);
+    let m = (macrust_ui::panel::MARGIN * s).round() as i32;
+    let r = WinRect { x: sc.w as i32 - (18.5 * s).round() as i32 - nw + m, y: br.h + (15.0 * s).round() as i32 - m, w: nw, h: nh };
+    nc.set_backdrop(&crop(&sc.wall, r.x, r.y, nw as u32, nh as u32));
+    let mut npm = pixmap_for(r);
+    nc.draw(&mut npm, &sc.ctx);
+    blit(&mut screen, &npm, r);
+    let w = (420.0 * s) as u32;
+    let h = (r.y + nh) as u32;
+    crop(&screen, sc.w as i32 - w as i32, 0, w, h.min(sc.h as u32)).save_png(format!("{out}/{name}.png")).unwrap();
+}
+
+/// Renders compared against the Tahoe reference frames.
+fn tahoe_set(out: &str) {
+    let pink2 = scene_on(stripes(3840, 2160), 2.0, true, &Strings::EN);
+    tahoe_menu(&pink2, out, "tahoe-menu-dark-2x");
+    let ru2 = scene_on(stripes(3840, 2160), 2.0, true, &Strings::RU);
+    tahoe_menu(&ru2, out, "tahoe-menu-dark-ru-2x");
+    let light2 = scene_on(wallpaper::procedural(3840, 2160, false), 2.0, false, &Strings::EN);
+    tahoe_menu(&light2, out, "tahoe-menu-light-2x");
+    let mut black = Pixmap::new(1920, 1080).unwrap();
+    black.fill(Color::from_rgba8(0, 0, 0, 255));
+    let owner = scene_on(black.clone(), 1.0, true, &Strings::RU);
+    tahoe_bar(&owner, out, "tahoe-bar-black-1x", None);
+    let mut black2 = Pixmap::new(3840, 2160).unwrap();
+    black2.fill(Color::from_rgba8(0, 0, 0, 255));
+    let owner2 = scene_on(black2, 2.0, true, &Strings::RU);
+    tahoe_bar(&owner2, out, "tahoe-bar-black-2x", Some(BarItem::Control));
+    let blue2 = scene_on(wallpaper::procedural(3840, 2160, true), 2.0, true, &Strings::EN);
+    tahoe_bar(&blue2, out, "tahoe-bar-en-2x", Some(BarItem::Control));
+    let blue1 = scene_on(wallpaper::procedural(1920, 1080, false), 1.0, false, &Strings::RU);
+    tahoe_bar(&blue1, out, "tahoe-bar-light-1x", None);
+    tahoe_nc(&owner2, out, "tahoe-nc-black-2x", false);
+    tahoe_nc(&pink2, out, "tahoe-nc-dark-2x", true);
+    tahoe_nc(&light2, out, "tahoe-nc-light-2x", true);
+    tahoe_nc(&owner, out, "tahoe-nc-black-ru-1x", true);
+}
+
 fn main() {
     let out = std::env::args().nth(1).unwrap_or_else(|| "out".into());
     std::fs::create_dir_all(&out).unwrap();
+    tahoe_set(&out);
+    if std::env::var_os("TAHOE_ONLY").is_some() {
+        return;
+    }
 
     icon_sheet(&out);
     let retina_light = scene(2880, 1800, 2.0, false);

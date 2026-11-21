@@ -244,7 +244,6 @@ impl Strings {
         }
     }
 
-    /// Menu-bar clock: «Пт 21 нояб. 14:32» / «Fri Nov 21 14:32».
     pub fn is_ru(&self) -> bool {
         self.days[0] == "Вс"
     }
@@ -265,13 +264,27 @@ impl Strings {
         }
     }
 
+    /// Menu-bar clock as Tahoe writes it: «Сб, 21 нояб.  14:32» /
+    /// «Sat Nov 21  14:32». The double space marks the date/time gap, which
+    /// the menu bar draws 10.5 pt wide.
     pub fn clock(&self, weekday: usize, day: u32, month: usize, hour: u32, minute: u32) -> String {
         let wd = self.days[weekday % 7];
         let mo = self.months[month.min(11)];
         if !self.is_ru() {
-            format!("{wd} {mo} {day} {hour:02}:{minute:02}")
+            format!("{wd} {mo} {day}  {hour:02}:{minute:02}")
         } else {
-            format!("{wd} {day} {mo} {hour:02}:{minute:02}")
+            format!("{wd}, {day} {mo}  {hour:02}:{minute:02}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_matches_tahoe() {
+        assert_eq!(Strings::RU.clock(6, 21, 10, 14, 36), "Сб, 21 нояб.  14:36");
+        assert_eq!(Strings::EN.clock(6, 21, 10, 14, 36), "Sat Nov 21  14:36");
     }
 }
