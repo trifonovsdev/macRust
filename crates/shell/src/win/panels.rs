@@ -435,7 +435,7 @@ impl App {
                     }
                     self.ctx.theme = Theme { dark };
                     self.configure(false);
-                    self.reshape_icons();
+                    self.rebuild_dock();
                     self.x.cc_s.dirty = true;
                 }
                 ControlEvent::Screenshot => {

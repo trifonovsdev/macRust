@@ -73,7 +73,7 @@ pub fn procedural(w: u32, h: u32, dark: bool) -> Pixmap {
     pm
 }
 
-/// Half resolution, a few pixels of blur and a little extra saturation.
+/// Half resolution, a strong blur and a little extra saturation.
 fn clear_level(screen: &Pixmap) -> (Vec<u8>, usize, usize) {
     let (w, h) = (screen.width() as usize, screen.height() as usize);
     let (cw, ch) = ((w / 2).max(1), (h / 2).max(1));
@@ -91,7 +91,9 @@ fn clear_level(screen: &Pixmap) -> (Vec<u8>, usize, usize) {
             }
         }
     }
-    box_blur(&mut buf, cw, ch, 4, 2, 3);
+    // Sigma about 7 screen px: the macOS 26 dock keeps only ~15% of the
+    // contrast of 10 pt wallpaper detail at 2x.
+    box_blur(&mut buf, cw, ch, 4, 3, 3);
     for px in buf.chunks_exact_mut(4) {
         let a = px[3].max(1) as f32;
         let (r, g, b) = (px[0] as f32 / a, px[1] as f32 / a, px[2] as f32 / a);
@@ -108,7 +110,7 @@ fn clear_level(screen: &Pixmap) -> (Vec<u8>, usize, usize) {
 pub struct Vibrancy {
     low: Pixmap,
     k: f32,
-    /// Lightly blurred half-resolution copy: what Liquid Glass refracts.
+    /// Blurred half-resolution copy: the dock's glass.
     clear: Vec<u8>,
     clear_w: usize,
     clear_h: usize,

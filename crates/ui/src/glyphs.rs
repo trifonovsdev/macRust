@@ -286,31 +286,143 @@ pub fn settings_tile(pm: &mut Pixmap, x: f32, y: f32, s: f32) {
     logo(pm, x + s * 0.22, y + s * 0.22, s * 0.56, rgba(240, 240, 245, 1.0));
 }
 
-/// Fallback recycle bin, drawn as a translucent bin with ribs.
-pub fn trash(pm: &mut Pixmap, x: f32, y: f32, s: f32) {
-    let (l, r, t, b) = (x + s * 0.2, x + s * 0.8, y + s * 0.2, y + s * 0.92);
+fn fill_stops(pm: &mut Pixmap, path: &tiny_skia::Path, y0: f32, y1: f32, stops: &[(f32, Color)]) {
+    let stops = stops.iter().map(|&(t, c)| GradientStop::new(t, c)).collect();
+    if let Some(sh) = LinearGradient::new(Point::from_xy(0.0, y0), Point::from_xy(0.0, y1), stops, SpreadMode::Pad, Transform::identity()) {
+        gfx::fill_shader(pm, path, sh);
+    }
+}
+
+/// Maps the dock icon box (`x, y`, side `s`) to units of the visible tile,
+/// which is 0.805 of the box (Apple's icon grid), origin at its top-left.
+fn tile_units(x: f32, y: f32, s: f32) -> impl Fn(f32, f32) -> (f32, f32) {
+    let (v, m) = (s * 0.805, s * 0.0975);
+    move |u, w| (x + m + u * v, y + m + w * v)
+}
+
+/// The dock's Downloads stack in the macOS 26 manner: a plain light-blue
+/// folder, wider than a tile, with a debossed down arrow. Sizes from Tahoe
+/// screenshots in tile units.
+pub fn stack_folder(pm: &mut Pixmap, x: f32, y: f32, s: f32) {
+    let p = tile_units(x, y, s);
+    let v = s * 0.805;
+    // 1.24 tiles wide: as wide as the icon box allows (Tahoe's is 1.2-1.3).
+    let (l, r) = (-0.12f32, 1.12f32);
+    let (x0, top) = p(l, -0.11);
+    let (_, back) = p(l, 0.0);
+    let (x1, bottom) = p(r, 0.95);
+    let (_, front) = p(l, 0.08);
+    let tab_w = 0.46 * (r - l) * v;
+    let back_col = [(0.0, rgba(87, 187, 235, 1.0)), (1.0, rgba(70, 176, 227, 1.0))];
+    // Tab with a sloped right side, merged into the back panel.
     let mut pb = PathBuilder::new();
-    pb.move_to(l, t);
-    pb.line_to(r, t);
-    pb.line_to(r - s * 0.05, b);
-    pb.line_to(l + s * 0.05, b);
+    let rt = 0.07 * v;
+    pb.move_to(x0, back + rt);
+    pb.quad_to(x0, top, x0 + rt, top);
+    pb.line_to(x0 + tab_w - 0.1 * v, top);
+    pb.cubic_to(x0 + tab_w - 0.05 * v, top, x0 + tab_w - 0.05 * v, back, x0 + tab_w, back);
+    pb.line_to(x0 + tab_w, back + rt);
     pb.close();
-    if let Some(p) = pb.finish() {
-        fill_grad(pm, &p, t, b, rgba(250, 250, 252, 0.95), rgba(205, 205, 212, 0.95));
-        gfx::stroke(pm, &p, rgba(0, 0, 0, 0.18), 1.0);
+    if let Some(path) = pb.finish() {
+        fill_stops(pm, &path, top, back + rt, &back_col);
     }
-    for i in 1..5 {
-        let fx = l + (r - l) * i as f32 / 5.0;
-        let mut pb = PathBuilder::new();
-        pb.move_to(fx, t + s * 0.08);
-        pb.line_to(fx + (fx - (l + r) / 2.0) * -0.08, b - s * 0.06);
-        if let Some(p) = pb.finish() {
-            gfx::stroke(pm, &p, rgba(0, 0, 0, 0.12), (s * 0.02).max(1.0));
-        }
+    if let Some(path) = gfx::squircle(x0, back, x1 - x0, bottom - back, 0.09 * v) {
+        fill_stops(pm, &path, back, bottom, &back_col);
     }
-    if let Some(p) = gfx::squircle(l - s * 0.04, t - s * 0.06, (r - l) + s * 0.08, s * 0.08, s * 0.04) {
-        fill_grad(pm, &p, t - s * 0.06, t + s * 0.02, rgba(236, 236, 240, 1.0), rgba(190, 190, 198, 1.0));
+    // The seam between the panels: the front casts a thin shadow upwards.
+    if let Some(path) = gfx::squircle(x0, front - 0.02 * v, x1 - x0, bottom - front, 0.1 * v) {
+        gfx::fill(pm, &path, rgba(52, 150, 205, 0.55));
     }
+    if let Some(path) = gfx::squircle(x0, front, x1 - x0, bottom - front, 0.1 * v) {
+        fill_stops(pm, &path, front, bottom, &[(0.0, rgba(114, 208, 251, 1.0)), (1.0, rgba(72, 177, 226, 1.0))]);
+    }
+    let ink = rgba(38, 138, 204, 0.38);
+    let (sx0, sy0) = p(0.5 - 0.035, 0.34);
+    let (sx1, sy1) = p(0.5 + 0.035, 0.6);
+    if let Some(path) = gfx::squircle(sx0, sy0, sx1 - sx0, sy1 - sy0, 0.02 * v) {
+        gfx::fill(pm, &path, ink);
+    }
+    if let Some(path) = poly(&[p(0.33, 0.52), p(0.67, 0.52), p(0.5, 0.72)], true) {
+        gfx::fill(pm, &path, ink);
+    }
+}
+
+/// The dock's Trash in the macOS 26 manner: a translucent glass bin with a
+/// lip, darker in dark mode. Sizes from Tahoe screenshots in tile units.
+pub fn stack_trash(pm: &mut Pixmap, x: f32, y: f32, s: f32, dark: bool) {
+    let p = tile_units(x, y, s);
+    let v = s * 0.805;
+    let (_, top) = p(0.0, 0.04);
+    let (_, bottom) = p(0.0, 0.99);
+    let rb = 0.11;
+    let mut pb = PathBuilder::new();
+    let (ax, ay) = p(0.0, 0.04);
+    pb.move_to(ax, ay);
+    let (bx, by) = p(1.0, 0.04);
+    pb.line_to(bx, by);
+    // Sides taper to 0.77 of the width; the bottom corners are rounded.
+    let (cx, cy) = p(0.885 + 0.012, 0.99 - rb);
+    pb.line_to(cx, cy);
+    let (qx, qy) = p(0.885, 0.99);
+    let (dx, dy) = p(0.885 - rb, 0.99);
+    pb.quad_to(qx, qy, dx, dy);
+    let (ex, ey) = p(0.115 + rb, 0.99);
+    pb.line_to(ex, ey);
+    let (qx, qy) = p(0.115, 0.99);
+    let (fx, fy) = p(0.115 - 0.012, 0.99 - rb);
+    pb.quad_to(qx, qy, fx, fy);
+    pb.close();
+    let body = pb.finish();
+    let (fill, rim_col, lip, lip_edge, lip_rim): ([(f32, Color); 3], Color, Color, Color, Color) = if dark {
+        (
+            [(0.0, rgba(30, 30, 38, 0.68)), (0.85, rgba(42, 40, 46, 0.8)), (1.0, rgba(92, 94, 104, 0.85))],
+            rgba(255, 255, 255, 0.2),
+            rgba(70, 68, 76, 0.72),
+            rgba(255, 255, 255, 0.4),
+            rgba(255, 255, 255, 0.32),
+        )
+    } else {
+        (
+            [(0.0, rgba(246, 248, 252, 0.5)), (0.85, rgba(236, 239, 244, 0.62)), (1.0, rgba(255, 255, 255, 0.85))],
+            rgba(0, 0, 0, 0.12),
+            rgba(250, 250, 252, 0.72),
+            rgba(255, 255, 255, 0.95),
+            rgba(0, 0, 0, 0.12),
+        )
+    };
+    if let Some(path) = &body {
+        fill_stops(pm, path, top, bottom, &fill);
+        gfx::stroke(pm, path, rim_col, (0.015 * v).max(1.0));
+    }
+    let (lx, ly) = p(-0.02, -0.12);
+    let (rx, ry) = p(1.02, 0.07);
+    if let Some(path) = gfx::squircle(lx, ly, rx - lx, ry - ly, 0.09 * v) {
+        gfx::fill(pm, &path, lip);
+        gfx::stroke(pm, &path, lip_rim, (0.015 * v).max(1.0));
+    }
+    // The front edge of the lip catches the light.
+    let (ex0, ey0) = p(0.03, 0.04);
+    let (ex1, _) = p(0.97, 0.04);
+    if let Some(path) = gfx::squircle(ex0, ey0 - 0.01 * v, ex1 - ex0, 0.04 * v, 0.02 * v) {
+        gfx::fill(pm, &path, lip_edge);
+    }
+}
+
+/// A label bubble: a capsule with a rounded pointer of `tip_w` x `tip_h`
+/// centred under it at `cx`.
+pub fn bubble(x: f32, y: f32, w: f32, h: f32, cx: f32, tip_w: f32, tip_h: f32) -> Option<tiny_skia::Path> {
+    let r = h / 2.0;
+    let b = y + h;
+    let cx = cx.clamp(x + r + tip_w / 2.0, x + w - r - tip_w / 2.0);
+    let mut pb = PathBuilder::new();
+    arc(&mut pb, x + r, y + r, r, FRAC_PI_2, PI + FRAC_PI_2, true);
+    arc(&mut pb, x + w - r, y + r, r, -FRAC_PI_2, FRAC_PI_2, false);
+    let hw = tip_w / 2.0;
+    pb.line_to(cx + hw, b);
+    pb.cubic_to(cx + hw * 0.45, b, cx + hw * 0.3, b + tip_h, cx, b + tip_h);
+    pb.cubic_to(cx - hw * 0.3, b + tip_h, cx - hw * 0.45, b, cx - hw, b);
+    pb.close();
+    pb.finish()
 }
 
 fn poly(pts: &[(f32, f32)], close: bool) -> Option<tiny_skia::Path> {

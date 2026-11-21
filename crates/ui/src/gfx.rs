@@ -399,7 +399,8 @@ fn darkened(src: &Pixmap) -> Pixmap {
     let mut out = src.clone();
     for px in out.data_mut().chunks_exact_mut(4) {
         for c in &mut px[..3] {
-            *c = (*c as u32 * 150 / 255) as u8;
+            // A held dock icon is multiplied by about 0.5 (measured on macOS 26).
+            *c = (*c as u32 * 128 / 255) as u8;
         }
     }
     out
@@ -436,9 +437,11 @@ pub fn fill_from(pm: &mut Pixmap, path: &Path, src: &Pixmap) {
 
 /// Fits an app icon into the macOS 26 icon shape. Icons that already fill a
 /// square tile are cut to the squircle; any other shape (round logos, glyphs
-/// with transparency) sits on a neutral plate, as macOS does with icons that
-/// do not follow its grid. Returns a square pixmap of `src`'s larger side.
-pub fn mac_icon(src: &Pixmap, dark: bool) -> Option<Pixmap> {
+/// with transparency) is shrunk to 70% on an opaque gray plate, as macOS 26
+/// does with icons that do not follow its grid (the Default icon style's
+/// plate, which it keeps in both appearances). Returns a square pixmap of
+/// `src`'s larger side.
+pub fn mac_icon(src: &Pixmap) -> Option<Pixmap> {
     let (w, h) = (src.width() as usize, src.height() as usize);
     let n = w.max(h) as f32;
     let data = src.data();
@@ -483,26 +486,26 @@ pub fn mac_icon(src: &Pixmap, dark: bool) -> Option<Pixmap> {
         let o = inset - size * 0.01;
         let t = Transform::from_row(k, 0.0, 0.0, k, o - x0 as f32 * k, o - y0 as f32 * k);
         out.draw_pixmap(0, 0, src.as_ref(), &quality, t, Some(&mask));
-        return Some(out);
-    }
-    let (top, bottom, edge) = if dark {
-        (rgba(64, 64, 68, 1.0), rgba(36, 36, 40, 1.0), rgba(255, 255, 255, 0.12))
     } else {
-        (rgba(255, 255, 255, 1.0), rgba(228, 228, 234, 1.0), rgba(0, 0, 0, 0.08))
-    };
-    if let Some(sh) = tiny_skia::LinearGradient::new(
-        tiny_skia::Point::from_xy(0.0, inset),
-        tiny_skia::Point::from_xy(0.0, inset + size),
-        vec![tiny_skia::GradientStop::new(0.0, top), tiny_skia::GradientStop::new(1.0, bottom)],
-        tiny_skia::SpreadMode::Pad,
-        Transform::identity(),
-    ) {
-        fill_shader(&mut out, &shape, sh);
+        if let Some(sh) = tiny_skia::LinearGradient::new(
+            tiny_skia::Point::from_xy(0.0, inset),
+            tiny_skia::Point::from_xy(0.0, inset + size),
+            vec![tiny_skia::GradientStop::new(0.0, rgba(140, 141, 141, 1.0)), tiny_skia::GradientStop::new(1.0, rgba(128, 128, 129, 1.0))],
+            tiny_skia::SpreadMode::Pad,
+            Transform::identity(),
+        ) {
+            fill_shader(&mut out, &shape, sh);
+        }
+        let k = size * 0.70 / bw.max(bh);
+        let t = Transform::from_row(k, 0.0, 0.0, k, n / 2.0 - (x0 as f32 + bw / 2.0) * k, n / 2.0 - (y0 as f32 + bh / 2.0) * k);
+        out.draw_pixmap(0, 0, src.as_ref(), &quality, t, None);
     }
-    stroke(&mut out, &shape, edge, (n / 256.0).max(1.0));
-    let k = size * 0.64 / bw.max(bh);
-    let t = Transform::from_row(k, 0.0, 0.0, k, n / 2.0 - (x0 as f32 + bw / 2.0) * k, n / 2.0 - (y0 as f32 + bh / 2.0) * k);
-    out.draw_pixmap(0, 0, src.as_ref(), &quality, t, None);
+    // The faint light edge of macOS 26 icons, kept inside the shape: about
+    // one device pixel where the dock draws the canvas at 52-104 px.
+    let ew = n / 100.0;
+    if let Some(edge) = squircle(inset + ew / 2.0, inset + ew / 2.0, size - ew, size - ew, size * 0.225 - ew / 2.0) {
+        stroke(&mut out, &edge, rgba(255, 255, 255, 0.22), ew);
+    }
     Some(out)
 }
 
@@ -548,4 +551,27 @@ pub fn template(src: &Pixmap, rgb: [u8; 3]) -> Option<Pixmap> {
         o[3] = (oa * 255.0) as u8;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_icon_sits_at_70_percent_on_the_gray_plate() {
+        let mut src = Pixmap::new(256, 256).unwrap();
+        if let Some(c) = circle(128.0, 128.0, 100.0) {
+            fill(&mut src, &c, rgba(255, 0, 0, 1.0));
+        }
+        let out = mac_icon(&src).unwrap();
+        let px = |x: u32, y: u32| out.pixel(x, y).unwrap().demultiply();
+        // Plate gradient #8C8D8D -> #808081, sampled away from the edge line.
+        let top = px(128, 34);
+        let bottom = px(128, 222);
+        assert!((top.red() as i32 - 140).abs() <= 3 && (bottom.red() as i32 - 128).abs() <= 3, "{top:?} {bottom:?}");
+        // The art spans 70% of the 0.805 shape: rows where the red disc shows.
+        let red: Vec<u32> = (0..256).filter(|&y| px(128, y).red() > 200 && px(128, y).green() < 60).collect();
+        let span = (red.last().unwrap() - red[0] + 1) as f32 / (256.0 * 0.805);
+        assert!((span - 0.70).abs() < 0.02, "art span {span}");
+    }
 }

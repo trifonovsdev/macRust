@@ -84,18 +84,27 @@ struct Geo {
 
 /// Wallpaper id, dark theme, window rect.
 type MaterialKey = (u64, bool, WinRect);
+/// Dark theme, Downloads folder, Trash.
+type Stacks = (bool, Rc<Image>, Rc<Image>);
 
-// Geometry in points.
-// Proportions measured from macOS 26 screenshots. Icons carry Apple's
-// canvas margin (the visible tile is ART of the icon box), so the gaps
-// between visible tiles come out at 0.31 of a tile, as in Tahoe.
-const GAP_BOTTOM: f32 = 4.0;
-const PAD: f32 = 8.5;
-const SIDE: f32 = 3.0;
-const TILE: f32 = 1.056;
+// Geometry, measured on macOS 26 screenshots in units of the visible tile
+// (V). Icons carry Apple's canvas margin: the visible tile is ART of the
+// icon box, so a cell of TILE boxes gives a pitch of 1.31 V.
 /// Visible part of an icon in its box (Apple's 824/1024 grid).
 const ART: f32 = 0.805;
-const SEP_W: f32 = 16.0;
+const TILE: f32 = 1.31 * ART;
+/// Bar height (1.62-1.72 V measured); the tile is centred in it.
+const BAR: f32 = 1.67;
+/// From the bar's end to the first tile: one gap (0.31 V), half of which is in the cell.
+const SIDE: f32 = 0.155;
+/// Extra width of the separator cell: tile to tile across it is 0.94 V.
+const SEP_W: f32 = 0.63;
+const SEP_H: f32 = 1.22;
+/// The bar floats this many points above the bottom of the screen.
+const GAP_BOTTOM: f32 = 5.5;
+/// Launch hop height and the running dot's centre below the tile.
+const HOP: f32 = 0.36;
+const DOT_BELOW: f32 = 0.2;
 /// Half-width of the magnification bell, in tiles.
 const RANGE: f32 = 2.7;
 const TIP_SPACE: f32 = 46.0;
@@ -120,6 +129,8 @@ pub struct Dock {
     material: RefCell<Option<(MaterialKey, Pixmap)>>,
     /// Live picture of what is behind the window; replaces the wallpaper.
     backdrop: Option<glass::Backdrop>,
+    /// Drawn Downloads and Trash for this appearance.
+    stacks: RefCell<Option<Stacks>>,
     pub events: Vec<DockEvent>,
 }
 
@@ -146,6 +157,7 @@ impl Dock {
             initialized: false,
             material: RefCell::new(None),
             backdrop: None,
+            stacks: RefCell::new(None),
             events: Vec::new(),
         }
     }
@@ -158,7 +170,12 @@ impl Dock {
 
     /// Height of the strip the dock keeps free at the bottom of the work area.
     pub fn reserved_height(&self) -> i32 {
-        ((self.cfg.icon + 2.0 * PAD + GAP_BOTTOM) * self.scale).ceil() as i32
+        ((self.cfg.icon * ART * BAR + GAP_BOTTOM) * self.scale).ceil() as i32
+    }
+
+    /// Visible tile size at rest, in points.
+    fn v(&self) -> f32 {
+        self.cfg.icon * ART
     }
 
     pub fn window_rect(&self) -> WinRect {
@@ -166,8 +183,9 @@ impl Dock {
         let tile = self.cfg.icon * TILE * s;
         let n = self.slots.len() as f32 + 1.0;
         let extra = (self.cfg.magnified / self.cfg.icon - 1.0).max(0.0) * RANGE * tile;
-        let w = (n * tile + SEP_W * s + 2.0 * extra + 2.0 * (SIDE + EDGE_MARGIN) * s).min(self.screen_w).ceil();
-        let h = ((GAP_BOTTOM + 2.0 * PAD + self.cfg.magnified.max(self.cfg.icon * 1.55) + TIP_SPACE) * s).ceil();
+        let v = self.v();
+        let w = (n * tile + (SEP_W * v + 2.0 * (SIDE * v + EDGE_MARGIN)) * s + 2.0 * extra).min(self.screen_w).ceil();
+        let h = ((GAP_BOTTOM + (v * BAR - self.cfg.icon) / 2.0 + self.cfg.magnified.max(self.cfg.icon * 1.55) + TIP_SPACE) * s).ceil();
         WinRect { x: ((self.screen_w - w) / 2.0).round() as i32, y: (self.screen_h - h) as i32, w: w as i32, h: h as i32 }
     }
 
@@ -190,7 +208,8 @@ impl Dock {
                 }
                 next.push(s);
             } else {
-                let mut appear = Spring::new(0.0, 0.42, 0.9);
+                // Critically damped: neighbours slide apart in about 0.4 s, no overshoot.
+                let mut appear = Spring::new(0.0, 0.45, 1.0);
                 if self.initialized {
                     appear.to(1.0);
                 } else {
@@ -286,7 +305,7 @@ impl Dock {
         let mut sep_done = false;
         for (i, sl) in self.slots.iter().enumerate() {
             if sl.e.section == Section::Stacks && !sep_done && has_apps {
-                cells.push((Cell::Separator, SEP_W * s));
+                cells.push((Cell::Separator, SEP_W * self.v() * s));
                 sep_done = true;
             }
             cells.push((Cell::Slot(i), tile0 * sl.appear.value.max(0.0)));
@@ -333,10 +352,16 @@ impl Dock {
             x += w;
         }
         let total = x - start;
-        let bh = icon0 + 2.0 * PAD * s;
-        let side = SIDE * s;
-        let bg = (start - side, win_h - GAP_BOTTOM * s - bh, total + 2.0 * side, bh);
-        Geo { cells: out, bg, icon_bottom: win_h - GAP_BOTTOM * s - PAD * s, icon0 }
+        let v = icon0 * ART;
+        let bh = v * BAR;
+        let side = SIDE * v;
+        // Whole pixels, so the hairline rim stays one crisp device pixel.
+        let (x0, x1) = ((start - side).round(), (start + total + side).round());
+        let bh = bh.round();
+        let bg = (x0, (win_h - GAP_BOTTOM * s - bh).round(), x1 - x0, bh);
+        // The box bottom: the tile is centred in the bar, the box adds the canvas margin.
+        let icon_bottom = bg.1 + bh / 2.0 + icon0 / 2.0;
+        Geo { cells: out, bg, icon_bottom, icon0 }
     }
 
     fn icon_box(&self, g: &Geo, slot: usize, x: f32, w: f32) -> (f32, f32, f32) {
@@ -345,7 +370,7 @@ impl Dock {
         let tile0 = g.icon0 * TILE * a;
         let factor = if tile0 > 0.0 { w / tile0 } else { 1.0 };
         let size = g.icon0 * factor * a;
-        let lift = sl.bounce.map(launch_bounce).unwrap_or(0.0) * g.icon0 * 0.5;
+        let lift = sl.bounce.map(launch_bounce).unwrap_or(0.0) * g.icon0 * ART * HOP;
         (x + (w - size) / 2.0, g.icon_bottom - size - lift, size)
     }
 
@@ -422,6 +447,29 @@ impl Dock {
         }
     }
 
+    /// The drawn Downloads folder and Trash for this appearance.
+    fn stack_images(&self, dark: bool) -> Option<(Rc<Image>, Rc<Image>)> {
+        let mut cache = self.stacks.borrow_mut();
+        if cache.as_ref().is_none_or(|(d, _, _)| *d != dark) {
+            let n = 256.0;
+            let mut folder = Pixmap::new(n as u32, n as u32)?;
+            glyphs::stack_folder(&mut folder, 0.0, 0.0, n);
+            let mut trash = Pixmap::new(n as u32, n as u32)?;
+            glyphs::stack_trash(&mut trash, 0.0, 0.0, n, dark);
+            *cache = Some((dark, Rc::new(Image::with_shadow(folder)), Rc::new(Image::new(trash))));
+        }
+        cache.as_ref().map(|(_, f, t)| (f.clone(), t.clone()))
+    }
+
+    /// Blurred colour of what is behind window point `x, y`.
+    fn behind(&self, ctx: &Ctx, wr: WinRect, x: f32, y: f32) -> Option<[f32; 3]> {
+        match (&self.backdrop, &ctx.vibrancy) {
+            (Some(b), _) => Some(b.vib.sample_frost(x, y)),
+            (None, Some(v)) => Some(v.sample_frost(wr.x as f32 + x, wr.y as f32 + y)),
+            (None, None) => None,
+        }
+    }
+
     pub fn draw(&self, pm: &mut Pixmap, ctx: &Ctx) {
         pm.fill(tiny_skia::Color::TRANSPARENT);
         let wr = self.window_rect();
@@ -433,6 +481,7 @@ impl Dock {
         if bw <= 1.0 {
             return;
         }
+        let v0 = g.icon0 * ART;
 
         // Nearly transparent pixels still take mouse input on a layered window:
         // they keep the hover alive in the gaps between magnified icons and on
@@ -448,35 +497,44 @@ impl Dock {
         }
         gfx::put_rect(pm, bx, top, bw + 1.0, wh - top.floor(), [0, 0, 0, 1]);
 
-        let radius = bh * 0.26;
-        ctx.shadow(radius, 9.0 * s).draw(pm, bx, by + 3.0 * s, bw, bh, if th.dark { rgba(0, 0, 0, 0.30) } else { rgba(0, 0, 0, 0.10) });
+        // No shadow: macOS 26 draws none under the dock.
+        let shape = glass::Shape { x: bx, y: by, w: bw, h: bh, r: bh * 0.25 };
+        let st = GlassStyle::dock(th.dark, s);
         match (&self.backdrop, &ctx.vibrancy) {
-            (Some(b), _) => b.draw(pm, glass::Shape { x: bx, y: by, w: bw, h: bh, r: radius }, &GlassStyle::dock(th.dark, s)),
+            (Some(b), _) => b.draw(pm, shape, &st),
             (None, Some(v)) => {
                 let key = (v.id, th.dark, wr);
                 let mut cache = self.material.borrow_mut();
                 if cache.as_ref().is_none_or(|(k, _)| *k != key) {
-                    let st = GlassStyle::dock(th.dark, s);
                     *cache = glass::material(v, wr.x as f32, wr.y as f32, pm.width(), pm.height(), st.tint).map(|m| (key, m));
                 }
                 if let Some((_, m)) = cache.as_ref() {
-                    let shape = glass::Shape { x: bx, y: by, w: bw, h: bh, r: radius };
-                    glass::draw(pm, v, m, wr.x as f32, wr.y as f32, shape, &GlassStyle::dock(th.dark, s));
+                    glass::draw(pm, v, m, wr.x as f32, wr.y as f32, shape, &st);
                 }
             }
             (None, None) => {
-                if let Some(path) = gfx::squircle(bx, by, bw, bh, radius) {
+                if let Some(path) = gfx::squircle(bx, by, bw, bh, shape.r) {
                     gfx::fill(pm, &path, th.dock_fallback());
-                    gfx::stroke(pm, &path, th.dock_border(), 1.0);
                 }
             }
+        }
+        // The hairline rim: in dark mode only the bottom edge shows; in light
+        // mode the top is brightest over two device pixels (+80, then +55).
+        if th.dark {
+            glass::rim(pm, shape, 4.0, 20.0, 6.0, 0.5 * s);
+        } else {
+            glass::rim(pm, shape, 55.0, 0.0, 0.0, s);
+            glass::rim(pm, shape, 25.0, 30.0, 25.0, 0.5 * s);
         }
 
         for (c, x, w) in &g.cells {
             match c {
                 Cell::Separator => {
-                    let lx = (x + w / 2.0).round() - 0.5;
-                    gfx::fill_rect(pm, lx, by + bh * 0.16, s.max(1.0), bh * 0.68, if th.dark { rgba(255, 255, 255, 0.22) } else { rgba(0, 0, 0, 0.16) });
+                    let h = SEP_H * v0;
+                    let lw = s.round().max(1.0);
+                    // Lighter than the glass in dark mode, darker in light mode,
+                    // by a fixed step rather than a tint (measured).
+                    add_rect(pm, (x + w / 2.0 - lw / 2.0).round(), (by + (bh - h) / 2.0).round(), lw, h.round(), if th.dark { 66.0 } else { -57.0 });
                 }
                 Cell::Slot(i) => {
                     let sl = &self.slots[*i];
@@ -486,48 +544,94 @@ impl Dock {
                     }
                     let alpha = sl.appear.value.clamp(0.0, 1.0);
                     let darken = self.pressed == Some(*i) && self.hover == Some(*i);
-                    match &sl.e.icon {
-                        Some(img) => img.draw(pm, ix, iy, size, alpha, darken),
-                        None => match sl.e.fallback {
-                            Fallback::App => glyphs::app_tile(pm, ix, iy, size),
-                            Fallback::Folder => glyphs::folder(pm, ix, iy, size),
-                            Fallback::Trash => glyphs::trash(pm, ix, iy, size),
-                        },
+                    let stack = match sl.e.fallback {
+                        Fallback::Folder | Fallback::Trash if sl.e.icon.is_none() => self.stack_images(th.dark),
+                        _ => None,
+                    };
+                    match (&sl.e.icon, stack, sl.e.fallback) {
+                        (Some(img), _, _) => img.draw(pm, ix, iy, size, alpha, darken),
+                        (None, Some((folder, _)), Fallback::Folder) => folder.draw(pm, ix, iy, size, alpha, darken),
+                        (None, Some((_, trash)), Fallback::Trash) => trash.draw(pm, ix, iy, size, alpha, darken),
+                        _ => glyphs::app_tile(pm, ix, iy, size),
                     }
                     if sl.e.running && alpha > 0.5 {
                         let cx = ix + size / 2.0;
-                        // Just under the visible tile, not under the icon's canvas margin.
+                        // Under the visible tile at rest, not under the icon's canvas margin.
                         let art_bottom = iy + size - size * (1.0 - ART) / 2.0;
-                        let cy = art_bottom.max(g.icon_bottom - g.icon0 * (1.0 - ART) / 2.0) + g.icon0 * ART * 0.1;
-                        if let Some(p) = gfx::circle(cx, cy, 1.8 * s) {
-                            gfx::fill(pm, &p, gfx::fade(th.indicator(), alpha));
+                        let cy = art_bottom.max(g.icon_bottom - g.icon0 * (1.0 - ART) / 2.0) + DOT_BELOW * v0;
+                        if let Some(p) = gfx::circle(cx, cy, 2.0 * s) {
+                            let dot = if th.dark { rgba(255, 255, 255, 0.88) } else { rgba(0, 0, 0, 0.88) };
+                            gfx::fill(pm, &p, gfx::fade(dot, alpha));
                         }
                     }
                 }
             }
         }
 
-        // Label above the hovered icon.
+        // Label above the hovered icon: a glass capsule with a pointer.
         if let Some(t) = self.tip_slot
             && self.tip.value > 0.01
             && t < self.slots.len()
             && let Some((_, x, w)) = g.cells.iter().find(|c| matches!(c.0, Cell::Slot(i) if i == t))
         {
-            let (ix, iy, size) = self.icon_box(&g, t, *x, *w);
+            let (ix, _, size) = self.icon_box(&g, t, *x, *w);
             let a = self.tip.value.clamp(0.0, 1.0);
             let fs = 13.0 * s;
             let label = ctx.text.ellipsize(&self.slots[t].e.label, fs, Weight::Regular, 280.0 * s);
             let tw = ctx.text.measure(&label, fs, Weight::Regular);
-            let (pw, ph) = (tw + 20.0 * s, 26.0 * s);
-            let px = (ix + size / 2.0 - pw / 2.0).clamp(2.0, ww - pw - 2.0).round();
-            let py = (iy - 10.0 * s - ph + (1.0 - a) * 4.0 * s).round();
-            ctx.shadow(6.0 * s, 4.0 * s).draw(pm, px, py + 1.0 * s, pw, ph, gfx::fade(th.shadow(), a * 0.7));
-            if let Some(p) = gfx::squircle(px, py, pw, ph, 7.0 * s) {
-                gfx::fill(pm, &p, gfx::fade(th.tooltip(), a));
-                gfx::stroke(pm, &p, gfx::fade(th.panel_border(), a * 0.8), 1.0);
+            let (pw, ph) = ((tw + 24.0 * s).round(), (23.0 * s).round());
+            let (tip_w, tip_h) = (11.0 * s, 5.5 * s);
+            // The bar's top, or the tile's when magnification lifts it out of the bar.
+            let rest_top = g.icon_bottom - size + size * (1.0 - ART) / 2.0;
+            let anchor = by.min(rest_top - v0 * (BAR - 1.0) / 2.0);
+            let cx = ix + size / 2.0;
+            let px = (cx - pw / 2.0).clamp(2.0, ww - pw - 2.0).round();
+            let py = (anchor - 9.0 * s - tip_h - ph).round();
+            if let Some(path) = glyphs::bubble(px, py, pw, ph, cx, tip_w, tip_h) {
+                // Dark glass: the blurred backdrop at about 0.45; light glass: about 67% white.
+                let tone = |c: [f32; 3]| {
+                    let f = |v: f32| if th.dark { v * 0.45 } else { v + (255.0 - v) * 0.67 };
+                    tiny_skia::Color::from_rgba8(f(c[0]) as u8, f(c[1]) as u8, f(c[2]) as u8, 255)
+                };
+                let my = py + ph / 2.0;
+                let samples: Option<Vec<tiny_skia::Color>> =
+                    [px + ph / 2.0, px + pw / 2.0, px + pw - ph / 2.0].iter().map(|&sx| self.behind(ctx, wr, sx, my).map(tone)).collect();
+                match samples.and_then(|c| {
+                    tiny_skia::LinearGradient::new(
+                        tiny_skia::Point::from_xy(px + ph / 2.0, my),
+                        tiny_skia::Point::from_xy(px + pw - ph / 2.0, my),
+                        c.iter().enumerate().map(|(k, c)| tiny_skia::GradientStop::new(k as f32 * 0.5, gfx::fade(*c, a))).collect(),
+                        tiny_skia::SpreadMode::Pad,
+                        tiny_skia::Transform::identity(),
+                    )
+                }) {
+                    Some(sh) => gfx::fill_shader(pm, &path, sh),
+                    None => gfx::fill(pm, &path, gfx::fade(th.tooltip(), a)),
+                }
+                let rim = if th.dark { rgba(255, 255, 255, 0.16) } else { rgba(255, 255, 255, 0.5) };
+                gfx::stroke(pm, &path, gfx::fade(rim, a), (0.5 * s).max(1.0));
             }
             let base = py + ph / 2.0 + ctx.text.cap_height(fs) / 2.0;
-            ctx.text.draw(pm, &label, px + 10.0 * s, base, fs, Weight::Regular, gfx::fade(th.label(), a), None);
+            ctx.text.draw(pm, &label, px + (pw - tw) / 2.0, base, fs, Weight::Regular, gfx::fade(th.label(), a), None);
+        }
+    }
+}
+
+/// Adds `delta` (0..255 steps, negative darkens) to the colour of an opaque
+/// region of a premultiplied pixmap, keeping its alpha.
+fn add_rect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, delta: f32) {
+    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+    let (x0, x1) = ((x as i32).clamp(0, pw), ((x + w) as i32).clamp(0, pw));
+    let (y0, y1) = ((y as i32).clamp(0, ph), ((y + h) as i32).clamp(0, ph));
+    let stride = pw as usize * 4;
+    let data = pm.data_mut();
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let o = yy as usize * stride + xx as usize * 4;
+            let a = data[o + 3] as f32;
+            for k in 0..3 {
+                data[o + k] = (data[o + k] as f32 + delta * a / 255.0).clamp(0.0, a).round() as u8;
+            }
         }
     }
 }
@@ -557,7 +661,8 @@ mod tests {
         for _ in 0..37 {
             d.update(1.0 / 120.0);
         }
-        assert!(icon_y(&d, "b") < rest - 20.0, "icon should be in the air");
+        let peak = DockConfig::default().icon * ART * HOP;
+        assert!(icon_y(&d, "b") < rest - peak * 0.95, "icon should be at the top of the hop");
         let mut e = entry("b");
         e.running = true;
         d.set_entries(vec![entry("a"), e]);
@@ -589,5 +694,48 @@ mod tests {
             d.update(1.0 / 120.0);
         }
         assert!(d.tip.value < 0.01 && !d.animating());
+    }
+
+    #[test]
+    fn bar_follows_the_measured_proportions() {
+        let mut d = Dock::new(DockConfig::default());
+        d.set_entries(vec![entry("a"), entry("b"), entry("c")]);
+        let wr = d.window_rect();
+        let g = d.geo(wr.w as f32, wr.h as f32);
+        let v = d.cfg.icon * ART;
+        let (bx, by, _, bh) = g.bg;
+        // The bar is snapped to whole pixels.
+        assert!((bh - v * BAR).abs() <= 0.5);
+        assert!((wr.h as f32 - (by + bh) - GAP_BOTTOM).abs() <= 0.5);
+        let (_, x0, w0) = g.cells[0];
+        let (_, x1, _) = g.cells[1];
+        assert!(((x1 - x0) / v - 1.31).abs() < 1e-3, "pitch");
+        // End padding equals the gap between tiles.
+        let first_tile = x0 + (w0 - v) / 2.0;
+        assert!(((first_tile - bx) - 0.31 * v).abs() <= 0.5);
+        // The tile is centred in the bar.
+        let tile_top = g.icon_bottom - g.icon0 + g.icon0 * (1.0 - ART) / 2.0;
+        assert!(((tile_top - by) - (by + bh - (tile_top + v))).abs() < 1e-3);
+        assert!((g.bg.0.fract(), by.fract(), bh.fract()) == (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn new_item_slides_in_over_about_0_4_s_without_overshoot() {
+        let mut d = Dock::new(DockConfig::default());
+        d.set_entries(vec![entry("a")]);
+        d.set_entries(vec![entry("a"), entry("b")]);
+        let (mut t, mut peak, mut at95) = (0.0f32, 0.0f32, None);
+        while d.animating() && t < 2.0 {
+            d.update(1.0 / 120.0);
+            t += 1.0 / 120.0;
+            let v = d.slots[1].appear.value;
+            peak = peak.max(v);
+            if v >= 0.95 && at95.is_none() {
+                at95 = Some(t);
+            }
+        }
+        assert!(peak <= 1.0 + 1e-4, "overshoot {peak}");
+        let at95 = at95.unwrap();
+        assert!((0.3..0.45).contains(&at95), "95% at {at95} s");
     }
 }
