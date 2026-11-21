@@ -507,41 +507,54 @@ pub fn mac_icon(src: &Pixmap, dark: bool) -> Option<Pixmap> {
 }
 
 /// A menu-bar "template" version of a colour icon, as macOS draws menu extras:
-/// one colour, shape from alpha (and, for colourful icons, from darkness, so a
-/// white logo on a coloured disc becomes a cut-out). Strong reds stay red:
-/// they are status (a recording dot, an unread badge).
+/// one colour at full strength, shape from alpha. A coloured plate carrying a
+/// light mark (Telegram's plane on its disc) becomes a cut-out instead. Faint
+/// icons are brought up to full opacity, so every extra matches the system
+/// glyphs. Strong reds stay red: they are status (a recording dot, an unread
+/// badge).
 pub fn template(src: &Pixmap, rgb: [u8; 3]) -> Option<Pixmap> {
     let mut out = Pixmap::new(src.width(), src.height())?;
     let d = src.data();
-    // Colourful icons take their shape from luminance, flat ones from alpha.
-    let (mut sat_sum, mut n) = (0.0f32, 0.0f32);
+    let unpremul = |px: &[u8]| {
+        let a = px[3] as f32 / 255.0;
+        (px[0] as f32 / 255.0 / a, px[1] as f32 / 255.0 / a, px[2] as f32 / 255.0 / a, a)
+    };
+    let luma = |r: f32, g: f32, b: f32| 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let (mut sat_sum, mut light, mut n) = (0.0f32, 0.0f32, 0.0f32);
     for px in d.chunks_exact(4) {
         if px[3] > 128 {
-            let (mx, mn) = (px[0].max(px[1]).max(px[2]) as f32, px[0].min(px[1]).min(px[2]) as f32);
+            let (r, g, b, _) = unpremul(px);
+            let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
             sat_sum += if mx > 0.0 { (mx - mn) / mx } else { 0.0 };
+            if luma(r, g, b) > 0.75 {
+                light += 1.0;
+            }
             n += 1.0;
         }
     }
     let colourful = n > 0.0 && sat_sum / n > 0.25;
-    for (o, px) in out.data_mut().chunks_exact_mut(4).zip(d.chunks_exact(4)) {
-        let a = px[3] as f32 / 255.0;
-        if a <= 0.0 {
+    // A flat single-colour glyph (a yellow USB stick) has no light mark and
+    // keeps its whole silhouette.
+    let cutout = colourful && light / n.max(1.0) > 0.03 && light / n.max(1.0) < 0.6;
+    let mut cov = vec![0.0f32; d.len() / 4];
+    let mut red = vec![false; d.len() / 4];
+    for (i, px) in d.chunks_exact(4).enumerate() {
+        if px[3] == 0 {
             continue;
         }
-        let (r, g, b) = (px[0] as f32 / 255.0 / a, px[1] as f32 / 255.0 / a, px[2] as f32 / 255.0 / a);
-        let red = r > 0.55 && r > g * 1.7 && r > b * 1.7;
-        if red {
+        let (r, g, b, a) = unpremul(px);
+        red[i] = r > 0.55 && r > g * 1.7 && r > b * 1.7;
+        let k = if cutout { ((0.85 - luma(r, g, b)) / 0.2).clamp(0.0, 1.0) } else { 1.0 };
+        cov[i] = a * k;
+    }
+    let peak = cov.iter().copied().fold(0.0f32, f32::max);
+    let gain = if peak > 0.05 { 1.0 / peak } else { 1.0 };
+    for (i, (o, px)) in out.data_mut().chunks_exact_mut(4).zip(d.chunks_exact(4)).enumerate() {
+        if red[i] {
             o.copy_from_slice(px);
             continue;
         }
-        let k = if colourful {
-            let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            // Dark and mid tones are the shape; near-white parts are holes.
-            ((0.88 - l) / 0.5).clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        let oa = a * k;
+        let oa = (cov[i] * gain).min(1.0);
         o[0] = (rgb[0] as f32 * oa) as u8;
         o[1] = (rgb[1] as f32 * oa) as u8;
         o[2] = (rgb[2] as f32 * oa) as u8;

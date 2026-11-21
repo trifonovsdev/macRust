@@ -376,6 +376,17 @@ impl App {
         WinRect { x, y, w: win.0, h: win.1 }
     }
 
+    /// Window rect for Notification Center and banners: Tahoe hangs them in a
+    /// column whose right edge lines up with the clock's text (18.5 pt from
+    /// the screen edge), 15 pt below the bar.
+    fn column_rect(&self, win: (i32, i32)) -> WinRect {
+        let s = self.screen.scale;
+        let m = (MARGIN * s).round() as i32;
+        let x = self.screen.w - (18.5 * s).round() as i32 - win.0 + m;
+        let y = self.bar.height_px() + (15.0 * s).round() as i32 - m;
+        WinRect { x, y, w: win.0, h: win.1 }
+    }
+
     fn arm_outside_click(&mut self, r: WinRect) {
         let m = (MARGIN * self.screen.scale).round() as i32;
         for (a, v) in MENU_RECT.iter().zip([r.x + m, r.y + m, r.x + r.w - m, r.y + r.h - m]) {
@@ -552,7 +563,7 @@ impl App {
         let Some(t) = self.x.queue.pop_front() else { return };
         let v = self.note_view(&t);
         let mut b = Banner::new(v, self.screen.scale);
-        let r = self.panel_rect(b.window_size(&self.ctx));
+        let r = self.column_rect(b.window_size(&self.ctx));
         if let Some(behind) = system::capture(r) {
             b.set_backdrop(&behind);
         }
@@ -598,7 +609,7 @@ impl App {
         let notes: Vec<NoteView> = self.visible_toasts().iter().map(|t| self.note_view(t)).collect();
         let max_h = (self.screen.h - self.bar.height_px()) as f32 - self.dock.reserved_height() as f32;
         let mut nc = NotificationCenter::new(notes, self.today(), self.screen.scale, max_h);
-        let r = self.panel_rect(nc.window_size(&self.ctx));
+        let r = self.column_rect(nc.window_size(&self.ctx));
         if let Some(behind) = system::capture(r) {
             nc.set_backdrop(&behind);
         }
@@ -733,7 +744,7 @@ impl App {
         for _ in 0..240 {
             nc.update(1.0 / 60.0);
         }
-        let r = self.panel_rect(nc.window_size(&self.ctx));
+        let r = self.column_rect(nc.window_size(&self.ctx));
         if let Some(behind) = crop(r) {
             nc.set_backdrop(&behind);
         }
@@ -924,7 +935,7 @@ impl App {
         if self.x.nc_s.dirty
             && let Some(nc) = &self.x.nc
         {
-            let r = self.panel_rect(nc.window_size(&self.ctx));
+            let r = self.column_rect(nc.window_size(&self.ctx));
             self.x.nc_s.prepare(r);
             nc.draw(&mut self.x.nc_s.pm, &self.ctx);
             clear_rows(&mut self.x.nc_s.pm, bar_h - r.y);
@@ -933,7 +944,7 @@ impl App {
         if self.x.banner_s.dirty
             && let Some(b) = &self.x.banner
         {
-            let r = self.panel_rect(b.window_size(&self.ctx));
+            let r = self.column_rect(b.window_size(&self.ctx));
             self.x.banner_s.prepare(r);
             b.draw(&mut self.x.banner_s.pm, &self.ctx);
             clear_rows(&mut self.x.banner_s.pm, bar_h - r.y);

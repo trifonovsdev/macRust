@@ -44,35 +44,38 @@ impl GlassStyle {
         }
     }
 
-    /// Notification cards, banners, widgets and menus: denser frosted glass
-    /// that carries theme-coloured text.
-    pub fn card(dark: bool, scale: f32) -> Self {
+    /// Notification Center widgets, notification cards and banners. Dark:
+    /// the blurred backdrop at about x0.5 with its hue kept (a black desktop
+    /// reads (17,17,17)); light: near-opaque white cards. Rim: `hairline`.
+    pub fn card(dark: bool, _scale: f32) -> Self {
         Self {
             tint: if dark {
-                Color::from_rgba8(36, 36, 40, 175)
+                Color::from_rgba8(34, 34, 36, 128)
             } else {
-                Color::from_rgba8(250, 250, 252, 165)
+                Color::from_rgba8(255, 255, 255, 230)
             },
-            bevel: 8.0 * scale,
-            refraction: 5.0 * scale,
-            specular: if dark { 0.45 } else { 0.7 },
-            glow: 0.05,
+            bevel: 1.0,
+            refraction: 0.0,
+            specular: 0.0,
+            glow: 0.0,
             frost: true,
         }
     }
 
-    /// Menus: the densest frosted glass, close to a solid sheet.
-    pub fn menu(dark: bool, scale: f32) -> Self {
+    /// Menus: almost a solid sheet. Tahoe menus let at most ~8-10% of the
+    /// blurred backdrop through (dark ~#0F0F0F-#292929, light ~80-85% white);
+    /// the rim is a separate hairline (`hairline`), not a lit bevel.
+    pub fn menu(dark: bool, _scale: f32) -> Self {
         Self {
             tint: if dark {
-                Color::from_rgba8(40, 40, 44, 205)
+                Color::from_rgba8(12, 12, 12, 243)
             } else {
-                Color::from_rgba8(246, 247, 250, 200)
+                Color::from_rgba8(246, 246, 248, 212)
             },
-            bevel: 6.0 * scale,
-            refraction: 3.0 * scale,
-            specular: if dark { 0.4 } else { 0.6 },
-            glow: 0.04,
+            bevel: 1.0,
+            refraction: 0.0,
+            specular: 0.0,
+            glow: 0.0,
             frost: true,
         }
     }
@@ -137,6 +140,49 @@ impl Shape {
         }
         let qy = dy - (hh - r);
         if qy <= 0.0 { Some(hw) } else { Some(hw - r + (r * r - qy * qy).max(0.0).sqrt()) }
+    }
+}
+
+/// Paints the band of `shape` between depths `d0` and `d1` px (negative is
+/// outside the edge), antialiased, blending from `top` to `bottom` colour
+/// down the shape: the 0.5 pt rims of menus and widgets.
+pub fn hairline(pm: &mut Pixmap, shape: Shape, d0: f32, d1: f32, top: Color, bottom: Color) {
+    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+    let pad = d0.min(0.0).abs().ceil() as i32 + 1;
+    let x0 = (shape.x.floor() as i32 - pad).clamp(0, pw);
+    let x1 = ((shape.x + shape.w).ceil() as i32 + pad).clamp(0, pw);
+    let y0 = (shape.y.floor() as i32 - pad).clamp(0, ph);
+    let y1 = ((shape.y + shape.h).ceil() as i32 + pad).clamp(0, ph);
+    let reach = d1.max(0.0) + 1.0;
+    let data = pm.data_mut();
+    for y in y0..y1 {
+        let fy = y as f32 + 0.5;
+        let t = ((fy - shape.y) / shape.h.max(1.0)).clamp(0.0, 1.0);
+        let c = [
+            top.red() + (bottom.red() - top.red()) * t,
+            top.green() + (bottom.green() - top.green()) * t,
+            top.blue() + (bottom.blue() - top.blue()) * t,
+            top.alpha() + (bottom.alpha() - top.alpha()) * t,
+        ];
+        // Rows well inside only touch the left and right edges.
+        let skip = shape.inner_half_span(fy, reach);
+        let cx = shape.x + shape.w * 0.5;
+        for x in x0..x1 {
+            let fx = x as f32 + 0.5;
+            if let Some(hs) = skip
+                && (fx - cx).abs() < hs - 1.0
+            {
+                continue;
+            }
+            let depth = -shape.sdf(fx, fy).0;
+            let cov = ((depth + 0.5).min(d1) - (depth - 0.5).max(d0)).clamp(0.0, 1.0);
+            if cov <= 0.0 {
+                continue;
+            }
+            let a = c[3] * cov;
+            let i = ((y * pw + x) * 4) as usize;
+            crate::gfx::blend_premul(&mut data[i..i + 4], c[0] * a, c[1] * a, c[2] * a, a);
+        }
     }
 }
 
