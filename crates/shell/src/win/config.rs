@@ -44,11 +44,24 @@ pub struct Settings {
     pub reserve_dock: bool,
     /// "auto", "light" or "dark".
     pub appearance: String,
+    /// Host the notification area so tray icons appear in the menu bar.
+    pub tray_icons: bool,
+    /// Announce new Windows notifications with banners at the top right.
+    pub banners: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { icon_size: 52.0, magnified: 92.0, magnify: true, hide_taskbar: true, reserve_dock: true, appearance: "auto".into() }
+        Self {
+            icon_size: 52.0,
+            magnified: 92.0,
+            magnify: true,
+            hide_taskbar: true,
+            reserve_dock: true,
+            appearance: "auto".into(),
+            tray_icons: true,
+            banners: true,
+        }
     }
 }
 
@@ -100,6 +113,8 @@ pub fn load_settings() -> Settings {
             "hide_taskbar" => s.hide_taskbar = b,
             "reserve_dock_space" => s.reserve_dock = b,
             "appearance" => s.appearance = v.to_string(),
+            "tray_icons" => s.tray_icons = b,
+            "banners" => s.banners = b,
             _ => {}
         }
     }
@@ -110,8 +125,8 @@ pub fn save_settings(s: &Settings) {
     let text = format!(
         "# macRust settings. Restart macRust after editing.\n\
          icon_size = {}\nmagnified_size = {}\nmagnification = {}\nhide_taskbar = {}\nreserve_dock_space = {}\n\
-         # auto | light | dark\nappearance = {}\n",
-        s.icon_size, s.magnified, s.magnify, s.hide_taskbar, s.reserve_dock, s.appearance
+         # auto | light | dark\nappearance = {}\ntray_icons = {}\nbanners = {}\n",
+        s.icon_size, s.magnified, s.magnify, s.hide_taskbar, s.reserve_dock, s.appearance, s.tray_icons, s.banners
     );
     let _ = std::fs::write(settings_path(), text);
 }

@@ -4,14 +4,11 @@ mod app;
 mod catalog;
 mod config;
 mod icons;
-#[allow(dead_code)]
 mod media;
-#[allow(dead_code)]
 mod notifications;
 mod surface;
 mod system;
 mod tracker;
-#[allow(dead_code)]
 mod tray;
 mod util;
 mod winops;

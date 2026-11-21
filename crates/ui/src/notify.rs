@@ -340,7 +340,6 @@ pub struct Banner {
     scale: f32,
     pub note: NoteView,
     slide: Spring,
-    shown_for: f32,
     hover: bool,
     close_hover: bool,
     pressed: bool,
@@ -348,14 +347,11 @@ pub struct Banner {
     pub events: Vec<NoteEvent>,
 }
 
-/// Seconds a banner stays up while the pointer is elsewhere.
-const BANNER_TIME: f32 = 5.0;
-
 impl Banner {
     pub fn new(note: NoteView, scale: f32) -> Self {
         let mut slide = Spring::new(0.0, 0.42, 0.82).epsilon(0.002);
         slide.to(1.0);
-        Self { scale, note, slide, shown_for: 0.0, hover: false, close_hover: false, pressed: false, closing: false, events: Vec::new() }
+        Self { scale, note, slide, hover: false, close_hover: false, pressed: false, closing: false, events: Vec::new() }
     }
 
     pub fn window_size(&self, ctx: &Ctx) -> (i32, i32) {
@@ -373,18 +369,15 @@ impl Banner {
     pub fn finished(&self) -> bool {
         self.closing && self.slide.settled()
     }
-    /// Includes the countdown, so the host keeps ticking until it closes.
+    /// The host times the banner out; the pointer on it keeps it up.
+    pub fn hovered(&self) -> bool {
+        self.hover
+    }
     pub fn animating(&self) -> bool {
-        !self.slide.settled() || !self.closing
+        !self.slide.settled()
     }
     pub fn update(&mut self, dt: f32) {
         self.slide.step(dt);
-        if !self.hover {
-            self.shown_for += dt;
-        }
-        if self.shown_for > BANNER_TIME {
-            self.close();
-        }
     }
 
     fn origin(&self) -> (f32, f32) {

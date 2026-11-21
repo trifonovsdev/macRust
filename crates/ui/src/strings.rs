@@ -212,6 +212,17 @@ impl Strings {
         week_start: 0,
     };
 
+    /// Age of a notification: «сейчас», «5 мин назад», «3 ч назад», «2 дн. назад».
+    pub fn ago(&self, minutes: u64) -> String {
+        let ru = self.is_ru();
+        match minutes {
+            0 => self.now.to_string(),
+            m if m < 60 => format!("{m} {}", self.min_ago),
+            m if m < 24 * 60 => format!("{} {}", m / 60, if ru { "ч назад" } else { "h ago" }),
+            m => format!("{} {}", m / (24 * 60), if ru { "дн. назад" } else { "d ago" }),
+        }
+    }
+
     /// Menu-bar clock: «Пт 21 нояб. 14:32» / «Fri Nov 21 14:32».
     pub fn is_ru(&self) -> bool {
         self.days[0] == "Вс"

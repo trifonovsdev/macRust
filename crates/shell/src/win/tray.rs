@@ -26,7 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, HICON, HWND_BROADCAST, HWND_TOPMOST, ICONINFO, IsWindow, MSGFLT_ALLOW, PostMessageW,
     RegisterClassExW, RegisterWindowMessageW, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_SHOWWINDOW, SendMessageTimeoutW, SendNotifyMessageW, SetWindowLongPtrW, SetWindowPos, UnregisterClassW,
-    WINDOWPOS, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WINDOWPOS, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_USER, WM_WINDOWPOSCHANGED, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN,
     WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
@@ -34,25 +34,24 @@ use windows::core::{PCWSTR, PWSTR, w};
 
 use super::icons::Rgba;
 use super::tracker::window_pid;
-use super::util::{from_wide, log};
+use super::util::log;
 
 pub struct TrayIconView {
     pub id: u64,
-    pub tip: String,
     pub icon: Option<Rgba>,
     pub owner_exe: Option<String>,
 }
 
+/// Balloons are not reported: Windows turns them into toasts, which the
+/// notification watcher already reads.
 pub enum TrayEvent {
     Changed,
-    Balloon { title: String, text: String, owner_exe: Option<String> },
 }
 
 #[derive(Clone, Copy)]
 pub enum TrayButton {
     Left,
     Right,
-    Double,
 }
 
 const TRAY_CLASS: PCWSTR = w!("Shell_TrayWnd");
@@ -71,9 +70,7 @@ const NIM_SETVERSION: u32 = 4;
 
 const NIF_MESSAGE: u32 = 0x1;
 const NIF_ICON: u32 = 0x2;
-const NIF_TIP: u32 = 0x4;
 const NIF_STATE: u32 = 0x8;
-const NIF_INFO: u32 = 0x10;
 const NIF_GUID: u32 = 0x20;
 const NIS_HIDDEN: u32 = 0x1;
 
@@ -89,9 +86,7 @@ const NID_HICON: usize = 20;
 const NID_TIP: usize = 24; // [u16; 128]
 const NID_STATE: usize = 280;
 const NID_STATE_MASK: usize = 284;
-const NID_INFO: usize = 288; // [u16; 256]
 const NID_VERSION: usize = 800;
-const NID_INFO_TITLE: usize = 804; // [u16; 64]
 const NID_GUID: usize = 936;
 // Smallest payload worth reading: header plus the fields through hIcon.
 const NID_MIN: usize = NID_OFFSET + NID_TIP;
@@ -117,7 +112,6 @@ struct Icon {
     callback: u32,
     version: u32,
     state: u32,
-    tip: String,
     image: Option<Rgba>,
     rect: Option<RECT>,
     owner_exe: Option<String>,
@@ -297,7 +291,6 @@ impl Tray {
                 .filter(|i| !i.hidden())
                 .map(|i| TrayIconView {
                     id: i.id,
-                    tip: i.tip.clone(),
                     icon: i.image.clone(),
                     owner_exe: i.owner_exe.clone(),
                 })
@@ -328,7 +321,6 @@ impl Tray {
             (TrayButton::Left, false) => &[WM_LBUTTONDOWN, WM_LBUTTONUP],
             (TrayButton::Right, true) => &[WM_RBUTTONDOWN, WM_RBUTTONUP, WM_CONTEXTMENU],
             (TrayButton::Right, false) => &[WM_RBUTTONDOWN, WM_RBUTTONUP],
-            (TrayButton::Double, _) => &[WM_LBUTTONDBLCLK],
         };
         unsafe {
             // The app opens a menu or a window in response; let it take focus.
@@ -507,16 +499,6 @@ fn guid_at(b: &[u8], off: usize) -> Option<[u8; 16]> {
     (g != [0; 16]).then_some(g)
 }
 
-fn wstr_at(b: &[u8], off: usize, chars: usize) -> String {
-    let units: Vec<u16> = b
-        .get(off..off + chars * 2)
-        .unwrap_or(&[])
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    from_wide(&units)
-}
-
 /// Applies one Shell_NotifyIcon call. None: not a call we understand.
 fn notify_icon(data: &[u8]) -> Option<bool> {
     if data.len() < NID_MIN || u32_at(data, 0) != TRAY_SIGNATURE {
@@ -563,7 +545,6 @@ fn notify_icon(data: &[u8]) -> Option<bool> {
                         callback: 0,
                         version: 0,
                         state: 0,
-                        tip: String::new(),
                         image: None,
                         rect: None,
                         owner_exe: process_path(pid),
@@ -584,9 +565,6 @@ fn notify_icon(data: &[u8]) -> Option<bool> {
             if flags & NIF_MESSAGE != 0 {
                 icon.callback = u32_at(&nid, NID_CALLBACK);
             }
-            if flags & NIF_TIP != 0 {
-                icon.tip = wstr_at(&nid, NID_TIP, 128);
-            }
             if flags & NIF_STATE != 0 {
                 let mask = u32_at(&nid, NID_STATE_MASK);
                 icon.state = (icon.state & !mask) | (u32_at(&nid, NID_STATE) & mask);
@@ -597,14 +575,7 @@ fn notify_icon(data: &[u8]) -> Option<bool> {
                 Some(None) if handle_at(&nid, NID_HICON) == 0 => icon.image = None,
                 _ => {}
             }
-            let balloon = (flags & NIF_INFO != 0)
-                .then(|| (wstr_at(&nid, NID_INFO_TITLE, 64), wstr_at(&nid, NID_INFO, 256)))
-                .filter(|(_, text)| !text.is_empty());
-            let owner_exe = icon.owner_exe.clone();
             s.push(TrayEvent::Changed);
-            if let Some((title, text)) = balloon {
-                s.push(TrayEvent::Balloon { title, text, owner_exe });
-            }
             // A modify for an icon we did not have (added before the tray
             // started, app ignores TaskbarCreated) is kept but still fails, as
             // in Explorer, so apps that re-add on failure do so.

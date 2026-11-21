@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::UI::Shell::{
-    IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY, SIIGBF_THUMBNAILONLY,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{Interface, PCWSTR};
@@ -29,11 +29,12 @@ pub fn shell_item(parse_name: &str) -> Option<IShellItem> {
 }
 
 /// Loads the icon of a path, `shell:AppsFolder\…` id or other shell parsing name.
-pub fn load(parse_name: &str, size: i32) -> Option<Rgba> {
+pub fn load(parse_name: &str, size: i32, thumbnail: bool) -> Option<Rgba> {
     unsafe {
         let item = shell_item(parse_name)?;
         let factory: IShellItemImageFactory = item.cast().ok()?;
-        let hbmp = factory.GetImage(SIZE { cx: size, cy: size }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK).ok()?;
+        let kind = if thumbnail { SIIGBF_THUMBNAILONLY } else { SIIGBF_ICONONLY };
+        let hbmp = factory.GetImage(SIZE { cx: size, cy: size }, kind | SIIGBF_BIGGERSIZEOK).ok()?;
         let out = read_bitmap(hbmp);
         let _ = DeleteObject(hbmp.into());
         out
@@ -107,6 +108,8 @@ pub struct Request {
     pub id: u64,
     pub parse_name: String,
     pub size: i32,
+    /// The picture itself (a sender avatar) rather than the file type icon.
+    pub thumbnail: bool,
 }
 
 /// Loads icons on a background thread and wakes the UI thread with `notify_msg`.
@@ -125,7 +128,7 @@ impl IconWorker {
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             }
             while let Ok(r) = req_rx.recv() {
-                let icon = load(&r.parse_name, r.size);
+                let icon = load(&r.parse_name, r.size, r.thumbnail);
                 if res_tx.send((r.id, icon)).is_err() {
                     break;
                 }

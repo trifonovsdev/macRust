@@ -5,7 +5,7 @@ use std::ffi::c_void;
 
 use macrust_ui::tiny_skia::{IntSize, Pixmap};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_SUCCESS, GENERIC_READ, HANDLE, HWND, LPARAM, LUID, POINT, RECT,
+    CloseHandle, ERROR_SUCCESS, GENERIC_READ, HANDLE, HWND, LPARAM, LUID, POINT, RECT, WPARAM,
 };
 use windows::Win32::Globalization::{GetUserDefaultUILanguage, LCIDToLocaleName};
 use windows::Win32::Graphics::Gdi::{
@@ -27,7 +27,8 @@ use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetCl
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS, SetSuspendState};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_QWORD, RRF_RT_REG_SZ, RegCloseKey,
+    RegDeleteKeyValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, RegSetKeyValueW,
 };
 use windows::Win32::System::Shutdown::{
     EWX_LOGOFF, EWX_POWEROFF, EWX_REBOOT, EWX_SHUTDOWN, ExitWindowsEx, LockWorkStation, SHTDN_REASON_FLAG_PLANNED,
@@ -42,11 +43,11 @@ use windows::Win32::UI::Shell::{
     APPBARDATA, SHAppBarMessage, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible, SPI_GETDESKWALLPAPER,
+    FindWindowExW, GetClassNameW, HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE, GetWindowThreadProcessId, IsWindowVisible, SPI_GETDESKWALLPAPER,
     SPI_SETDESKWALLPAPER, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE, SW_HIDE, SW_SHOWNA, SW_SHOWNORMAL,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, ShowWindow, SystemParametersInfoW,
 };
-use windows::core::{PCWSTR, w};
+use windows::core::{PCWSTR, PWSTR, w};
 
 use super::util::{data_dir, from_wide, log, wide};
 
@@ -102,6 +103,98 @@ fn reg_string(root: HKEY, sub: &str, value: &str) -> Option<String> {
         )
     };
     (r == ERROR_SUCCESS).then(|| from_wide(&buf))
+}
+
+/// (microphone, camera) in use right now by any app. Windows records each
+/// access in the capability consent store; an access still running has no
+/// stop time yet.
+pub fn privacy_in_use() -> (bool, bool) {
+    let base = "Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore";
+    let active = |cap: &str| {
+        let root = format!("{base}\\{cap}");
+        let mut keys: Vec<String> = reg_subkeys(&root).into_iter().map(|k| format!("{root}\\{k}")).collect();
+        let np = format!("{root}\\NonPackaged");
+        keys.extend(reg_subkeys(&np).into_iter().map(|k| format!("{np}\\{k}")));
+        keys.iter().any(|k| {
+            reg_qword(HKEY_CURRENT_USER, k, "LastUsedTimeStart").is_some_and(|t| t > 0)
+                && reg_qword(HKEY_CURRENT_USER, k, "LastUsedTimeStop") == Some(0)
+        })
+    };
+    (active("microphone"), active("webcam"))
+}
+
+fn reg_qword(root: HKEY, sub: &str, value: &str) -> Option<u64> {
+    let (sub, value) = (wide(sub), wide(value));
+    let mut data = 0u64;
+    let mut len = 8u32;
+    let r = unsafe {
+        RegGetValueW(
+            root,
+            PCWSTR(sub.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_REG_QWORD,
+            None,
+            Some(&mut data as *mut u64 as *mut c_void),
+            Some(&mut len),
+        )
+    };
+    (r == ERROR_SUCCESS).then_some(data)
+}
+
+fn reg_subkeys(sub: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let w = wide(sub);
+    let mut key = HKEY::default();
+    unsafe {
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(w.as_ptr()), None, KEY_READ, &mut key) != ERROR_SUCCESS {
+            return out;
+        }
+        for i in 0.. {
+            let mut buf = [0u16; 512];
+            let mut len = buf.len() as u32;
+            if RegEnumKeyExW(key, i, Some(PWSTR(buf.as_mut_ptr())), &mut len, None, None, None, None) != ERROR_SUCCESS {
+                break;
+            }
+            out.push(String::from_utf16_lossy(&buf[..len as usize]));
+        }
+        let _ = RegCloseKey(key);
+    }
+    out
+}
+
+/// Switches Windows between light and dark mode, as the macOS appearance does.
+pub fn set_system_dark(dark: bool) {
+    let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+    let v: u32 = if dark { 0 } else { 1 };
+    for name in ["AppsUseLightTheme", "SystemUsesLightTheme"] {
+        let n = wide(name);
+        unsafe {
+            let _ = RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR(sub.as_ptr()),
+                PCWSTR(n.as_ptr()),
+                REG_DWORD.0,
+                Some(&v as *const u32 as *const c_void),
+                4,
+            );
+        }
+    }
+    // Apps re-read the theme on this broadcast. It waits on every top-level
+    // window in turn, so it runs off the UI thread.
+    std::thread::spawn(|| {
+        let topic = wide("ImmersiveColorSet");
+        unsafe {
+            let _ = SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                WPARAM(0),
+                LPARAM(topic.as_ptr() as isize),
+                SMTO_ABORTIFHUNG,
+                200,
+                None,
+            );
+        }
+    });
 }
 
 pub fn system_dark() -> bool {
@@ -164,6 +257,12 @@ pub fn local_time() -> (usize, u32, usize, u32, u32, u32) {
         t.wMinute as u32,
         t.wSecond as u32,
     )
+}
+
+/// (year, month 0..11, day, weekday 0 = Sunday).
+pub fn today() -> (i32, usize, u32, usize) {
+    let t = unsafe { GetLocalTime() };
+    (t.wYear as i32, (t.wMonth as usize).saturating_sub(1), t.wDay as u32, t.wDayOfWeek as usize)
 }
 
 // ---------------------------------------------------------------------------

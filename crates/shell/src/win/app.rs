@@ -59,11 +59,19 @@ pub const WM_APP_DISMISS: u32 = WM_APP + 5;
 pub const WM_APP_MENUKEY: u32 = WM_APP + 6;
 pub const WM_APP_TRASH: u32 = WM_APP + 7;
 pub const WM_APP_TASKBAR: u32 = WM_APP + 8;
+// WM_APP + 10 is system::WM_APPBAR.
+pub const WM_APP_TRAY: u32 = WM_APP + 11;
+pub const WM_APP_MEDIA: u32 = WM_APP + 12;
+pub const WM_APP_NOTES: u32 = WM_APP + 13;
+
+#[path = "panels.rs"]
+mod panels;
 
 const TIMER_CLOCK: usize = 1;
 const TIMER_STATUS: usize = 2;
 const TIMER_CARET: usize = 3;
 const TIMER_WINDOWS: usize = 4;
+const TIMER_BANNER: usize = 5;
 const HOTKEY_SEARCH: i32 = 1;
 
 const TRASH: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}";
@@ -108,6 +116,8 @@ static NOTIFY: AtomicIsize = AtomicIsize::new(0);
 static MENU_RECT: [AtomicI32; 4] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
 static BAR_H: AtomicI32 = AtomicI32::new(0);
 static MENU_FROM_BAR: AtomicBool = AtomicBool::new(false);
+/// A panel (not a menu) is open: only Esc is taken from the keyboard.
+static ESC_ONLY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Confirm {
@@ -200,6 +210,8 @@ pub struct App {
     taskbar_hidden: bool,
     taskbar_msg: u32,
     own_pid: u32,
+    /// Tray, Control Center, Notification Center, banners (panels.rs).
+    x: panels::Extras,
 }
 
 fn win_events_install() {
@@ -271,7 +283,8 @@ unsafe extern "system" fn ll_keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRES
     if code >= 0 && matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
         let info = unsafe { &*(lp.0 as *const KBDLLHOOKSTRUCT) };
         let vk = VIRTUAL_KEY(info.vkCode as u16);
-        if matches!(vk, VK_UP | VK_DOWN | VK_RETURN | VK_ESCAPE) {
+        let wanted = if ESC_ONLY.load(Ordering::Relaxed) { vk == VK_ESCAPE } else { matches!(vk, VK_UP | VK_DOWN | VK_RETURN | VK_ESCAPE) };
+        if wanted {
             notify(WM_APP_MENUKEY, vk.0 as usize);
             return LRESULT(1);
         }
@@ -386,6 +399,7 @@ impl App {
         NOTIFY.store(bar_s.hwnd.0 as isize, Ordering::Relaxed);
 
         let icon_worker = IconWorker::spawn(bar_s.hwnd, WM_APP_ICON);
+        let extras = panels::Extras::new(bar_s.hwnd);
         let catalog = catalog::spawn(bar_s.hwnd, WM_APP_CATALOG, ru);
         let mut names = HashMap::new();
         let pins = config::load_pins().unwrap_or_else(|| {
@@ -438,6 +452,7 @@ impl App {
             taskbar_hidden: false,
             taskbar_msg,
             own_pid: unsafe { GetCurrentProcessId() },
+            x: extras,
         };
 
         if app.settings.hide_taskbar {
@@ -445,6 +460,7 @@ impl App {
             app.taskbar_hidden = true;
             system::spawn_watchdog();
         }
+        app.extras_start();
         system::appbar_register(app.bar_s.hwnd);
         if app.settings.reserve_dock {
             system::appbar_register(app.dock_s.hwnd);
@@ -500,6 +516,8 @@ impl App {
     }
 
     pub fn shutdown(&mut self) {
+        // Apps fall back to Explorer's tray, which got every icon forwarded.
+        self.x.tray = None;
         self.unhook_menu();
         unsafe {
             let _ = UnregisterHotKey(Some(self.bar_s.hwnd), HOTKEY_SEARCH);
@@ -536,7 +554,7 @@ impl App {
         self.next_req += 1;
         self.icon_pending.insert(key.clone());
         self.icon_reqs.insert(id, (key, true));
-        self.icon_worker.request(Request { id, parse_name: parse_name.to_string(), size: 256 });
+        self.icon_worker.request(Request { id, parse_name: parse_name.to_string(), size: 256, thumbnail: false });
         None
     }
 
@@ -579,13 +597,15 @@ impl App {
             if let Some(i) = ling {
                 used_lingering[i] = true;
             }
+            // Running only as a tray icon (Telegram, Discord closed to the tray).
+            let in_tray = matches!(&pin.source, Source::Exe(p) if self.x.tray_exes.contains(&p.to_lowercase()));
             let key = pin.source.key();
             let icon = self.dock_icon(&pin.source.parse_name());
             entries.push(DockEntry {
                 key: key.clone(),
                 label: pin.name.clone(),
                 icon,
-                running: idx.is_some() || ling.is_some(),
+                running: idx.is_some() || ling.is_some() || in_tray,
                 section: Section::Apps,
                 fallback: Fallback::App,
             });
@@ -594,7 +614,7 @@ impl App {
                 DockTarget {
                     source: Some(pin.source.clone()),
                     pinned: true,
-                    alive: ling.is_some(),
+                    alive: idx.is_none() && (ling.is_some() || in_tray),
                     app: idx.map(|i| self.running[i].key.clone()),
                     special: Special::None,
                     name: pin.name.clone(),
@@ -710,6 +730,8 @@ impl App {
             battery: system::battery(),
             wifi,
             clock: self.ctx.strings.clock(wd, day, mon, h, m),
+            mic: self.x.privacy.0,
+            camera: self.x.privacy.1,
         };
         if self.bar.set_status(st, &self.ctx) {
             self.bar_s.dirty = true;
@@ -794,6 +816,7 @@ impl App {
             a.store(v, Ordering::Relaxed);
         }
         MENU_FROM_BAR.store(matches!(owner, MenuOwner::Bar(_) | MenuOwner::Confirm(_)), Ordering::Relaxed);
+        ESC_ONLY.store(false, Ordering::Relaxed);
         self.dock.set_menu_open(matches!(owner, MenuOwner::Dock(_)));
         self.menu = Some(m);
         self.menu_owner = Some(owner);
@@ -809,6 +832,7 @@ impl App {
     /// Fades the open menu out (or drops it at once when another one replaces it).
     fn close_menu(&mut self, animated: bool) {
         self.unhook_menu();
+        self.close_panels(animated);
         if let Some(m) = &mut self.menu {
             if animated {
                 m.close();
@@ -1125,6 +1149,10 @@ impl App {
     }
 
     fn request_icon(&mut self, key: String, parse_name: String) {
+        self.request_image(key, parse_name, false);
+    }
+
+    fn request_image(&mut self, key: String, parse_name: String, thumbnail: bool) {
         if self.small_icons.contains_key(&key) || self.icon_pending.contains(&key) {
             return;
         }
@@ -1132,11 +1160,13 @@ impl App {
         self.next_req += 1;
         self.icon_pending.insert(key.clone());
         self.icon_reqs.insert(id, (key, false));
-        self.icon_worker.request(Request { id, parse_name, size: icon_size_for(self.screen.scale) });
+        let size = if thumbnail { 96 } else { icon_size_for(self.screen.scale) };
+        self.icon_worker.request(Request { id, parse_name, size, thumbnail });
     }
 
     fn icons_arrived(&mut self) {
         let mut dock_changed = false;
+        let mut notes_changed = false;
         while let Ok((id, rgba)) = self.icon_worker.rx.try_recv() {
             let Some((key, dock)) = self.icon_reqs.remove(&id) else { continue };
             self.icon_pending.remove(&key);
@@ -1161,10 +1191,16 @@ impl App {
                 }
                 self.spot_s.dirty = true;
             }
+            if key.starts_with("note:") || key.starts_with("img:") {
+                notes_changed = true;
+            }
             self.small_icons.insert(key, img);
         }
         if dock_changed {
             self.rebuild_dock();
+        }
+        if notes_changed {
+            self.refresh_note_views();
         }
     }
 
@@ -1238,7 +1274,9 @@ impl App {
             }
             BarItem::Battery => system::open("ms-settings:batterysaver"),
             BarItem::Wifi => system::open("ms-availablenetworks:"),
-            BarItem::Clock => system::open("ms-actioncenter:"),
+            BarItem::Clock => self.toggle_notes(),
+            BarItem::Control | BarItem::Privacy => self.toggle_control(),
+            BarItem::Tray(id) => self.tray_click(id, false),
             _ => {}
         }
     }
@@ -1257,6 +1295,8 @@ impl App {
                 }
                 BarEvent::CloseMenus => self.close_menu(true),
                 BarEvent::Click(item) => self.bar_click(item),
+                BarEvent::Context { item: BarItem::Tray(id), .. } => self.tray_click(id, true),
+                BarEvent::Context { .. } => {}
             }
         }
         for e in std::mem::take(&mut self.dock.events) {
@@ -1291,7 +1331,10 @@ impl App {
     }
 
     pub fn animating(&self) -> bool {
-        self.dock.animating() || self.spot.animating() || self.menu.as_ref().is_some_and(|m| m.animating())
+        self.dock.animating()
+            || self.spot.animating()
+            || self.menu.as_ref().is_some_and(|m| m.animating())
+            || self.x.animating()
     }
 
     pub fn frame(&mut self) {
@@ -1318,6 +1361,7 @@ impl App {
             m.update(dt);
             self.menu_s.dirty = true;
         }
+        self.extras_update(dt);
         self.pump_events();
         if self.menu.as_ref().is_some_and(|m| m.finished()) {
             self.menu = None;
@@ -1358,6 +1402,7 @@ impl App {
             m.draw(&mut self.menu_s.pm, &self.ctx);
             self.menu_s.present();
         }
+        self.extras_render();
     }
 
     fn set_fullscreen(&mut self, on: bool) {
@@ -1383,7 +1428,15 @@ impl App {
         let is_dock = hwnd == self.dock_s.hwnd;
         let is_spot = hwnd == self.spot_s.hwnd;
         let is_menu = hwnd == self.menu_s.hwnd;
-        if msg == self.taskbar_msg && self.taskbar_msg != 0 && is_bar {
+        if self.x.owns(hwnd) && matches!(msg, WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
+            let (x, y) = lparam_point(lp);
+            if self.panel_mouse(hwnd, msg, x, y).is_some() {
+                return Some(LRESULT(0));
+            }
+        }
+        // Our tray host broadcasts TaskbarCreated itself so apps re-add icons.
+        let own_broadcast = super::tray::broadcast_time().is_some_and(|t| t.elapsed().as_secs() < 3);
+        if msg == self.taskbar_msg && self.taskbar_msg != 0 && is_bar && !own_broadcast {
             // Explorer restarted: its taskbar is back and our app bars are gone.
             if self.settings.hide_taskbar {
                 system::hide_taskbar();
@@ -1393,6 +1446,9 @@ impl App {
                 system::appbar_register(self.dock_s.hwnd);
             }
             self.place_appbars();
+            if let Some(t) = &self.x.tray {
+                t.keep_on_top();
+            }
             return Some(LRESULT(0));
         }
         match msg {
@@ -1463,6 +1519,10 @@ impl App {
                     m.mouse_up(x, y);
                     self.menu_s.dirty = true;
                 }
+            }
+            WM_RBUTTONUP if is_bar => {
+                let (x, _) = lparam_point(lp);
+                self.bar.right_click(x);
             }
             WM_RBUTTONUP if is_dock => {
                 let (x, y) = lparam_point(lp);
@@ -1547,6 +1607,7 @@ impl App {
                 }
                 TIMER_STATUS => {
                     self.refresh_status();
+                    self.extras_tick();
                     if self.taskbar_hidden {
                         system::keep_taskbar_hidden();
                     }
@@ -1558,6 +1619,7 @@ impl App {
                     }
                 }
                 TIMER_CARET => self.spot_s.dirty = self.spot.shown(),
+                TIMER_BANNER => self.banner_timer(),
                 TIMER_WINDOWS => {
                     unsafe {
                         let _ = KillTimer(Some(self.bar_s.hwnd), TIMER_WINDOWS);
@@ -1574,7 +1636,7 @@ impl App {
             WM_APP_FOREGROUND => {
                 // Alt+Tab or a notification took the foreground: the open menu goes away.
                 let fg = unsafe { GetForegroundWindow() };
-                if self.menu_owner.is_some() && !fg.is_invalid() && tracker::window_pid(fg) != self.own_pid {
+                if (self.menu_owner.is_some() || self.x.panel_open()) && !fg.is_invalid() && tracker::window_pid(fg) != self.own_pid {
                     self.close_menu(true);
                 }
                 self.refresh_foreground();
@@ -1589,6 +1651,9 @@ impl App {
                 }
             }
             WM_APP_ICON => self.icons_arrived(),
+            WM_APP_TRAY => self.on_tray(),
+            WM_APP_MEDIA => self.on_media(),
+            WM_APP_NOTES => self.on_notes(),
             WM_APP_CATALOG => self.catalog_arrived(),
             WM_APP_DISMISS => self.close_menu(true),
             WM_APP_MENUKEY => {
@@ -1641,7 +1706,12 @@ impl App {
     }
 
     pub fn has_work(&self) -> bool {
-        self.animating() || self.bar_s.dirty || self.dock_s.dirty || self.menu_s.dirty || (self.spot_s.dirty && self.spot.shown())
+        self.animating()
+            || self.bar_s.dirty
+            || self.dock_s.dirty
+            || self.menu_s.dirty
+            || (self.spot_s.dirty && self.spot.shown())
+            || self.x.dirty()
     }
 }
 
