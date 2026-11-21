@@ -4,6 +4,7 @@ mod app;
 mod capture;
 mod catalog;
 mod config;
+mod genie;
 mod icons;
 mod macicons;
 mod media;
@@ -92,6 +93,7 @@ pub fn run() {
         // feature; only the UI thread takes the shell down.
         if thread == "main" {
             system::restore_taskbar();
+            genie::release_min_animate();
             alert(&format!(
                 "macRust stopped because of an error:\n\n{info}\n\nDetails: {}",
                 util::data_dir().join("log.txt").display()
@@ -102,11 +104,13 @@ pub fn run() {
     if let Some(pid) = args.iter().position(|a| a == "--watch").and_then(|i| args.get(i + 1)).and_then(|p| p.parse().ok()) {
         system::watch(pid);
         workarea::release();
+        genie::release_min_animate();
         return;
     }
     if has("--restore") {
         workarea::release();
         system::restore_taskbar();
+        genie::release_min_animate();
         return;
     }
     if has("--install") {
@@ -167,6 +171,8 @@ pub fn run() {
     if system::taskbar_state_saved() {
         system::restore_taskbar();
     }
+    // The same for Windows' minimize animation, which the Genie turns off.
+    genie::release_min_animate();
     log(format!("starting {}", env!("CARGO_PKG_VERSION")));
     register_class();
     let app = App::new();

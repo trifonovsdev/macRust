@@ -9,6 +9,7 @@ use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
 use macrust_ui::dock::{Dock, DockConfig, DockEntry, DockEvent, Fallback, Section};
+use macrust_ui::genie::{Path as GeniePath, Rect as GenieRect};
 use macrust_ui::gfx::Image;
 use macrust_ui::menu::{MenuEntry, MenuEvent, PopupMenu};
 use macrust_ui::menubar::{BarEvent, BarItem, MenuBar, Status};
@@ -31,7 +32,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{FOLDERID_Downloads, SHEmptyRecycleBinW};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
-    EVENT_SYSTEM_FOREGROUND, GA_PARENT, GA_ROOTOWNER, GetAncestor, GetDesktopWindow, GetForegroundWindow, HHOOK,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, GA_PARENT, GA_ROOTOWNER, GetAncestor,
+    GetDesktopWindow, GetForegroundWindow, HHOOK,
     KBDLLHOOKSTRUCT, KillTimer, MSLLHOOKSTRUCT, OBJID_WINDOW, PostMessageW, PostQuitMessage, SetForegroundWindow,
     SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
     WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_DISPLAYCHANGE,
@@ -43,6 +45,7 @@ use windows::core::PCWSTR;
 
 use super::catalog::{self, Batch};
 use super::config::{self, Pin, Settings, Source};
+use super::genie::{self, Genie};
 use super::icons::{self, IconWorker, Request};
 use super::macicons::{self, MacIcons};
 use super::surface::Surface;
@@ -61,7 +64,8 @@ pub const WM_APP_ICON: u32 = WM_APP + 3;
 pub const WM_APP_CATALOG: u32 = WM_APP + 4;
 pub const WM_APP_DISMISS: u32 = WM_APP + 5;
 pub const WM_APP_MENUKEY: u32 = WM_APP + 6;
-// WM_APP + 7 is free.
+/// A window starts or ends being minimized: WPARAM is the HWND, LPARAM 1 for start.
+pub const WM_APP_MINIMIZE: u32 = WM_APP + 7;
 pub const WM_APP_TASKBAR: u32 = WM_APP + 8;
 // WM_APP + 10 is system::WM_APPBAR.
 pub const WM_APP_TRAY: u32 = WM_APP + 11;
@@ -243,6 +247,8 @@ pub struct App {
     own_pid: u32,
     /// Tray, Control Center, Notification Center, banners (panels.rs).
     x: panels::Extras,
+    /// Minimize into and restore out of Dock icons (genie.rs).
+    genie: Genie,
     stats: std::collections::BTreeMap<&'static str, Stat>,
 }
 
@@ -252,6 +258,7 @@ fn win_events_install() {
         SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(win_event), 0, 0, flags);
         SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, None, Some(win_event), 0, 0, flags);
         SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, None, Some(win_event), 0, 0, flags);
+        SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, None, Some(win_event), 0, 0, flags);
     }
 }
 
@@ -271,6 +278,14 @@ unsafe extern "system" fn win_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id
         return;
     }
     if id_object != OBJID_WINDOW.0 || id_child != 0 || hwnd.is_invalid() {
+        return;
+    }
+    if event == EVENT_SYSTEM_MINIMIZESTART || event == EVENT_SYSTEM_MINIMIZEEND {
+        let h = HWND(NOTIFY.load(Ordering::Relaxed) as *mut _);
+        let start = (event == EVENT_SYSTEM_MINIMIZESTART) as isize;
+        unsafe {
+            let _ = PostMessageW(Some(h), WM_APP_MINIMIZE, WPARAM(hwnd.0 as usize), LPARAM(start));
+        }
         return;
     }
     if event == EVENT_OBJECT_SHOW && system::is_taskbar(hwnd) {
@@ -467,6 +482,7 @@ impl App {
         let taskbar_msg = unsafe { windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(windows::core::w!("TaskbarCreated")) };
 
         let cfg = DockConfig { icon: settings.icon_size, magnified: settings.magnified, magnify: settings.magnify };
+        let genie = Genie::new(dock_s.hwnd, extras.capture.is_some());
         let mut app = Self {
             ctx,
             settings,
@@ -513,6 +529,7 @@ impl App {
             taskbar_msg,
             own_pid: unsafe { GetCurrentProcessId() },
             x: extras,
+            genie,
             stats: std::collections::BTreeMap::new(),
         };
 
@@ -600,6 +617,7 @@ impl App {
     }
 
     pub fn shutdown(&mut self) {
+        self.genie.shutdown();
         // Apps fall back to Explorer's tray, which got every icon forwarded.
         self.x.tray = None;
         self.unhook_menu();
@@ -700,6 +718,8 @@ impl App {
             k.clear();
             k.extend(self.running.iter().flat_map(|a| a.windows.iter().map(|w| w.0 as isize)));
         });
+        let live: HashSet<isize> = self.running.iter().flat_map(|a| a.windows.iter().map(|w| w.0 as isize)).collect();
+        self.genie.forget_except(&live);
         self.rebuild_dock();
     }
 
@@ -837,6 +857,7 @@ impl App {
             self.fg_name = tracker::app_name(&mut self.names, &format!("{windir}\\explorer.exe"), None);
         } else {
             self.fg = Some(root);
+            self.genie.note_window(root);
             let (exe, aumid) = tracker::identify(root);
             self.fg_name = exe.map(|e| tracker::app_name(&mut self.names, &e, aumid.as_deref())).unwrap_or_default();
         }
@@ -883,12 +904,16 @@ impl App {
             Special::None => {
                 let app = t.app.as_deref().and_then(|k| self.app_by_key(k)).cloned();
                 match (app, t.source) {
-                    // As on a Mac a click never hides the app: it brings its
-                    // windows forward, and restores one only when all are minimized.
+                    // The owner's rule, unlike a Mac: clicking the app in front
+                    // minimizes its windows into the icon; all minimized come
+                    // back out of it; any other app comes forward.
                     (Some(app), _) => {
                         let shown: Vec<HWND> = app.windows.iter().copied().filter(|&w| !winops::is_minimized(w)).collect();
+                        let front = self.fg_app().is_some_and(|f| f.key == app.key);
                         if shown.is_empty() {
-                            winops::activate(app.windows[0]);
+                            self.genie_restore(key, &app.windows);
+                        } else if front {
+                            self.genie_minimize(key, &shown, false, "dock");
                         } else {
                             for &w in shown.iter().skip(1).rev() {
                                 winops::raise(w);
@@ -903,6 +928,85 @@ impl App {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// The Dock entry that stands for the app owning window `h`.
+    fn dock_key_of(&self, h: HWND) -> Option<String> {
+        let app = self.running.iter().find(|a| a.windows.contains(&h))?;
+        self.targets.iter().find(|(_, t)| t.app.as_deref() == Some(app.key.as_str())).map(|(k, _)| k.clone())
+    }
+
+    /// The window frame `win` flowing into the Dock icon of `key`; None when
+    /// the Genie cannot play (Dock hidden for a full-screen app, window off
+    /// the primary screen, icon gone).
+    fn genie_path(dock: &Dock, screen: &Screen, fullscreen: bool, key: &str, win: WinRect) -> Option<GeniePath> {
+        let (cx, cy) = (win.x + win.w / 2, win.y + win.h / 2);
+        if fullscreen || win.w <= 0 || win.h <= 0 || !(0..screen.w).contains(&cx) || !(0..screen.h).contains(&cy) {
+            return None;
+        }
+        let (x, y, w, h) = dock.icon_rect(key)?;
+        Some(GeniePath {
+            win: GenieRect { x: win.x as f32, y: win.y as f32, w: win.w as f32, h: win.h as f32 },
+            icon: GenieRect { x, y, w, h },
+            clip: dock.bar_top(),
+            screen_h: screen.h as f32,
+            dock_visible: true,
+            scale: screen.scale,
+        })
+    }
+
+    /// Minimizes `windows` into the Dock icon of `key` with the Genie where it
+    /// can play, plainly otherwise. `already`: Windows is minimizing them (a
+    /// title-bar click), so the snapshot comes from the last captured frame.
+    fn genie_minimize(&mut self, key: &str, windows: &[HWND], already: bool, why: &str) {
+        let mut items = Vec::new();
+        for &h in windows {
+            let item = if self.genie.enabled { self.genie_item(key, h, already) } else { None };
+            match item {
+                Some(i) => items.push(i),
+                None if !already => winops::minimize(h),
+                None => {}
+            }
+        }
+        self.genie.minimize(items, already, (self.screen.w, self.screen.h), why);
+    }
+
+    fn genie_item(&mut self, key: &str, h: HWND, already: bool) -> Option<genie::Item> {
+        let (frame, maxed) = if already || winops::is_minimized(h) {
+            winops::restore_frame(h, self.genie.borders_of(h))?
+        } else {
+            (winops::frame_rect(h)?, winops::is_maximized(h))
+        };
+        let path = Self::genie_path(&self.dock, &self.screen, self.fullscreen, key, frame)?;
+        // Windows 11 rounds the corners of windows that are not maximized.
+        let radius = if self.genie.win11 && !maxed { 8.0 * self.screen.scale } else { 0.0 };
+        let snap = genie::grab(self.x.capture.as_mut(), h, frame, !already, radius)?;
+        Some(genie::Item { hwnd: h, path, snap })
+    }
+
+    /// Restores `windows` out of the Dock icon of `key`; the first comes to the front.
+    fn genie_restore(&mut self, key: &str, windows: &[HWND]) {
+        let screen = (self.screen.w, self.screen.h);
+        // The one to activate goes last, so it ends up in front.
+        for (i, &h) in windows.iter().enumerate().rev() {
+            let (dock, scr, full) = (&self.dock, &self.screen, self.fullscreen);
+            let path = |r: WinRect| Self::genie_path(dock, scr, full, key, r);
+            self.genie.restore(h, &path, i == 0, screen);
+        }
+    }
+
+    /// A window started (`start`) or stopped being minimized, by any means.
+    fn minimize_event(&mut self, h: HWND, start: bool) {
+        if !start {
+            self.genie.restored_elsewhere(h);
+            return;
+        }
+        if self.genie.busy(h) || !self.genie.session() {
+            return;
+        }
+        if let Some(key) = self.dock_key_of(h) {
+            self.genie_minimize(&key, &[h], true, "title bar");
         }
     }
 
@@ -1158,7 +1262,10 @@ impl App {
             T_MINIMIZE | T_ZOOM | T_LEFT | T_RIGHT | T_CENTER => {
                 if let Some(w) = self.fg {
                     match tag {
-                        T_MINIMIZE => winops::minimize(w),
+                        T_MINIMIZE => match self.dock_key_of(w) {
+                            Some(key) => self.genie_minimize(&key, &[w], false, "menu"),
+                            None => winops::minimize(w),
+                        },
                         T_ZOOM => winops::toggle_zoom(w),
                         T_LEFT => winops::tile(w, true),
                         T_RIGHT => winops::tile(w, false),
@@ -1510,7 +1617,8 @@ impl App {
     }
 
     pub fn animating(&self) -> bool {
-        self.dock.animating()
+        self.genie.animating()
+            || self.dock.animating()
             || self.spot.animating()
             || self.menu.as_ref().is_some_and(|m| m.animating())
             || self.x.animating()
@@ -1541,6 +1649,11 @@ impl App {
             self.menu_s.dirty = true;
         }
         self.extras_update(dt);
+        if self.genie.animating() {
+            let t = Instant::now();
+            self.genie.step((self.screen.w, self.screen.h));
+            self.stat("genie", t);
+        }
         self.pump_events();
         if self.menu.as_ref().is_some_and(|m| m.finished()) {
             self.menu = None;
@@ -1856,6 +1969,9 @@ impl App {
                     self.close_menu(true);
                 }
                 self.refresh_foreground();
+            }
+            WM_APP_MINIMIZE => {
+                self.minimize_event(HWND(wp.0 as *mut _), lp.0 != 0);
             }
             WM_APP_TASKBAR => {
                 if self.taskbar_hidden {

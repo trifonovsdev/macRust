@@ -4,6 +4,7 @@
 
 pub mod anim;
 pub mod dock;
+pub mod genie;
 pub mod gfx;
 pub mod glass;
 pub mod glyphs;

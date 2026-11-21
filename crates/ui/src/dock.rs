@@ -264,6 +264,27 @@ impl Dock {
         }
     }
 
+    /// Screen rect (x, y, w, h in px) of the visible art of `key`'s icon, as
+    /// drawn now (magnified, hopping), for animations that land on it.
+    pub fn icon_rect(&self, key: &str) -> Option<(f32, f32, f32, f32)> {
+        let wr = self.window_rect();
+        let g = self.geo(wr.w as f32, wr.h as f32);
+        g.cells.iter().find_map(|&(c, x, w)| match c {
+            Cell::Slot(i) if self.slots[i].e.key == key && !self.slots[i].removing => {
+                let (bx, by, size) = self.icon_box(&g, i, x, w);
+                let inset = size * (1.0 - ART) / 2.0;
+                Some((wr.x as f32 + bx + inset, wr.y as f32 + by + inset, size * ART, size * ART))
+            }
+            _ => None,
+        })
+    }
+
+    /// Screen y of the bar's top edge.
+    pub fn bar_top(&self) -> f32 {
+        let wr = self.window_rect();
+        wr.y as f32 + self.geo(wr.w as f32, wr.h as f32).bg.1
+    }
+
     /// What is behind the dock window right now, window-sized.
     pub fn set_backdrop(&mut self, behind: &Pixmap) {
         self.backdrop = Some(glass::Backdrop::new(behind));
@@ -729,5 +750,23 @@ mod tests {
         let at95 = at95.unwrap();
         assert!((0.2..0.3).contains(&at95), "95% at {at95} s");
         assert!((t - 0.4).abs() < 0.02, "settled at {t} s");
+    }
+
+    #[test]
+    fn icon_rect_is_the_tile_in_screen_px() {
+        let mut d = Dock::new(DockConfig::default());
+        d.set_screen(1920.0, 1080.0, 1.0);
+        d.set_entries(vec![entry("a"), entry("b"), entry("c")]);
+        let (ax, ay, aw, ah) = d.icon_rect("a").unwrap();
+        let (bx, _, _, _) = d.icon_rect("b").unwrap();
+        let v = d.cfg.icon * ART;
+        assert!((aw - v).abs() < 1e-3 && (ah - v).abs() < 1e-3);
+        assert!(((bx - ax) / v - 1.31).abs() < 1e-3);
+        // Centred in the bar, which sits at the bottom of the screen.
+        let top = d.bar_top();
+        let bh = (v * BAR).round();
+        assert!(((ay - top) - (top + bh - (ay + ah))).abs() < 1.0);
+        assert!((1080.0 - (top + bh) - GAP_BOTTOM).abs() <= 1.0);
+        assert!(d.icon_rect("zzz").is_none());
     }
 }
